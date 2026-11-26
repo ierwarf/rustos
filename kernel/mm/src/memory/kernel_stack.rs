@@ -588,7 +588,7 @@ impl Drop for KernelStack {
         meta.state.store(SLOT_RECLAIMING, Ordering::Release);
 
         let pt_phys = PhysAddr::new(self.pt_phys);
-        let mut reclaimed: [Option<PhysAddr>; MAX_USABLE_PAGES] = [None; MAX_USABLE_PAGES];
+        let mut reclaimed = [PhysAddr::zero(); MAX_USABLE_PAGES];
         let mut reclaimed_count = 0usize;
         let pages = (self.usable_len / KERNEL_STACK_PAGE_SIZE).min(MAX_USABLE_PAGES);
         let present_bit = PageTableFlags::PRESENT.bits();
@@ -603,7 +603,7 @@ impl Drop for KernelStack {
             if raw & present_bit != 0 {
                 let phys = raw & 0x000f_ffff_ffff_f000;
                 if phys != 0 {
-                    reclaimed[reclaimed_count] = Some(PhysAddr::new(phys));
+                    reclaimed[reclaimed_count] = PhysAddr::new(phys);
                     reclaimed_count += 1;
                 }
             }
@@ -611,8 +611,21 @@ impl Drop for KernelStack {
         let flushed = mutation.flush_for_reclaim();
         drop(flushed);
 
-        for frame in reclaimed.iter().take(reclaimed_count).flatten().copied() {
-            crate::memory::phys::free_frame(frame);
+        if reclaimed_count != 0 {
+            let mut failures = [(
+                PhysAddr::zero(),
+                crate::memory::phys::FreeFrameError::AlreadyFree,
+            ); MAX_USABLE_PAGES];
+            let failed = crate::memory::phys::try_free_frames_batch(
+                &reclaimed[..reclaimed_count],
+                &mut failures,
+            );
+            assert_eq!(
+                failed,
+                0,
+                "kernel stack drop failed to free {failed} reclaimed frame(s): {:?}",
+                &failures[..failed.min(failures.len())]
+            );
         }
 
         meta.task_id.store(0, Ordering::Relaxed);

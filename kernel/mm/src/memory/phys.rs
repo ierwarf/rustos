@@ -989,6 +989,11 @@ fn range_overlaps_boot_usable_locked(state: &PhysAllocatorState, phys_start: u64
     let Some(end) = phys_start.checked_add(byte_len) else {
         return true;
     };
+    // The allocator deliberately excludes physical page zero from geometry;
+    // that does not make it an admissible device aperture.
+    if phys_start == 0 {
+        return true;
+    }
     let first = phys_start / PAGE_SIZE;
     let last = end / PAGE_SIZE;
     let limit = (state.geo.frame_count as u64).min(last);
@@ -1177,7 +1182,10 @@ fn usable_region_spans<'a>(
             return None;
         }
 
-        let start = align_up(region.phys_start, PAGE_SIZE)?.min(DIRECT_MAP_PHYS_LIMIT);
+        // Physical zero is the absent-root / absent-frame sentinel used by
+        // page tables and the pager. Never place metadata or lend a frame there.
+        let start = align_up(region.phys_start, PAGE_SIZE)?
+            .clamp(PAGE_SIZE, DIRECT_MAP_PHYS_LIMIT);
         let end = region
             .page_count
             .checked_mul(PAGE_SIZE)
@@ -1335,6 +1343,20 @@ mod tests {
             spans,
             alloc::vec![(0x2000, 3), (DIRECT_MAP_PHYS_LIMIT - PAGE_SIZE, 1)]
         );
+    }
+
+    #[test]
+    fn firmware_usable_page_zero_is_never_allocatable() {
+        let regions = [BootMemoryRegion {
+            phys_start: 0,
+            page_count: 3,
+            kind: BootMemoryKind::Usable,
+            _reserved0: 0,
+        }];
+        let spans: alloc::vec::Vec<_> = usable_region_spans(&regions).collect();
+        assert_eq!(spans, [(PAGE_SIZE, 2)]);
+        assert_eq!(find_usable_span_excluding_ranges(&regions, 1, &[]), Some(PAGE_SIZE));
+        assert_eq!(find_usable_span_excluding_ranges(&regions, 3, &[]), None);
     }
 
     #[test]

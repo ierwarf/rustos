@@ -222,8 +222,28 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_PIPE2 => syscall_linux_pipe2(frame.rdi, frame.rsi),
         linux_abi::SYS_EVENTFD => syscall_linux_eventfd(frame.rdi),
         linux_abi::SYS_EVENTFD2 => syscall_linux_eventfd2(frame.rdi, frame.rsi),
+        linux_abi::SYS_TIMERFD_CREATE => syscall_linux_timerfd_create(frame.rdi, frame.rsi),
+        linux_abi::SYS_TIMERFD_SETTIME => {
+            syscall_linux_timerfd_settime(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_TIMERFD_GETTIME => syscall_linux_timerfd_gettime(frame.rdi, frame.rsi),
+        linux_abi::SYS_NAME_TO_HANDLE_AT => {
+            syscall_linux_name_to_handle_at(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_PKEY_MPROTECT => {
+            syscall_linux_pkey_mprotect(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_PKEY_ALLOC => syscall_linux_pkey_alloc(frame.rdi, frame.rsi),
+        linux_abi::SYS_PKEY_FREE => syscall_linux_pkey_free(frame.rdi),
         linux_abi::SYS_GETPPID => {
-            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPPID, 0)
+            if let Some(ppid) = multitask::current_user_process_id()
+                .and_then(multitask::parent_process_id_of)
+                .filter(|&ppid| ppid != 0)
+            {
+                ppid
+            } else {
+                syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPPID, 0)
+            }
         }
         linux_abi::SYS_GETPGRP => {
             syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPGID, 0)

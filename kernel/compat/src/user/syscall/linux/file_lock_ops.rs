@@ -332,26 +332,39 @@ fn cancel_wait(fd: u64, remote_id: u64, owner: u16) {
     let _ = send(fd, remote_id, &control_wire(VFS_FILE_LOCK_CMD_CANCEL_WAIT, owner));
 }
 
-/// Pins the exact description for the whole (possibly sleeping) operation, so
-/// a concurrent close cannot retire it between two polls.
-fn with_pinned_description<T>(
-    fd: u64,
-    remote_id: u64,
-    body: impl FnOnce() -> Result<T, i64>,
-) -> Result<T, i64> {
-    acquire_current_remote_vfs_ref(fd, remote_id)?;
-    let result = body();
-    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-    result
+struct PinnedRemoteVfs(u64);
+
+impl Drop for PinnedRemoteVfs {
+    fn drop(&mut self) {
+        release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(self.0)]);
+    }
 }
 
-/// `EBADF` for a closed fd, `EINVAL` for a live fd that cannot carry locks.
-fn not_lockable_errno(fd: u64) -> i64 {
-    let exists = multitask::with_current_user_process_state(|_, _, state| {
-        state.handles().get_entry(fd).is_some()
+/// Resolves `fd` as a lockable `RemoteVfs` handle, checks basic read/write
+/// access, runs `validate_before_pin`, and pins the open description in a
+/// single process-state lock acquisition.
+fn pin_lockable_remote_vfs(
+    fd: u64,
+    validate_before_pin: impl FnOnce(kernel_object::api::HandleRights) -> Result<(), i64>,
+) -> Result<(PinnedRemoteVfs, kernel_object::api::HandleRights), i64> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        let Some(entry) = process_state.handles().get_entry(fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let multitask::KernelHandle::RemoteVfs(remote) = entry.handle() else {
+            return Err(LINUX_EINVAL);
+        };
+        let rights = entry.rights();
+        // An O_PATH description grants neither read nor write: no locks either.
+        if !rights.allows_read() && !rights.allows_write() {
+            return Err(LINUX_EBADF);
+        }
+        validate_before_pin(rights)?;
+        let remote_id = remote.remote_id();
+        acquire_service_handle_ref(&ServiceHandleRef::RemoteVfs(remote_id))?;
+        Ok((PinnedRemoteVfs(remote_id), rights))
     })
-    .unwrap_or(false);
-    if exists { LINUX_EINVAL } else { LINUX_EBADF }
+    .ok_or(LINUX_EBADF)?
 }
 
 // ---- syscalls --------------------------------------------------------------
@@ -381,17 +394,13 @@ pub(super) fn fcntl(fd: u64, cmd: u64, arg: u64) -> Option<u64> {
 }
 
 fn fcntl_lock(fd: u64, kind: FcntlLockCmd, owner: u16, flock_ptr: u64) -> Result<u64, i64> {
-    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
-        return Err(not_lockable_errno(fd));
-    };
-    // An O_PATH description grants neither read nor write: no locks either.
-    if !rights.allows_read() && !rights.allows_write() {
-        return Err(LINUX_EBADF);
-    }
+    let (pinned, rights) = pin_lockable_remote_vfs(fd, |_| Ok(()))?;
     let flock = usermem::read_current_user_struct::<LinuxFlock>(flock_ptr)
         .map_err(user_pointer_error_to_linux_errno)?;
     let wire = fcntl_wire(kind, owner, &flock)?;
-    if kind != FcntlLockCmd::Get {
+    if kind == FcntlLockCmd::Get {
+        validate_user_write_struct::<LinuxFlock>(flock_ptr)?;
+    } else {
         // Linux: a read lock needs a readable fd, a write lock a writable one.
         match wire.lock_type {
             VFS_FILE_LOCK_TYPE_RDLCK if !rights.allows_read() => return Err(LINUX_EBADF),
@@ -405,10 +414,7 @@ fn fcntl_lock(fd: u64, kind: FcntlLockCmd, owner: u16, flock_ptr: u64) -> Result
             }
         }
     }
-    let remote_id = remote.remote_id();
-    let reply = with_pinned_description(fd, remote_id, || {
-        run(fd, remote_id, &wire, kind == FcntlLockCmd::SetWait)
-    })?;
+    let reply = run(fd, pinned.0, &wire, kind == FcntlLockCmd::SetWait)?;
     if kind == FcntlLockCmd::Get {
         let answer = flock_from_reply(&flock, &reply);
         usermem::write_current_user_bytes(flock_ptr, &answer.to_bytes())
@@ -426,13 +432,12 @@ pub(super) fn syscall_linux_flock(fd: u64, operation: u64) -> u64 {
 }
 
 fn flock_lock(fd: u64, operation: u64) -> Result<(), i64> {
-    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
-        return Err(not_lockable_errno(fd));
-    };
-    if !rights.allows_read() && !rights.allows_write() {
-        return Err(LINUX_EBADF);
-    }
-    let (lock_type, blocking) = flock_operation(operation)?;
+    let mut parsed = None;
+    let (pinned, _) = pin_lockable_remote_vfs(fd, |_| {
+        parsed = Some(flock_operation(operation)?);
+        Ok(())
+    })?;
+    let (lock_type, blocking) = parsed.expect("validated before pin");
     let wire = VfsFileLockWire {
         version: VFS_FILE_LOCK_WIRE_VERSION,
         cmd: if blocking { VFS_FILE_LOCK_CMD_SETLKW } else { VFS_FILE_LOCK_CMD_SETLK },
@@ -440,8 +445,7 @@ fn flock_lock(fd: u64, operation: u64) -> Result<(), i64> {
         lock_type,
         ..VfsFileLockWire::default()
     };
-    let remote_id = remote.remote_id();
-    with_pinned_description(fd, remote_id, || run(fd, remote_id, &wire, blocking)).map(|_| ())
+    run(fd, pinned.0, &wire, blocking).map(|_| ())
 }
 
 #[cfg(test)]
@@ -566,11 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn published_pid_is_visible_without_separate_counter_publication() {
+    fn posix_lock_pid_set_clears_duplicate_slots_from_hole_reuse() {
         let set = PosixLockPids::new();
-        // A close can run immediately after the inserting CAS publishes a pid.
-        // ORDERING: model the release publication independently of insertion.
+        // ORDERING: Set up two published slots, as allowed by hole reuse.
         set.slots[0].store(42, Ordering::Release);
+        set.slots[5].store(42, Ordering::Release);
         assert!(set.contains(42));
         set.remove(42);
         assert!(!set.contains(42));

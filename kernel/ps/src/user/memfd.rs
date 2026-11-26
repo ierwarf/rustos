@@ -638,6 +638,8 @@ impl MemfdMappingHold {
 }
 
 fn reconcile_memfd_mappings(object_id: u64, frames: &[u64]) {
+    #[cfg(test)]
+    tests::record_reconcile(object_id, frames.len());
     crate::multitask::for_each_visible_process_state_mut(|state| {
         let _ = state.reconcile_shared_memfd_mappings(object_id, frames);
     });
@@ -1095,14 +1097,16 @@ fn write_with_source<E>(
         fill_staged_pages(&staged.frames, base_pages, offset, end, fill)
             .map_err(MemfdWriteError::Source)?;
 
+        let _reconcile = object.reconcile_lock.lock();
         let mut state = object.state.lock();
         check_write_seals(&state, end).map_err(MemfdWriteError::Memfd)?;
         if state.frames.len() < base_pages {
             // A truncate removed pages the plan was written against.
             continue;
         }
+        let old_pages = state.frames.len();
         // Concurrent growers may have installed the first staged pages.
-        let installed = (state.frames.len() - base_pages).min(staged.frames.len());
+        let installed = (old_pages - base_pages).min(staged.frames.len());
         state
             .frames
             .try_reserve(staged.frames.len() - installed)
@@ -1140,10 +1144,15 @@ fn write_with_source<E>(
         }
         state.frames.extend(staged.frames.drain(installed..));
         state.len = state.len.max(end);
+        let reconcile_frames = (state.mapping_count != 0 && state.frames.len() > old_pages)
+            .then(|| state.frames.clone());
         // Staged frames a concurrent grower made redundant are freed after the
         // lock is released.
         drop(state);
         drop(staged);
+        if let Some(frames) = reconcile_frames {
+            reconcile_memfd_mappings(object.object_id, &frames);
+        }
         return Ok(len);
     }
     Err(MemfdWriteError::Memfd(MemfdError::Busy))
@@ -1212,6 +1221,15 @@ fn fill_staged_pages<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static LAST_RECONCILED: Cell<(u64, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn record_reconcile(object_id: u64, pages: usize) {
+        LAST_RECONCILED.with(|cell| cell.set((object_id, pages)));
+    }
 
     fn empty_object(seals: u32) -> MemfdObject {
         MemfdObject {
@@ -1716,5 +1734,32 @@ mod tests {
         assert_eq!(result, Err(MemfdWriteError::Source(())));
         assert_eq!(handle.seek(0, FileHandleSeekWhence::Current), Ok(4));
         assert_eq!(handle.len(), 4);
+    }
+
+    #[test]
+    fn write_extending_a_mapped_memfd_reconciles_mappings() {
+        fake_reset(usize::MAX);
+        record_reconcile(0, 0);
+        let handle = MemfdHandle::new(String::from("mapped-write"), true, None);
+        let (_frames, page_count, hold) = handle
+            .acquire_mapping_with_eof_guard(0, 3 * PAGE_SIZE, true)
+            .unwrap();
+        assert_eq!(page_count, 3);
+
+        let data = pattern(PAGE_SIZE + 64, 17);
+        assert_eq!(handle.write_at(PAGE_SIZE, &data), Ok(data.len()));
+        assert_eq!(
+            LAST_RECONCILED.with(|cell| cell.get()),
+            (handle.object_id(), 3)
+        );
+
+        // Writing strictly within existing pages must not trigger extra reconciles.
+        record_reconcile(0, 0);
+        assert_eq!(handle.write_at(0, b"head"), Ok(4));
+        assert_eq!(LAST_RECONCILED.with(|cell| cell.get()), (0, 0));
+
+        drop(hold);
+        drop(handle);
+        assert_eq!(fake_live(), 0);
     }
 }

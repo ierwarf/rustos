@@ -126,6 +126,7 @@ static INPUT_LIFECYCLE: crate::transport_lifecycle::TransportLifecycle =
     crate::transport_lifecycle::TransportLifecycle::detached();
 static WITHDRAW_PENDING: AtomicBool = AtomicBool::new(false);
 static REVOKE_PENDING: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_FINISH_LOCK: AtomicBool = AtomicBool::new(false);
 static BROKER_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECORDS_COPIED: AtomicU64 = AtomicU64::new(0);
 // Bounded drain observability. The host relay fails closed when the ring stays
@@ -181,6 +182,30 @@ impl Drop for DrainGuard {
         // later broker caller may become the sole drain owner.
         DRAIN_IN_PROGRESS.store(false, Ordering::Release);
         finish_pending_lifecycle();
+    }
+}
+
+struct LifecycleFinishGuard;
+
+impl LifecycleFinishGuard {
+    fn acquire() -> Self {
+        // ORDERING: AcqRel serializes lifecycle drain/withdraw/revoke finish
+        // transitions across callers without waiting on in-flight claims.
+        while LIFECYCLE_FINISH_LOCK
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for LifecycleFinishGuard {
+    fn drop(&mut self) {
+        // ORDERING: Release publishes all lifecycle/cursor/mapping cleanup to
+        // the next finisher.
+        LIFECYCLE_FINISH_LOCK.store(false, Ordering::Release);
     }
 }
 
@@ -395,6 +420,13 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return false;
     }
+    // ORDERING: serialize with service_pending across reading the header and
+    // validating/advancing CONSUMER so concurrent drain turns cannot observe a
+    // stale header.consumer vs CONSUMER and falsely revoke the transport.
+    while !try_claim_drain(&DRAIN_IN_PROGRESS) {
+        core::hint::spin_loop();
+    }
+    let _drain_guard = DrainGuard;
     let Some(mapping) = claim_installed_mapping() else {
         return false;
     };
@@ -923,6 +955,7 @@ fn revoke(reason: &str) {
         GENERATION.load(Ordering::Acquire),
         revoke_reason_code(reason),
     );
+    let _finish_guard = LifecycleFinishGuard::acquire();
     INPUT_LIFECYCLE.request_drain();
     // ORDERING: drain closes admission before Release publishes revoke work;
     // the generation and waiter wake follow that publication.
@@ -935,22 +968,32 @@ fn revoke(reason: &str) {
         "dvm-input-ring: transport drain requested reason={}",
         reason
     );
-    finish_pending_lifecycle();
+    finish_pending_lifecycle_locked();
 }
 
 fn finish_pending_lifecycle() {
     // ORDERING: Acquire observes the drain request and its generation before
-    // attempting the zero-claim transition to Revoked.
+    // taking the lifecycle finish lock.
     if !WITHDRAW_PENDING.load(Ordering::Acquire) && !REVOKE_PENDING.load(Ordering::Acquire) {
         return;
+    }
+    let _finish_guard = LifecycleFinishGuard::acquire();
+    finish_pending_lifecycle_locked();
+}
+
+fn finish_pending_lifecycle_locked() {
+    if !WITHDRAW_PENDING.load(Ordering::Acquire) && !REVOKE_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    if REVOKE_PENDING.load(Ordering::Acquire) {
+        INPUT_LIFECYCLE.request_drain();
     }
     let Some(retired_generation) = INPUT_LIFECYCLE.finish_drain() else {
         return;
     };
-    // ORDERING: AcqRel swap makes one finisher the withdrawal owner; Release partner is the pending-bit store in withdraw_policy_consumer.
-    if WITHDRAW_PENDING.swap(false, Ordering::AcqRel) {
-        // ORDERING: AcqRel owns the one withdrawal reset; Acquire then observes
-        // the mapping and cursor state published by the final claim.
+    if !REVOKE_PENDING.load(Ordering::Acquire) && WITHDRAW_PENDING.load(Ordering::Acquire) {
+        // ORDERING: Acquire observes the mapping and cursor state published by
+        // the final claim before retirement.
         let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
         let valid = if mapped.is_null() {
             false
@@ -963,7 +1006,7 @@ fn finish_pending_lifecycle() {
                 && header.producer.saturating_sub(consumer) <= u64::from(DVM_INPUT_RING_SLOT_COUNT)
             {
                 // ORDERING: Release publishes withdrawal's retired cursor
-                // before the pending-bit store exposes completion to L0.
+                // before reactivating the retired generation for replacement inputd.
                 store_shared_u64(
                     mapped,
                     DVM_INPUT_RING_CONSUMER_OFFSET,
@@ -980,19 +1023,24 @@ fn finish_pending_lifecycle() {
         } else {
             false
         };
-        if !valid {
-            // ORDERING: Release hands malformed withdrawal to the stronger
-            // revoke branch before this finisher relinquishes ownership.
-            REVOKE_PENDING.store(true, Ordering::Release);
+        if valid && INPUT_LIFECYCLE.activate(retired_generation) {
+            // ORDERING: Release clears WITHDRAW_PENDING only after the lifecycle
+            // is reactivated so wait_for_lifecycle_quiescence never returns with
+            // INPUT_LIFECYCLE still Revoked.
+            WITHDRAW_PENDING.store(false, Ordering::Release);
+            return;
         }
+        // ORDERING: Release hands malformed withdrawal or failed reactivation to
+        // the stronger revoke branch before this finisher relinquishes ownership.
+        REVOKE_PENDING.store(true, Ordering::Release);
     }
-    // ORDERING: AcqRel selects the sole revoke/reset owner after every claim
-    // and optional withdrawal cursor publication is complete.
-    if !REVOKE_PENDING.swap(false, Ordering::AcqRel) {
+    WITHDRAW_PENDING.store(false, Ordering::Release);
+    if !REVOKE_PENDING.load(Ordering::Acquire) {
         return;
     }
-    // ORDERING: Release clears INSTALLED first so new claims fail; the AcqRel swap then takes the mapping address exactly once for unmap.
-    INSTALLED.store(false, Ordering::Release);
+    // ORDERING: AcqRel swap takes the mapping address exactly once for unmap
+    // before INSTALLED becomes false so a concurrent installer cannot observe
+    // INSTALLED == false while SHARED_ADDR still points at the retired mapping.
     let mapped = SHARED_ADDR.swap(0, Ordering::AcqRel) as *mut u8;
     if !mapped.is_null() {
         let _ = update_shared_flags(mapped, |flags| {
@@ -1016,6 +1064,8 @@ fn finish_pending_lifecycle() {
     // before their waiter wake can observe transport absence.
     RESET_PENDING_GENERATION.store(retired_generation.max(1), Ordering::Release);
     REVOKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    INSTALLED.store(false, Ordering::Release);
+    REVOKE_PENDING.store(false, Ordering::Release);
     super::wait_queue::wake_input_waiters();
     crate::debug::warn!(input, "dvm-input-ring: transport revoked after quiescence");
 }
@@ -1740,5 +1790,79 @@ mod tests {
             admitted_policy_ready_flags(admitted & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY),
             Some(admitted)
         );
+    }
+
+    #[test]
+    fn withdraw_drain_reactivates_generation_and_falls_back_to_revoke_when_invalid() {
+        let _serial = super::super::wait_queue::INPUT_WAIT_TEST_LOCK.lock().unwrap();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                INSTALLED.store(false, Ordering::Release);
+                SHARED_ADDR.store(0, Ordering::Release);
+                GENERATION.store(0, Ordering::Release);
+                CONSUMER.store(0, Ordering::Release);
+                CONSUMER_WAKE_GENERATION.store(0, Ordering::Release);
+                RESET_PENDING_GENERATION.store(0, Ordering::Release);
+                WITHDRAW_PENDING.store(false, Ordering::Release);
+                REVOKE_PENDING.store(false, Ordering::Release);
+                IRQ_PENDING.store(false, Ordering::Release);
+                INPUT_LIFECYCLE.request_drain();
+                let _ = INPUT_LIFECYCLE.finish_drain();
+            }
+        }
+        let _restore = Restore;
+
+        let mut backing = [0_u64; 32];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        let mut header = DvmInputRingHeader::new(DVM_INPUT_RING_APERTURE_BYTES, 9).encode();
+        for (index, byte) in header.iter().enumerate() {
+            // SAFETY: private test backing with no concurrent shared access.
+            unsafe { base.add(index).write_volatile(*byte) };
+        }
+        store_shared_u64(
+            base,
+            DVM_INPUT_RING_PRODUCER_OFFSET,
+            5,
+            shared_control_publish_order(),
+        );
+        store_shared_u64(
+            base,
+            DVM_INPUT_RING_CONSUMER_OFFSET,
+            2,
+            shared_control_publish_order(),
+        );
+
+        let _ = INPUT_LIFECYCLE.finish_drain();
+        assert!(INPUT_LIFECYCLE.activate(9));
+        SHARED_ADDR.store(base as usize, Ordering::Release);
+        GENERATION.store(9, Ordering::Release);
+        CONSUMER.store(2, Ordering::Release);
+        INSTALLED.store(true, Ordering::Release);
+
+        // Withdraw retires consumer to producer=5 and reactivates generation 9.
+        INPUT_LIFECYCLE.request_drain();
+        WITHDRAW_PENDING.store(true, Ordering::Release);
+        finish_pending_lifecycle();
+        assert!(!WITHDRAW_PENDING.load(Ordering::Acquire));
+        assert!(!REVOKE_PENDING.load(Ordering::Acquire));
+        assert_eq!(CONSUMER.load(Ordering::Acquire), 5);
+        assert_eq!(load_shared_u64(base, DVM_INPUT_RING_CONSUMER_OFFSET), 5);
+        assert!(INPUT_LIFECYCLE.try_claim(9).is_some());
+
+        // Invalid withdrawal (header generation mismatch) falls back to revoke.
+        header = DvmInputRingHeader::new(DVM_INPUT_RING_APERTURE_BYTES, 10).encode();
+        for (index, byte) in header.iter().enumerate() {
+            // SAFETY: private test backing with no concurrent shared access.
+            unsafe { base.add(index).write_volatile(*byte) };
+        }
+        INPUT_LIFECYCLE.request_drain();
+        WITHDRAW_PENDING.store(true, Ordering::Release);
+        finish_pending_lifecycle();
+        assert!(!WITHDRAW_PENDING.load(Ordering::Acquire));
+        assert!(!REVOKE_PENDING.load(Ordering::Acquire));
+        assert!(!INSTALLED.load(Ordering::Acquire));
+        assert_eq!(SHARED_ADDR.load(Ordering::Acquire), 0);
+        assert!(INPUT_LIFECYCLE.try_claim(9).is_none());
     }
 }

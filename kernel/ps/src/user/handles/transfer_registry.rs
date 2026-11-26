@@ -45,10 +45,28 @@ enum IpcTransferState {
     Enqueued,
 }
 
+const FREE_NONE: usize = usize::MAX;
+const SLOT_INDEX_MASK: u64 = 0xffff_ffff;
+
+const fn encode_transfer_id(slot_index: usize, generation: u32) -> u64 {
+    ((generation as u64) << 32) | ((slot_index as u64) + 1)
+}
+
+fn decode_slot_index(transfer_id: u64) -> Option<usize> {
+    if transfer_id == 0 {
+        return None;
+    }
+    let raw_index = (transfer_id & SLOT_INDEX_MASK).checked_sub(1)?;
+    let index = usize::try_from(raw_index).ok()?;
+    (index < MAX_PENDING_IPC_TRANSFER_OBJECTS).then_some(index)
+}
+
 struct IpcTransferSlot {
     transfer_id: u64,
     nonce: u64,
     batch_generation: u64,
+    generation: u32,
+    next_free: usize,
     context: Option<TransferContext>,
     state: IpcTransferState,
     entry: Option<TransferredHandleEntry>,
@@ -56,10 +74,16 @@ struct IpcTransferSlot {
 
 impl IpcTransferSlot {
     const fn empty() -> Self {
+        Self::vacant(1, FREE_NONE)
+    }
+
+    const fn vacant(generation: u32, next_free: usize) -> Self {
         Self {
             transfer_id: 0,
             nonce: 0,
             batch_generation: 0,
+            generation,
+            next_free,
             context: None,
             state: IpcTransferState::Vacant,
             entry: None,
@@ -70,13 +94,25 @@ impl IpcTransferSlot {
 struct IpcTransferRegistry {
     slots: [IpcTransferSlot; MAX_PENDING_IPC_TRANSFER_OBJECTS],
     len: usize,
+    free_head: usize,
 }
 
 impl IpcTransferRegistry {
     const fn new() -> Self {
+        let mut slots = [const { IpcTransferSlot::empty() }; MAX_PENDING_IPC_TRANSFER_OBJECTS];
+        let mut index = 0;
+        while index < MAX_PENDING_IPC_TRANSFER_OBJECTS {
+            slots[index].next_free = if index + 1 < MAX_PENDING_IPC_TRANSFER_OBJECTS {
+                index + 1
+            } else {
+                FREE_NONE
+            };
+            index += 1;
+        }
         Self {
-            slots: [const { IpcTransferSlot::empty() }; MAX_PENDING_IPC_TRANSFER_OBJECTS],
+            slots,
             len: 0,
+            free_head: 0,
         }
     }
 
@@ -84,32 +120,59 @@ impl IpcTransferRegistry {
         self.len
     }
 
-    fn contains(&self, transfer_id: u64) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| slot.transfer_id == transfer_id && slot.entry.is_some())
+    fn slot_index(&self, transfer_id: u64) -> Option<usize> {
+        let index = decode_slot_index(transfer_id)?;
+        let slot = self.slots.get(index)?;
+        (slot.state != IpcTransferState::Vacant
+            && slot.transfer_id == transfer_id
+            && slot.entry.is_some())
+        .then_some(index)
+    }
+
+    fn slot_ref(&self, transfer_id: u64) -> Option<&IpcTransferSlot> {
+        let index = self.slot_index(transfer_id)?;
+        Some(&self.slots[index])
+    }
+
+    fn slot_mut(&mut self, transfer_id: u64) -> Option<&mut IpcTransferSlot> {
+        let index = self.slot_index(transfer_id)?;
+        Some(&mut self.slots[index])
     }
 
     fn get(&self, transfer_id: u64) -> Option<&TransferredHandleEntry> {
-        self.slots
-            .iter()
-            .find(|slot| slot.transfer_id == transfer_id)
-            .and_then(|slot| slot.entry.as_ref())
+        self.slot_ref(transfer_id).and_then(|slot| slot.entry.as_ref())
     }
 
-    fn insert(&mut self, transfer_id: u64, nonce: u64, entry: TransferredHandleEntry) -> bool {
-        if transfer_id == 0 || nonce == 0 || self.contains(transfer_id) {
+    fn peek_free(&self) -> Option<(usize, u64)> {
+        let index = self.free_head;
+        if index == FREE_NONE {
+            return None;
+        }
+        let slot = &self.slots[index];
+        debug_assert_eq!(slot.state, IpcTransferState::Vacant);
+        Some((index, encode_transfer_id(index, slot.generation)))
+    }
+
+    fn insert_at_free(
+        &mut self,
+        index: usize,
+        transfer_id: u64,
+        nonce: u64,
+        entry: TransferredHandleEntry,
+    ) -> bool {
+        if transfer_id == 0 || nonce == 0 || index != self.free_head {
             return false;
         }
-        let Some(slot) = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.state == IpcTransferState::Vacant)
-        else {
+        let slot = &mut self.slots[index];
+        if slot.state != IpcTransferState::Vacant {
             return false;
-        };
+        }
+        self.free_head = slot.next_free;
         slot.transfer_id = transfer_id;
         slot.nonce = nonce;
+        slot.batch_generation = 0;
+        slot.next_free = FREE_NONE;
+        slot.context = None;
         slot.state = IpcTransferState::Registered;
         slot.entry = Some(entry);
         self.len += 1;
@@ -117,27 +180,26 @@ impl IpcTransferRegistry {
     }
 
     fn remove(&mut self, transfer_id: u64) -> Option<TransferredHandleEntry> {
-        let index = self
-            .slots
-            .iter()
-            .position(|slot| slot.transfer_id == transfer_id)?;
+        let index = self.slot_index(transfer_id)?;
         self.remove_at(index)
     }
 
     fn remove_at(&mut self, index: usize) -> Option<TransferredHandleEntry> {
         let slot = self.slots.get_mut(index)?;
+        if slot.state == IpcTransferState::Vacant {
+            return None;
+        }
         let entry = slot.entry.take()?;
-        *slot = IpcTransferSlot::empty();
+        let next_generation = slot.generation.wrapping_add(1).max(1);
+        *slot = IpcTransferSlot::vacant(next_generation, self.free_head);
+        self.free_head = index;
         self.len -= 1;
         Some(entry)
     }
 
     fn ticket_matches(&self, ticket: KernelTransferTicket) -> bool {
-        self.slots.iter().any(|slot| {
-            slot.entry.is_some()
-                && slot.transfer_id == ticket.transfer_id()
-                && slot.nonce == ticket.nonce()
-                && slot.batch_generation == ticket.batch_generation()
+        self.slot_ref(ticket.transfer_id()).is_some_and(|slot| {
+            slot.batch_generation == ticket.batch_generation() && slot.nonce == ticket.nonce()
         })
     }
 }
@@ -198,7 +260,6 @@ static IPC_DEFERRED_TRANSFER_DROPS: TrackedSpinLock<
     // large fixed store through a first-use stack frame.
     TrackedSpinLock::new(DeferredTransferDropQueue::new());
 
-static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_IPC_TRANSFER_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Registers the one initial netd-owned reference of a newly created AF_INET
@@ -287,7 +348,7 @@ pub fn register_ipc_transfer_entries(
     drop(deferred);
 
     for (entry, nonce) in entries.into_iter().zip(nonces) {
-        let Some(transfer_id) = allocate_ipc_transfer_id(&objects) else {
+        let Some((slot_index, transfer_id)) = objects.peek_free() else {
             for transfer_id in inserted_ids {
                 if let Some(entry) = objects.remove(transfer_id) {
                     rollback.push(entry);
@@ -308,7 +369,7 @@ pub fn register_ipc_transfer_entries(
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         };
         assert!(
-            objects.insert(transfer_id, nonce, entry),
+            objects.insert_at_free(slot_index, transfer_id, nonce, entry),
             "validated IPC transfer slot disappeared before publication"
         );
         inserted_ids.push(transfer_id);
@@ -349,11 +410,7 @@ pub fn bind_ipc_transfer_tickets(
         {
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         }
-        let Some(slot) = objects
-            .slots
-            .iter()
-            .find(|slot| slot.transfer_id == descriptor.transfer_id())
-        else {
+        let Some(slot) = objects.slot_ref(descriptor.transfer_id()) else {
             return Err(IpcTransferRegistryError::StaleDescriptor);
         };
         let Some(entry) = slot.entry.as_ref() else {
@@ -368,9 +425,7 @@ pub fn bind_ipc_transfer_tickets(
     }
     for descriptor in descriptors {
         let slot = objects
-            .slots
-            .iter_mut()
-            .find(|slot| slot.transfer_id == descriptor.transfer_id())
+            .slot_mut(descriptor.transfer_id())
             .expect("validated transfer registry entry disappeared before binding");
         slot.batch_generation = batch_generation;
         slot.context = Some(context);
@@ -390,9 +445,7 @@ pub fn commit_ipc_transfer_enqueue(
     validate_ticket_batch(&objects, tickets, IpcTransferState::Exported)?;
     for ticket in tickets {
         let slot = objects
-            .slots
-            .iter_mut()
-            .find(|slot| slot.transfer_id == ticket.transfer_id())
+            .slot_mut(ticket.transfer_id())
             .expect("validated transfer ticket disappeared before enqueue commit");
         slot.state = IpcTransferState::Enqueued;
     }
@@ -414,9 +467,7 @@ pub fn bind_ipc_transfer_receiver_by_tickets(
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     validate_ticket_batch(&objects, tickets, IpcTransferState::Enqueued)?;
     let context = objects
-        .slots
-        .iter()
-        .find(|slot| slot.transfer_id == tickets[0].transfer_id())
+        .slot_ref(tickets[0].transfer_id())
         .and_then(|slot| slot.context)
         .ok_or(IpcTransferRegistryError::InvalidState)?;
     if context.service != service
@@ -437,9 +488,7 @@ pub fn bind_ipc_transfer_receiver_by_tickets(
     }
     for ticket in tickets {
         let slot = objects
-            .slots
-            .iter_mut()
-            .find(|slot| slot.transfer_id == ticket.transfer_id())
+            .slot_mut(ticket.transfer_id())
             .expect("validated transfer ticket disappeared during receiver bind");
         let mut bound = slot
             .context
@@ -463,9 +512,7 @@ pub fn claim_ipc_transfer_entries_by_tickets(
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     validate_ticket_batch(&objects, tickets, IpcTransferState::Enqueued)?;
     let context = objects
-        .slots
-        .iter()
-        .find(|slot| slot.transfer_id == tickets[0].transfer_id())
+        .slot_ref(tickets[0].transfer_id())
         .and_then(|slot| slot.context)
         .ok_or(IpcTransferRegistryError::InvalidState)?;
     if context.service != service
@@ -507,10 +554,8 @@ fn validate_ticket_batch(
         {
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         }
-        let Some(slot) = objects.slots.iter().find(|slot| {
-            slot.transfer_id == ticket.transfer_id()
-                && slot.nonce == ticket.nonce()
-                && slot.batch_generation == ticket.batch_generation()
+        let Some(slot) = objects.slot_ref(ticket.transfer_id()).filter(|slot| {
+            slot.batch_generation == ticket.batch_generation() && slot.nonce == ticket.nonce()
         }) else {
             return Err(IpcTransferRegistryError::StaleDescriptor);
         };
@@ -604,16 +649,6 @@ pub fn take_deferred_ipc_transfer_drops(limit: usize) -> Vec<TransferredHandleEn
     let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
     deferred.take_prefix(limit, &mut taken);
     taken
-}
-
-fn allocate_ipc_transfer_id(objects: &IpcTransferRegistry) -> Option<u64> {
-    for _ in 0..MAX_PENDING_IPC_TRANSFER_OBJECTS {
-        let id = NEXT_IPC_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
-        if id != 0 && !objects.contains(id) {
-            return Some(id);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -941,5 +976,63 @@ mod transfer_registry_tests {
         drop(duplicated);
         assert!(!ConsoleHandle::token_is_live(token));
         assert_eq!(ConsoleHandle::stream_for_token(token), None);
+    }
+
+    #[test]
+    fn slot_reuse_bumps_generation_and_satisfies_ticket_wire_abi() {
+        let token = u64::MAX - 704;
+        let device =
+            DeviceHandle::from_parts_with_token(DeviceId::Input, DeviceAccessKind::Evdev, token);
+        let mk_entry = || {
+            TransferredHandleEntry::from_entry(HandleEntry::new(
+                KernelHandle::Device(device),
+                0,
+                linux_abi::O_RDONLY,
+            ))
+            .expect("transferable input")
+        };
+
+        let mut registry = IpcTransferRegistry::new();
+        let (slot1, id1) = registry.peek_free().expect("free slot");
+        assert_eq!(slot1, 0);
+        assert_eq!(id1, (1_u64 << 32) | 1);
+        assert!(registry.insert_at_free(slot1, id1, 11, mk_entry()));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(id1).is_some());
+
+        let wire = rustos_user_abi::syscall::IpcTransferTicketWire::new(id1, 11, 13)
+            .expect("encoded transfer_id satisfies wire ABI");
+        assert_eq!(
+            rustos_user_abi::syscall::IpcTransferTicketWire::decode(&wire.encode()),
+            Some(wire)
+        );
+
+        let removed = registry.remove(id1).expect("remove first");
+        drop(removed);
+        assert_eq!(registry.len(), 0);
+        assert!(registry.get(id1).is_none());
+
+        // Next allocation pops the freed slot from `free_head` with incremented generation.
+        let (slot2, id2) = registry.peek_free().expect("reused free slot");
+        assert_eq!(slot2, slot1);
+        assert_eq!(id2, (2_u64 << 32) | 1);
+        assert!(registry.insert_at_free(slot2, id2, 17, mk_entry()));
+        assert!(registry.get(id1).is_none(), "stale generation must not alias slot");
+        assert!(registry.get(id2).is_some());
+        drop(registry.remove(id2).expect("cleanup"));
+
+        // Also exercise the global registry path end-to-end with ABI wire encoding.
+        let d1 = register_ipc_transfer_entries(alloc::vec![mk_entry()]).expect("global register");
+        let gid1 = d1[0].transfer_id();
+        assert_ne!(gid1, 0);
+        assert!((gid1 >> 32) >= 1);
+        assert!(((gid1 & SLOT_INDEX_MASK) - 1) < MAX_PENDING_IPC_TRANSFER_OBJECTS as u64);
+        assert!(rustos_user_abi::syscall::IpcTransferTicketWire::new(gid1, 19, 23).is_some());
+        let taken = take_ipc_transfer_entries(&d1).expect("global take");
+        assert!(matches!(
+            take_ipc_transfer_entries(&d1),
+            Err(IpcTransferRegistryError::StaleDescriptor)
+        ));
+        drop(taken);
     }
 }

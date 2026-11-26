@@ -188,6 +188,13 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_PIPE2 => [W, U, W, W, W, W],
         SYS_EVENTFD => [U, W, W, W, W, W],
         SYS_EVENTFD2 => [U, U, W, W, W, W],
+        SYS_TIMERFD_CREATE => [S, U, W, W, W, W],
+        SYS_TIMERFD_SETTIME => [S, U, W, W, W, W],
+        SYS_TIMERFD_GETTIME => [S, W, W, W, W, W],
+        SYS_NAME_TO_HANDLE_AT => [S, W, W, W, U, W],
+        SYS_PKEY_MPROTECT => [W, W, U, S, W, W],
+        SYS_PKEY_ALLOC => [U, U, W, W, W, W],
+        SYS_PKEY_FREE => [S, W, W, W, W, W],
         // int flags
         SYS_INOTIFY_INIT1 => [U, W, W, W, W, W],
         // int fd, const char *path, uint32_t mask

@@ -1108,28 +1108,6 @@ impl ProcessAddressSpace {
         Ok(unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) })
     }
 
-    fn protect_user_page(
-        &mut self,
-        virt: VirtAddr,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
-        // Preserve it across mprotect so a write-combine external mapping
-        // cannot silently become write-back and create conflicting aliases.
-        // Software ownership and COW tags are likewise lifecycle evidence,
-        // not protection requested by mprotect, and may never be detached.
-        let p1 = p1_index(virt);
-        let pt = self.leaf_pt_mut(virt)?;
-        let pt_entry = &mut pt[p1];
-        if pt_entry.is_unused() {
-            return Err(AddressSpaceError::NotMapped);
-        }
-        let updated = preserve_4k_leaf_pat(pt_entry.flags(), flags);
-        pt_entry.set_addr(pt_entry.addr(), updated);
-        self.flush_if_active(virt);
-        Ok(())
-    }
-
     fn set_user_page_flags_exact_without_flush(
         &mut self,
         virt: VirtAddr,
@@ -1494,78 +1472,6 @@ fn preserve_4k_leaf_pat(existing: PageTableFlags, requested: PageTableFlags) -> 
         preserved.difference(PageTableFlags::WRITABLE)
     } else {
         preserved
-    }
-}
-
-enum UserPageLookup {
-    NotUser,
-    MissingPml4,
-    MissingPdpt,
-    MissingPd,
-    MissingPt,
-    Present,
-}
-
-impl UserPageLookup {
-    /// Whether the walk found no leaf because a level of its path is absent.
-    ///
-    /// Every absent level is an ordinary demand state once intermediate tables
-    /// are published at fault time rather than at reservation time: an
-    /// untouched page has no leaf, and an untouched 2 MiB block has no page
-    /// table to hold one. Treating only a missing leaf as ordinary would make
-    /// `munmap` and `mprotect` fail on a range the process never touched.
-    fn is_absent(&self) -> bool {
-        matches!(
-            self,
-            Self::MissingPml4 | Self::MissingPdpt | Self::MissingPd | Self::MissingPt
-        )
-    }
-}
-
-impl ProcessAddressSpace {
-    fn lookup_user_page_state(&self, virt: VirtAddr) -> UserPageLookup {
-        if !is_user_addr(virt.as_u64()) {
-            return UserPageLookup::NotUser;
-        }
-
-        let p4 = p4_index(virt);
-        let root = self.root_table_ref();
-        let pml4_entry = &root[p4];
-        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return UserPageLookup::MissingPml4;
-        }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
-        let pdpt_entry = &pdpt[p3_index(virt)];
-        if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return UserPageLookup::MissingPdpt;
-        }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
-        let pd_entry = &pd[p2_index(virt)];
-        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return UserPageLookup::MissingPd;
-        }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
-        let pt_entry = &pt[p1_index(virt)];
-        if pt_entry.is_unused() {
-            return UserPageLookup::MissingPt;
-        }
-
-        UserPageLookup::Present
     }
 }
 

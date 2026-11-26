@@ -113,7 +113,7 @@ pub(super) fn syscall_linux_setrlimit(resource: u64, rlim_ptr: u64) -> u64 {
 
 /// Priority range of `policy`, or `None` for an unknown policy.
 pub(super) fn sched_priority_range(policy: i64) -> Option<(u64, u64)> {
-    match policy {
+    match policy as i32 as i64 {
         linux_abi::SCHED_FIFO | linux_abi::SCHED_RR => {
             Some((linux_abi::SCHED_RT_PRIORITY_MIN, linux_abi::SCHED_RT_PRIORITY_MAX))
         }
@@ -123,6 +123,7 @@ pub(super) fn sched_priority_range(policy: i64) -> Option<(u64, u64)> {
 }
 
 pub(super) fn syscall_linux_sched_get_priority(policy: i64, max: bool) -> u64 {
+    let policy = policy as i32 as i64;
     match sched_priority_range(policy) {
         Some((min_prio, max_prio)) => if max { max_prio } else { min_prio },
         None => linux_errno(LINUX_EINVAL),
@@ -134,6 +135,7 @@ pub(super) fn syscall_linux_sched_get_priority(policy: i64, max: bool) -> u64 {
 /// does not exist is `ESRCH`. Every task has the same fixed policy, so reading
 /// another process's scheduling attributes needs no more than its existence.
 pub(super) fn sched_target(pid: i64) -> Result<bool, i64> {
+    let pid = pid as i32 as i64;
     if pid < 0 {
         return Err(LINUX_EINVAL);
     }
@@ -170,6 +172,7 @@ const SCHED_RESET_ON_FORK: i64 = 0x4000_0000;
 
 /// The result of `sched_setscheduler(policy, priority)` for this kernel.
 pub(super) fn sched_set_outcome(policy: i64, priority: i32) -> Result<(), i64> {
+    let policy = policy as i32 as i64;
     let Some((min_prio, max_prio)) = sched_priority_range(policy) else {
         return Err(LINUX_EINVAL);
     };
@@ -197,6 +200,7 @@ fn sched_policy_without_flags(word: i64) -> Result<i64, i64> {
 /// a negative pid or a NULL `param` is `EINVAL` (not `EFAULT`), then the
 /// `param` copy, then the target, then the policy.
 fn read_sched_param(pid: i64, param_ptr: u64) -> Result<linux_abi::LinuxSchedParam, i64> {
+    let pid = pid as i32 as i64;
     if param_ptr == 0 || pid < 0 {
         return Err(LINUX_EINVAL);
     }
@@ -205,6 +209,7 @@ fn read_sched_param(pid: i64, param_ptr: u64) -> Result<linux_abi::LinuxSchedPar
 
 pub(super) fn syscall_linux_sched_setscheduler(pid: i64, policy: i64, param_ptr: u64) -> u64 {
     linux_unit_result((|| {
+        let pid = pid as i32 as i64;
         let policy = sched_policy_without_flags(policy)?;
         let param = read_sched_param(pid, param_ptr)?;
         sched_write_target(pid)?;
@@ -214,6 +219,7 @@ pub(super) fn syscall_linux_sched_setscheduler(pid: i64, policy: i64, param_ptr:
 
 pub(super) fn syscall_linux_sched_setparam(pid: i64, param_ptr: u64) -> u64 {
     linux_unit_result((|| {
+        let pid = pid as i32 as i64;
         let param = read_sched_param(pid, param_ptr)?;
         sched_write_target(pid)?;
         // The task's policy is always SCHED_OTHER, whose only priority is 0.
@@ -398,9 +404,31 @@ mod tests {
         // The upper register half of a C `int` is not ABI.
         assert_eq!(sched_policy_without_flags(0xFFFF_FFFF), Err(LINUX_EINVAL));
         assert_eq!(sched_policy_without_flags(0x5_0000_0001), Ok(1));
+        assert_eq!(sched_priority_range(0x5_0000_0000 | linux_abi::SCHED_OTHER), Some((0, 0)));
+        assert_eq!(sched_priority_range(0xFFFF_FFFF), None);
+        assert_eq!(
+            syscall_linux_sched_get_priority(0x5_0000_0000 | linux_abi::SCHED_FIFO, false),
+            1
+        );
+        assert_eq!(
+            syscall_linux_sched_get_priority(0x5_0000_0000 | linux_abi::SCHED_FIFO, true),
+            99
+        );
+        assert_eq!(
+            syscall_linux_sched_get_priority(0xFFFF_FFFF, false),
+            linux_errno(LINUX_EINVAL)
+        );
+        assert_eq!(sched_set_outcome(0x5_0000_0000 | linux_abi::SCHED_OTHER, 0), Ok(()));
+        assert_eq!(sched_set_outcome(0xFFFF_FFFF, 0), Err(LINUX_EINVAL));
         // A NULL param or negative pid is EINVAL before anything is read.
         assert_eq!(read_sched_param(0, 0).err(), Some(LINUX_EINVAL));
         assert_eq!(read_sched_param(-1, 0x1000).err(), Some(LINUX_EINVAL));
+        assert_eq!(read_sched_param(0xFFFF_FFFF, 0x1000).err(), Some(LINUX_EINVAL));
+        assert_eq!(read_sched_param(0x5_0000_FFFF_FFFF_u64 as i64, 0x1000).err(), Some(LINUX_EINVAL));
+        assert_eq!(sched_target(-1), Err(LINUX_EINVAL));
+        assert_eq!(sched_target(0xFFFF_FFFF), Err(LINUX_EINVAL));
+        assert_eq!(sched_target(0x5_0000_FFFF_FFFF_u64 as i64), Err(LINUX_EINVAL));
+        assert_eq!(sched_target(0x5_0000_0000), Ok(false));
     }
 
     #[test]

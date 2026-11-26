@@ -87,61 +87,49 @@
         });
     }
 
-    /// Mirrors `FaultFramePool`: an availability count that authorizes a claim
-    /// and a slot array the claim then scans.
+    /// A ready bit grants the right to consume its already-published slot.
     #[derive(Default)]
     struct FaultFrameReserve {
-        available: AtomicUsize,
+        ready: AtomicUsize,
         slot_a: AtomicUsize,
         slot_b: AtomicUsize,
     }
 
-    /// The count is authority, not a census.
-    ///
-    /// A claimer decrements before it scans, so two claimers can never be
-    /// promised the same frame, and a claimer that wins the decrement always
-    /// finds one. The previous shape recomputed the depth by sweeping the
-    /// array on every fault, which is both O(pool) on the fault path and
-    /// unable to state this property at all.
+    /// Concurrent claimers race for the published bits, not the frame slots.
     #[test]
     fn two_claimers_never_receive_the_same_reserve_frame() {
         loom::model(|| {
             let pool = Arc::new(FaultFrameReserve::default());
-            pool.slot_a.store(11, Ordering::Release);
-            pool.slot_b.store(22, Ordering::Release);
-            pool.available.store(2, Ordering::Release);
+            pool.slot_a.store(11, Ordering::Relaxed);
+            pool.ready.store(1, Ordering::Release);
 
-            let claim = |pool: Arc<FaultFrameReserve>| {
+            let claim = |pool: Arc<FaultFrameReserve>, publish_b| {
                 thread::spawn(move || {
-                    let granted = pool
-                        .available
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                            available.checked_sub(1)
-                        })
-                        .is_ok();
-                    if !granted {
-                        return 0;
+                    if publish_b {
+                        pool.slot_b.store(22, Ordering::Relaxed);
+                        pool.ready.fetch_or(2, Ordering::Release);
                     }
-                    let taken = pool.slot_a.swap(0, Ordering::AcqRel);
-                    if taken != 0 {
-                        return taken;
+                    let mut ready = pool.ready.load(Ordering::Relaxed);
+                    while ready != 0 {
+                        let mask = 1 << ready.trailing_zeros();
+                        ready &= !mask;
+                        if pool.ready.fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
+                            let slot = if mask == 1 { &pool.slot_a } else { &pool.slot_b };
+                            let frame = slot.swap(0, Ordering::AcqRel);
+                            assert_ne!(frame, 0, "a granted bit must have a frame");
+                            return frame;
+                        }
                     }
-                    let taken = pool.slot_b.swap(0, Ordering::AcqRel);
-                    assert_ne!(
-                        taken, 0,
-                        "a claimer won the count but the array held no frame"
-                    );
-                    taken
+                    0
                 })
             };
-            let first = claim(Arc::clone(&pool));
-            let second = claim(Arc::clone(&pool));
+            let first = claim(Arc::clone(&pool), true);
+            let second = claim(Arc::clone(&pool), false);
             let first = first.join().unwrap();
             let second = second.join().unwrap();
-            assert!(
-                first == 0 || second == 0 || first != second,
-                "two claimers received the same frame: {first} and {second}"
-            );
+            assert!(first == 0 || second == 0 || first != second);
+            let ready = pool.ready.load(Ordering::Relaxed);
+            assert_eq!(2 - ready.count_ones(), u32::from(first != 0) + u32::from(second != 0));
         });
     }
 

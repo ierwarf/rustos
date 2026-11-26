@@ -356,13 +356,6 @@ pub(super) fn format_comm(thread: &ThreadFacts) -> Vec<u8> {
     out
 }
 
-/// `/proc/<pid>/oom_score_adj`: the value last written (default 0). It is
-/// recorded and inherited but ranks nothing: RustOS has no OOM victim
-/// selection for it to influence.
-pub(super) fn format_oom_score_adj(process: &ProcessFacts) -> Vec<u8> {
-    alloc::format!("{}\n", process.oom_score_adj).into_bytes()
-}
-
 // ---- limits ---------------------------------------------------------------------------
 
 /// `(resource index, label, units)` of the rlimits syscalld stores.
@@ -715,7 +708,6 @@ mod tests {
     #[test]
     fn comm_and_oom_score_adj() {
         assert_eq!(format_comm(&thread(1, "abc")), b"abc\n");
-        assert_eq!(format_oom_score_adj(&facts(vec![])), b"-250\n");
     }
 
     #[test]

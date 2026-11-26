@@ -3,7 +3,6 @@
 // keeps framebuffer mapping, current-process user-copy, display surface handles,
 // and hot present substrate.
 use alloc::vec;
-use alloc::vec::Vec;
 use core::convert::TryFrom;
 
 use x86_64::VirtAddr;
@@ -220,28 +219,67 @@ pub(crate) fn ioctl(
                 .mapped_region()
                 .ok_or(DeviceError::InvalidArgument)?;
             validate_surface_mapping(surface, region)?;
+            const STACK_BATCH_BYTES: usize = 4096;
+            const MAX_DAMAGE_RECTS: usize =
+                driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize;
             let batch_len = request.batch_len as usize;
-            let mut batch = vec![0_u8; batch_len];
             process_state
                 .address_space()
                 .validate_user_read_buffer(VirtAddr::new(request.batch_ptr), batch_len)?;
+            let mut stack_batch = [0_u8; STACK_BATCH_BYTES];
+            let mut heap_batch;
+            let batch: &mut [u8] = if batch_len <= STACK_BATCH_BYTES {
+                &mut stack_batch[..batch_len]
+            } else {
+                heap_batch = vec![0_u8; batch_len];
+                &mut heap_batch
+            };
             process_state
                 .address_space()
-                .copy_from_user(VirtAddr::new(request.batch_ptr), &mut batch)?;
-            let mut damage = Vec::with_capacity(request.damage_count as usize);
-            for index in 0..request.damage_count {
-                let offset = u64::from(index)
-                    .checked_mul(core::mem::size_of::<DisplayGpuDamage>() as u64)
-                    .and_then(|offset| request.damage_ptr.checked_add(offset))
+                .copy_from_user(VirtAddr::new(request.batch_ptr), batch)?;
+            let damage_count = request.damage_count as usize;
+            let mut raw_damage = [DisplayGpuDamage::default(); MAX_DAMAGE_RECTS];
+            let mut damage = [driver_domain_protocol::DvmGpuAtlasDamage {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }; MAX_DAMAGE_RECTS];
+            if damage_count != 0 {
+                let damage_bytes_len = damage_count
+                    .checked_mul(core::mem::size_of::<DisplayGpuDamage>())
                     .ok_or(DeviceError::InvalidArgument)?;
-                let rect =
-                    read_user_struct::<DisplayGpuDamage>(process_state.address_space(), offset)?;
-                damage.push(driver_domain_protocol::DvmGpuAtlasDamage {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                });
+                request
+                    .damage_ptr
+                    .checked_add(damage_bytes_len as u64)
+                    .ok_or(DeviceError::InvalidArgument)?;
+                let damage_ptr = VirtAddr::new(request.damage_ptr);
+                process_state
+                    .address_space()
+                    .validate_user_read_buffer(damage_ptr, damage_bytes_len)?;
+                // SAFETY: `DisplayGpuDamage` is `#[repr(C)]` (`UserDevicePod`: 16 bytes,
+                // no padding, all bit patterns valid), so `&mut raw_damage[..damage_count]`
+                // is a contiguous `damage_bytes_len`-byte buffer valid for bytewise copy.
+                let raw_damage_bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        raw_damage.as_mut_ptr().cast::<u8>(),
+                        damage_bytes_len,
+                    )
+                };
+                process_state
+                    .address_space()
+                    .copy_from_user(damage_ptr, raw_damage_bytes)?;
+                for (dst, src) in damage[..damage_count]
+                    .iter_mut()
+                    .zip(raw_damage[..damage_count].iter())
+                {
+                    *dst = driver_domain_protocol::DvmGpuAtlasDamage {
+                        x: src.x,
+                        y: src.y,
+                        width: src.width,
+                        height: src.height,
+                    };
+                }
             }
             let slot = surface.binding_slot().ok_or(DeviceError::InvalidArgument)?;
             match crate::io::dvm_display::try_submit_gpu_atlas(
@@ -250,8 +288,8 @@ pub(crate) fn ioctl(
                 surface.width(),
                 surface.height(),
                 surface.stride_bytes(),
-                &damage,
-                &batch,
+                &damage[..damage_count],
+                batch,
             ) {
                 crate::io::dvm_display::DvmGpuSubmitOutcome::Submitted => Ok(0),
                 crate::io::dvm_display::DvmGpuSubmitOutcome::Backpressured => {

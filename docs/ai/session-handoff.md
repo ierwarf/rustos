@@ -6,7 +6,19 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
-## Current state (2026-11-25, uncommitted on `master`)
+## Non-core Ring0 audit continuation
+
+- The integration branch `fix/non-core-ring0-audit` covers MM, IPC runtime,
+  I/O manager, process management and Linux compatibility. The prior UI
+  working changes are separate and are not part of this branch.
+- The integration pass completed the AF_UNIX address-buffer conversion,
+  kept futex requeue and wake-op queue selection atomic across buffer growth,
+  and preserved elapsed periods when arming an absolute realtime timerfd.
+- Refresh evidence on the exact branch before publication: focused kernel
+  tests, KVM Chrome compatibility and IPC benchmark, and the PR formal gate.
+  The earlier `bench-after.log` and `chrome-after.log` predate these changes.
+
+## Historical snapshot (2026-11-25, then uncommitted on `master`)
 
 ### Completed in this wave
 

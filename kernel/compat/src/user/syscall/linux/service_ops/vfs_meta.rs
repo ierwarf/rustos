@@ -233,7 +233,7 @@ pub fn syscall_linux_vfs_statx_str(
             path
         );
     }
-    if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, &path, flags, statx_ptr) {
+    if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, path, flags, statx_ptr) {
         return result;
     }
     linux_unit_result((|| {
@@ -241,11 +241,36 @@ pub fn syscall_linux_vfs_statx_str(
             return Err(LINUX_ENOENT);
         }
         validate_user_write_as(statx_ptr, LINUX_STATX_SIZE)?;
+        if path.is_empty() && !is_linux_at_fdcwd_for_vfs(dirfd) {
+            return match current_kernel_handle(dirfd) {
+                Some(multitask::KernelHandle::Console(console)) => {
+                    let stat = bootstrap_linux_stat(console.token_id(), 0);
+                    write_user_bytes_as(statx_ptr, &encode_linux_statx_from_stat(&stat))
+                }
+                Some(multitask::KernelHandle::DeviceBuffer(buffer)) => {
+                    let stat = device_buffer_linux_stat(&buffer);
+                    write_user_bytes_as(statx_ptr, &encode_linux_statx_from_stat(&stat))
+                }
+                Some(multitask::KernelHandle::RemoteVfs(remote)) => {
+                    let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
+                    request.fd = dirfd;
+                    request.remote_id = remote.remote_id();
+                    let response = call_vfs_checked(&request)?;
+                    let stat = decode_exact_payload::<linux_abi::LinuxStat>(
+                        &response.payload,
+                        response.payload_len,
+                    )?;
+                    write_user_bytes_as(statx_ptr, &encode_linux_statx_from_stat(&stat))
+                }
+                _ => Err(LINUX_EBADF),
+            };
+        }
+        let effective_path = if path.is_empty() { "." } else { path };
         let mut request = new_vfs_request(VFS_IPC_OP_STATX);
         proc_identity::attach_caller_exec_path(&mut request);
         request.flags = flags as u32;
         request.arg1 = mask;
-        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        populate_vfs_path_base(&mut request, dirfd, effective_path)?;
         let response = call_vfs_checked(&request)?;
         if let Some(result) = proc_identity::complete_stat(
             response.aux,
@@ -285,21 +310,26 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
     }
     if path.is_empty()
         && flags & linux_abi::AT_EMPTY_PATH != 0
+        && !is_linux_at_fdcwd_for_vfs(dirfd)
         && matches!(
             current_kernel_handle(dirfd),
             Some(
-                multitask::KernelHandle::Console(_) | multitask::KernelHandle::DeviceBuffer(_)
+                multitask::KernelHandle::Console(_)
+                    | multitask::KernelHandle::DeviceBuffer(_)
+                    | multitask::KernelHandle::RemoteVfs(_)
+                    | multitask::KernelHandle::VfsDirectory(_)
             )
         )
     {
         return syscall_linux_vfs_fstat(dirfd, stat_ptr);
     }
+    let effective_path = if path.is_empty() { "." } else { &path };
     linux_unit_result((|| {
         validate_user_write_as(stat_ptr, LINUX_STAT_SIZE)?;
         let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
         proc_identity::attach_caller_exec_path(&mut request);
         request.flags = flags as u32;
-        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        populate_vfs_path_base(&mut request, dirfd, effective_path)?;
         let response = call_vfs_checked(&request)?;
         if let Some(result) = proc_identity::complete_stat(
             response.aux,
@@ -356,12 +386,14 @@ pub fn syscall_linux_vfs_readlinkat(
 
 pub fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
     linux_result((|| {
+        const ACCESS_ALLOWED_FLAGS: u64 =
+            linux_abi::AT_EACCESS | linux_abi::AT_SYMLINK_NOFOLLOW | linux_abi::AT_EMPTY_PATH;
         let path = copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY)?;
         if path.is_empty() {
             if flags & linux_abi::AT_EMPTY_PATH == 0 {
                 return Err(LINUX_ENOENT);
             }
-            if mode & !7 != 0 {
+            if flags & !ACCESS_ALLOWED_FLAGS != 0 || mode & !7 != 0 {
                 return Err(LINUX_EINVAL);
             }
             if let Some(owner_bits) = super::anon_stat::current_owner_mode_bits(dirfd) {
@@ -467,28 +499,99 @@ fn write_stat_bytes_checked(user_ptr: u64, out: &[u8; LINUX_STAT_SIZE]) -> u64 {
     })())
 }
 
-fn write_device_buffer_stat(user_ptr: u64, buffer: &kernel_ps::api::handles::BufferCapability) -> u64 {
-    let id = buffer.identity();
+fn linux_dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0x0fff) | ((dev >> 32) & 0xffff_f000)) as u32
+}
+
+fn linux_dev_minor(dev: u64) -> u32 {
+    ((dev & 0x00ff) | ((dev >> 12) & 0xffff_ff00)) as u32
+}
+
+fn encode_linux_stat_bytes(stat: &linux_abi::LinuxStat) -> [u8; LINUX_STAT_SIZE] {
     let mut out = [0_u8; LINUX_STAT_SIZE];
-    out[0..8].copy_from_slice(&id.owner.generation.to_ne_bytes());
-    out[8..16].copy_from_slice(&id.allocation.to_ne_bytes());
-    out[16..24].copy_from_slice(&1_u64.to_ne_bytes());
-    out[24..28].copy_from_slice(&(0o020000_u32 | 0o600).to_ne_bytes());
-    out[40..48].copy_from_slice(&rustos_user_abi::syscall::APP_BUFFER_STAT_RDEV.to_ne_bytes());
-    out[48..56].copy_from_slice(&(buffer.len() as i64).to_ne_bytes());
-    out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
-    write_stat_bytes_checked(user_ptr, &out)
+    out[0..8].copy_from_slice(&stat.st_dev.to_ne_bytes());
+    out[8..16].copy_from_slice(&stat.st_ino.to_ne_bytes());
+    out[16..24].copy_from_slice(&stat.st_nlink.to_ne_bytes());
+    out[24..28].copy_from_slice(&stat.st_mode.to_ne_bytes());
+    out[28..32].copy_from_slice(&stat.st_uid.to_ne_bytes());
+    out[32..36].copy_from_slice(&stat.st_gid.to_ne_bytes());
+    out[40..48].copy_from_slice(&stat.st_rdev.to_ne_bytes());
+    out[48..56].copy_from_slice(&stat.st_size.to_ne_bytes());
+    out[56..64].copy_from_slice(&stat.st_blksize.to_ne_bytes());
+    out[64..72].copy_from_slice(&stat.st_blocks.to_ne_bytes());
+    out[72..80].copy_from_slice(&stat.st_atim.tv_sec.to_ne_bytes());
+    out[80..88].copy_from_slice(&stat.st_atim.tv_nsec.to_ne_bytes());
+    out[88..96].copy_from_slice(&stat.st_mtim.tv_sec.to_ne_bytes());
+    out[96..104].copy_from_slice(&stat.st_mtim.tv_nsec.to_ne_bytes());
+    out[104..112].copy_from_slice(&stat.st_ctim.tv_sec.to_ne_bytes());
+    out[112..120].copy_from_slice(&stat.st_ctim.tv_nsec.to_ne_bytes());
+    out
+}
+
+fn encode_linux_statx_from_stat(stat: &linux_abi::LinuxStat) -> [u8; LINUX_STATX_SIZE] {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let mut out = [0_u8; LINUX_STATX_SIZE];
+    out[0..4].copy_from_slice(&STATX_BASIC_STATS.to_ne_bytes());
+    let blksize = u32::try_from(stat.st_blksize.max(0)).unwrap_or(4096);
+    out[4..8].copy_from_slice(&blksize.to_ne_bytes());
+    let nlink = u32::try_from(stat.st_nlink).unwrap_or(u32::MAX);
+    out[16..20].copy_from_slice(&nlink.to_ne_bytes());
+    out[20..24].copy_from_slice(&stat.st_uid.to_ne_bytes());
+    out[24..28].copy_from_slice(&stat.st_gid.to_ne_bytes());
+    out[28..30].copy_from_slice(&(stat.st_mode as u16).to_ne_bytes());
+    out[32..40].copy_from_slice(&stat.st_ino.to_ne_bytes());
+    out[40..48].copy_from_slice(&(stat.st_size.max(0) as u64).to_ne_bytes());
+    out[48..56].copy_from_slice(&(stat.st_blocks.max(0) as u64).to_ne_bytes());
+    out[64..72].copy_from_slice(&stat.st_atim.tv_sec.to_ne_bytes());
+    out[72..76].copy_from_slice(&(stat.st_atim.tv_nsec as u32).to_ne_bytes());
+    out[96..104].copy_from_slice(&stat.st_ctim.tv_sec.to_ne_bytes());
+    out[104..108].copy_from_slice(&(stat.st_ctim.tv_nsec as u32).to_ne_bytes());
+    out[112..120].copy_from_slice(&stat.st_mtim.tv_sec.to_ne_bytes());
+    out[120..124].copy_from_slice(&(stat.st_mtim.tv_nsec as u32).to_ne_bytes());
+    out[128..132].copy_from_slice(&linux_dev_major(stat.st_rdev).to_ne_bytes());
+    out[132..136].copy_from_slice(&linux_dev_minor(stat.st_rdev).to_ne_bytes());
+    out[136..140].copy_from_slice(&linux_dev_major(stat.st_dev).to_ne_bytes());
+    out[140..144].copy_from_slice(&linux_dev_minor(stat.st_dev).to_ne_bytes());
+    out[144..152].copy_from_slice(&stat.st_dev.to_ne_bytes());
+    out
+}
+
+fn device_buffer_linux_stat(
+    buffer: &kernel_ps::api::handles::BufferCapability,
+) -> linux_abi::LinuxStat {
+    let id = buffer.identity();
+    linux_abi::LinuxStat {
+        st_dev: id.owner.generation,
+        st_ino: id.allocation,
+        st_nlink: 1,
+        st_mode: 0o020000 | 0o600,
+        st_rdev: rustos_user_abi::syscall::APP_BUFFER_STAT_RDEV,
+        st_size: buffer.len() as i64,
+        st_blksize: 4096,
+        ..linux_abi::LinuxStat::default()
+    }
+}
+
+fn bootstrap_linux_stat(inode: u64, len: u64) -> linux_abi::LinuxStat {
+    linux_abi::LinuxStat {
+        st_ino: inode.max(1),
+        st_nlink: 1,
+        st_mode: 0o100000 | 0o555,
+        st_size: len as i64,
+        st_blksize: 4096,
+        st_blocks: len.div_ceil(512) as i64,
+        ..linux_abi::LinuxStat::default()
+    }
+}
+
+fn write_device_buffer_stat(user_ptr: u64, buffer: &kernel_ps::api::handles::BufferCapability) -> u64 {
+    let stat = device_buffer_linux_stat(buffer);
+    write_stat_bytes_checked(user_ptr, &encode_linux_stat_bytes(&stat))
 }
 
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
-    let mut out = [0_u8; LINUX_STAT_SIZE];
-    out[8..16].copy_from_slice(&inode.max(1).to_ne_bytes());
-    out[16..24].copy_from_slice(&1_u64.to_ne_bytes());
-    out[24..28].copy_from_slice(&(0o100000_u32 | 0o555).to_ne_bytes());
-    out[48..56].copy_from_slice(&(len as i64).to_ne_bytes());
-    out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
-    out[64..72].copy_from_slice(&(len.div_ceil(512) as i64).to_ne_bytes());
-    write_stat_bytes_checked(user_ptr, &out)
+    let stat = bootstrap_linux_stat(inode, len);
+    write_stat_bytes_checked(user_ptr, &encode_linux_stat_bytes(&stat))
 }
 
 // RING3-MIGRATION-REFERENCE END: kernel-owned handle stat substrate.
@@ -852,6 +955,7 @@ fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
         multitask::KernelHandle::DeviceBuffer(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DEVICE_BUFFER,
         multitask::KernelHandle::Pipe(_) => rustos_user_abi::handle_kind::HANDLE_KIND_PIPE,
         multitask::KernelHandle::EventFd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_EVENTFD,
+        multitask::KernelHandle::TimerFd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_TIMERFD,
         multitask::KernelHandle::Job(_) => rustos_user_abi::handle_kind::HANDLE_KIND_JOB,
     }
 }
@@ -1229,6 +1333,18 @@ fn syscall_linux_net6_once(
     request.arg4 = arg4;
     request.arg5 = arg5;
     let socket_snapshot = populate_netd_socket_token(&mut request);
+    if socket_snapshot.is_none()
+        && !matches!(
+            op,
+            SYSCALL_OFFLOAD_OP_LINUX_SOCKET | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
+        )
+    {
+        let errno = multitask::with_current_user_process_state(|_, _, state| {
+            missing_socket_snapshot_errno(state.handles(), arg0)
+        })
+        .unwrap_or(LINUX_EBADF);
+        return linux_errno(errno);
+    }
     let io_flags = match op {
         SYSCALL_OFFLOAD_OP_LINUX_SENDMSG | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => arg2,
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => arg3,
@@ -1443,6 +1559,14 @@ impl SocketSnapshot {
     }
     pub(super) fn uses_netd_message(&self) -> bool {
         self.is_datagram() || self.is_ipv6_datagram()
+    }
+}
+
+pub(super) fn missing_socket_snapshot_errno(handles: &multitask::HandleTable, fd: u64) -> i64 {
+    if handles.get_entry(fd).is_some() {
+        LINUX_ENOTSOCK
+    } else {
+        LINUX_EBADF
     }
 }
 

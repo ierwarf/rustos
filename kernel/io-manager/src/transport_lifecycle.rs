@@ -157,13 +157,10 @@ impl TransportLifecycle {
     pub(crate) fn finish_drain(&self) -> Option<u64> {
         let current = self.state_epoch.load(Ordering::Acquire);
         let state = TransportState::from_word(current);
-        if self.in_flight.load(Ordering::Acquire) != 0 {
+        if state != TransportState::Draining {
             return None;
         }
-        if state == TransportState::Revoked {
-            return Some(unpack_epoch(current));
-        }
-        if state != TransportState::Draining {
+        if self.in_flight.load(Ordering::Acquire) != 0 {
             return None;
         }
         let epoch = unpack_epoch(current);
@@ -287,6 +284,7 @@ mod tests {
         assert!(!claim.validate_current());
         drop(claim);
         assert_eq!(lifecycle.finish_drain(), Some(7));
+        assert_eq!(lifecycle.finish_drain(), None);
         assert!(lifecycle.activate(8));
         assert_eq!(lifecycle.epoch(), 8);
     }
@@ -298,6 +296,7 @@ mod tests {
         lifecycle.request_drain();
         assert!(!activation.commit());
         assert_eq!(lifecycle.finish_drain(), Some(11));
+        assert_eq!(lifecycle.finish_drain(), None);
         assert!(lifecycle.activate(12));
     }
 }

@@ -138,6 +138,7 @@ pub enum AppBufferTransportError {
 struct Pending {
     sequence: u64,
     kind: u64,
+    context_epoch: u32,
     capability: BufferCapability,
 }
 
@@ -151,6 +152,15 @@ static MAILBOX: Mutex<Mailbox> = Mutex::new(Mailbox {
     pending: None,
 });
 
+fn clear_stale_pending(mailbox: &mut Mailbox) {
+    if let Some(pending) = mailbox.pending.as_ref()
+        && (TRANSPORT_REVOKED.load(Ordering::Acquire)
+            || GPU_CONTEXT_EPOCH.load(Ordering::Acquire) != pending.context_epoch)
+    {
+        let _ = mailbox.pending.take();
+    }
+}
+
 /// The caller holds the exact live service-publication lease until this
 /// operation has published. Geometry is policy-selected; range and identity
 /// must match the independently retained kernel capability.
@@ -159,7 +169,12 @@ pub fn begin(
     record: DvmAppBuffer,
     revoke: bool,
 ) -> Result<u64, AppBufferTransportError> {
+    service_gpu_epoch_reset();
+    if INSTALLED.load(Ordering::Acquire) {
+        drain_dvm_control();
+    }
     let mut mailbox = MAILBOX.lock();
+    clear_stale_pending(&mut mailbox);
     if mailbox.pending.is_some() {
         return Err(AppBufferTransportError::Busy);
     }
@@ -171,6 +186,7 @@ pub fn begin(
     {
         return Err(AppBufferTransportError::Unavailable);
     }
+    let context_epoch = GPU_CONTEXT_EPOCH.load(Ordering::Acquire);
     if !verify_aperture() {
         return Err(AppBufferTransportError::Unavailable);
     }
@@ -204,6 +220,7 @@ pub fn begin(
     mailbox.pending = Some(Pending {
         sequence,
         kind,
+        context_epoch,
         capability: capability.clone(),
     });
     mailbox.sequence = sequence;
@@ -228,6 +245,10 @@ pub fn begin(
 /// A missing, stale or failed response never manufactures provider retirement.
 /// The retained capability cannot disappear while a response is outstanding.
 pub fn take(sequence: u64) -> Result<Option<BufferCapability>, AppBufferTransportError> {
+    service_gpu_epoch_reset();
+    if INSTALLED.load(Ordering::Acquire) {
+        drain_dvm_control();
+    }
     let mut mailbox = MAILBOX.lock();
     let pending = mailbox
         .pending
@@ -237,8 +258,16 @@ pub fn take(sequence: u64) -> Result<Option<BufferCapability>, AppBufferTranspor
         return Err(AppBufferTransportError::Stale);
     }
     // ORDERING: Acquire loads pair with the Release stores in revoke_transport/drain_dvm_control; a response from a
-    // revoked or unready peer is never accepted.
-    if !GUI_DVM_PEER_READY.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
+    // revoked or prior-epoch peer is never accepted and drops the stalled mailbox slot.
+    if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        let _ = mailbox.pending.take();
+        return Err(AppBufferTransportError::Unavailable);
+    }
+    if GPU_CONTEXT_EPOCH.load(Ordering::Acquire) != pending.context_epoch {
+        let _ = mailbox.pending.take();
+        return Err(AppBufferTransportError::Stale);
+    }
+    if !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
         return Err(AppBufferTransportError::Unavailable);
     }
     if read_u64(DVM_APP_BUFFER_RESPONSE_SEQUENCE_OFFSET) != sequence {
@@ -270,4 +299,37 @@ pub fn take(sequence: u64) -> Result<Option<BufferCapability>, AppBufferTranspor
             .map_err(|_| AppBufferTransportError::Stale)?;
     }
     Ok(Some(pending.capability))
+}
+
+#[cfg(test)]
+pub(super) fn insert_pending_for_test(
+    sequence: u64,
+    context_epoch: u32,
+    capability: &BufferCapability,
+) -> u64 {
+    let mut mailbox = MAILBOX.lock();
+    mailbox.pending = Some(Pending {
+        sequence,
+        kind: DVM_APP_BUFFER_REQUEST_EXPORT,
+        context_epoch,
+        capability: capability.clone(),
+    });
+    mailbox.sequence = sequence;
+    sequence
+}
+
+#[cfg(test)]
+pub(super) fn has_pending_for_test() -> bool {
+    MAILBOX.lock().pending.is_some()
+}
+
+#[cfg(test)]
+pub(super) fn clear_stale_pending_for_test() {
+    let mut mailbox = MAILBOX.lock();
+    clear_stale_pending(&mut mailbox);
+}
+
+#[cfg(test)]
+pub(super) fn clear_pending_for_test() {
+    let _ = MAILBOX.lock().pending.take();
 }

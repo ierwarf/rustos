@@ -131,32 +131,36 @@ pub(super) fn tile_range(spans: &[Span], start: u64, end: u64) -> Option<Vec<Spa
     )
 }
 
-/// Per-page residency of `pages` pages from `start`, read from the live leaves.
-fn resident_pages(start: u64, pages: usize) -> Option<Vec<bool>> {
+/// Fills `out` with per-page `0`/`1` residency from `start`, read from the live leaves.
+fn resident_pages(start: u64, out: &mut [u8]) -> Option<()> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         let space = process_state.address_space();
-        (0..pages)
-            .map(|index| {
-                space
-                    .translate_user(VirtAddr::new(start.wrapping_add(index as u64 * PAGE)))
-                    .is_some()
-            })
-            .collect::<Vec<bool>>()
+        for (index, slot) in out.iter_mut().enumerate() {
+            let present = space
+                .translate_user(VirtAddr::new(start.wrapping_add(index as u64 * PAGE)))
+                .is_some();
+            *slot = u8::from(present);
+        }
     })
 }
 
-/// Sub-ranges of `[start, end)` that are neither covered by a published region
+/// Sub-ranges of `[start, end)` that are neither covered by `spans`
 /// nor resident, ascending.
-fn unmapped_ranges(start: u64, end: u64) -> Result<Vec<(u64, u64)>, i64> {
-    let spans = current_spans()?;
+fn unmapped_ranges_with_spans(
+    spans: &[Span],
+    start: u64,
+    end: u64,
+) -> Result<Vec<(u64, u64)>, i64> {
     let mut holes: Vec<(u64, u64)> = Vec::new();
-    for (gap_start, gap_end) in uncovered_ranges(&spans, start, end) {
+    let mut buf = Vec::new();
+    for (gap_start, gap_end) in uncovered_ranges(spans, start, end) {
         let mut cursor = gap_start;
         while cursor < gap_end {
             let pages = (((gap_end - cursor) / PAGE) as usize).min(SCAN_CHUNK_PAGES);
-            let resident = resident_pages(cursor, pages).ok_or(LINUX_ESRCH)?;
-            for (index, present) in resident.iter().copied().enumerate() {
-                if present {
+            buf.resize(pages, 0);
+            resident_pages(cursor, &mut buf).ok_or(LINUX_ESRCH)?;
+            for (index, &present) in buf.iter().enumerate() {
+                if present != 0 {
                     continue;
                 }
                 let page = cursor + index as u64 * PAGE;
@@ -169,6 +173,13 @@ fn unmapped_ranges(start: u64, end: u64) -> Result<Vec<(u64, u64)>, i64> {
         }
     }
     Ok(holes)
+}
+
+/// Sub-ranges of `[start, end)` that are neither covered by a published region
+/// nor resident, ascending.
+fn unmapped_ranges(start: u64, end: u64) -> Result<Vec<(u64, u64)>, i64> {
+    let spans = current_spans()?;
+    unmapped_ranges_with_spans(&spans, start, end)
 }
 
 /// Whether every page of `[start, end)` is mapped: covered by a published
@@ -198,23 +209,25 @@ pub(super) fn syscall_linux_mincore(start: u64, len: u64, vec_ptr: u64) -> u64 {
         }
         validate_user_write(vec_ptr, pages)?;
         let spans = current_spans()?;
+        let mut buf = alloc::vec![0_u8; pages.min(SCAN_CHUNK_PAGES)];
         let mut done = 0_usize;
         while done < pages {
             let chunk = (pages - done).min(SCAN_CHUNK_PAGES);
             let chunk_start = start + done as u64 * PAGE;
-            let resident = resident_pages(chunk_start, chunk).ok_or(LINUX_ESRCH)?;
-            let mut bytes = Vec::with_capacity(chunk);
+            let chunk_buf = &mut buf[..chunk];
+            resident_pages(chunk_start, chunk_buf).ok_or(LINUX_ESRCH)?;
+            let mut valid = chunk;
             let mut hole = false;
-            for (index, present) in resident.iter().copied().enumerate() {
+            for (index, &present) in chunk_buf.iter().enumerate() {
                 let addr = chunk_start + index as u64 * PAGE;
-                if !present && span_containing(&spans, addr).is_none() {
+                if present == 0 && span_containing(&spans, addr).is_none() {
+                    valid = index;
                     hole = true;
                     break;
                 }
-                bytes.push(u8::from(present));
             }
-            if !bytes.is_empty() {
-                write_user_bytes(vec_ptr + done as u64, &bytes)?;
+            if valid > 0 {
+                write_user_bytes(vec_ptr + done as u64, &chunk_buf[..valid])?;
             }
             if hole {
                 return Err(LINUX_ENOMEM);
@@ -230,10 +243,8 @@ pub(super) fn syscall_linux_mincore(start: u64, len: u64, vec_ptr: u64) -> u64 {
 // Admission follows Linux: `EPERM` when the caller has neither privilege nor a
 // nonzero `RLIMIT_MEMLOCK`; `ENOMEM` when the cumulative locked total would
 // exceed the limit or part of the range is unmapped; `EAGAIN` when the ledger
-// cannot record the lock. Ledger edits and the mapped check are ordered lock,
-// then check, then repair: a concurrent `munmap` releases its locks under the
-// same process-state lock, so a lock recorded after the unmap is the only stale
-// one and the repair below removes exactly that.
+// cannot record the lock. Mapped pieces are computed from the published spans
+// and live leaves before locking.
 
 fn memlock_limit() -> Result<u64, i64> {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
@@ -360,13 +371,14 @@ fn populate_resident(
 fn mlock_common(start: u64, len: u64, populate: bool) -> u64 {
     linux_unit_result((|| {
         let (base, end) = lock_range(start, len)?;
-        let limit = memlock_limit()?;
         let privileged = caller_is_privileged();
+        let limit = if privileged { 0 } else { memlock_limit()? };
         lock_admission(limit, privileged)?;
         if end == base {
             return Ok(());
         }
-        let holes = unmapped_ranges(base, end)?;
+        let spans = current_spans()?;
+        let holes = unmapped_ranges_with_spans(&spans, base, end)?;
         let pieces = complement_of_holes(base, end, &holes);
         let budget = lock_budget(limit, privileged);
         multitask::with_current_user_process_state_mut(|_, _, state| {
@@ -374,19 +386,8 @@ fn mlock_common(start: u64, len: u64, populate: bool) -> u64 {
         })
         .ok_or(LINUX_ESRCH)?
         .map_err(refusal_errno)?;
-        // A thread that unmapped part of the range between the check and the lock
-        // left a lock on nothing; drop exactly those holes.
-        let holes = unmapped_ranges(base, end)?;
-        if !holes.is_empty() {
-            let _ = multitask::with_current_user_process_state_mut(|_, _, state| {
-                for &(hole_start, hole_end) in &holes {
-                    state.memlock_mut().release_mapping(hole_start, hole_end);
-                }
-            });
-        }
         if populate {
-            let spans = current_spans()?;
-            for (piece_start, piece_end) in complement_of_holes(base, end, &holes) {
+            for &(piece_start, piece_end) in &pieces {
                 populate_resident(&spans, piece_start, piece_end, None)?;
             }
         }
@@ -469,7 +470,7 @@ pub(super) fn syscall_linux_madvise_populate(start: u64, len: u64, write: bool) 
         {
             return Err(LINUX_EFAULT);
         }
-        let holes = unmapped_ranges(start, end)?;
+        let holes = unmapped_ranges_with_spans(&spans, start, end)?;
         populate_resident(&spans, start, end, Some(write))?;
         if holes.is_empty() { Ok(()) } else { Err(LINUX_ENOMEM) }
     })())
@@ -525,7 +526,7 @@ fn madvise_discard_range(
         if uncovered_ranges(&spans, start, end).is_empty() {
             return Ok(());
         }
-        let holes = unmapped_ranges(start, end)?;
+        let holes = unmapped_ranges_with_spans(&spans, start, end)?;
         if holes.is_empty() || syscalld_vma_covers_range(start, end - start) {
             Ok(())
         } else {
@@ -596,8 +597,8 @@ pub(super) fn syscall_linux_mlockall(flags: u64) -> u64 {
         if !mlockall_flags_valid(flags) {
             return Err(LINUX_EINVAL);
         }
-        let limit = memlock_limit()?;
         let privileged = caller_is_privileged();
+        let limit = if privileged { 0 } else { memlock_limit()? };
         lock_admission(limit, privileged)?;
         let budget = lock_budget(limit, privileged);
         let ranges = if flags & linux_abi::MCL_CURRENT != 0 {
@@ -705,6 +706,35 @@ pub(super) fn syscall_linux_membarrier(cmd: u64, flags: u64) -> u64 {
     }
     if cmd == linux_abi::MEMBARRIER_CMD_QUERY {
         return 0;
+    }
+    linux_errno(LINUX_EINVAL)
+}
+
+pub(super) fn syscall_linux_pkey_alloc(flags: u64, access_rights: u64) -> u64 {
+    if flags != 0 || (access_rights & !0x3) != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    // No PKU protection keys exist in hardware/CR4.PKE.
+    linux_errno(LINUX_ENOSPC)
+}
+
+pub(super) fn syscall_linux_pkey_free(_pkey: u64) -> u64 {
+    linux_errno(LINUX_EINVAL)
+}
+
+fn pkey_mprotect_key_valid(pkey: u64) -> bool {
+    let pkey_i32 = pkey as i32;
+    pkey_i32 == 0 || pkey_i32 == -1
+}
+
+pub(super) fn syscall_linux_pkey_mprotect(
+    start: u64,
+    len: u64,
+    prot: u64,
+    pkey: u64,
+) -> u64 {
+    if pkey_mprotect_key_valid(pkey) {
+        return super::memory_ops::syscall_linux_mprotect(start, len, prot);
     }
     linux_errno(LINUX_EINVAL)
 }
@@ -819,22 +849,28 @@ pub(super) fn syscall_linux_mremap(
         let old_end = request.old_addr + request.old_len;
         let hint = source_hint(&current_spans()?, request.old_addr, old_end);
         let grows = request.new_len > request.old_len;
-        let extension_locked = grows
-            && multitask::with_current_user_process_state(|_, _, state| {
-                state.memlock().is_locked(old_end - 1)
-            })
-            .unwrap_or(false);
-        if extension_locked {
-            let extension = request.new_len - request.old_len;
-            let budget = lock_budget(memlock_limit()?, caller_is_privileged());
-            let within = multitask::with_current_user_process_state(|_, _, state| {
-                state.memlock().locked_bytes().saturating_add(extension) <= budget
-            })
-            .unwrap_or(false);
-            if !within {
-                return Err(LINUX_ENOMEM);
+        let extension_budget = if grows {
+            let (is_locked, locked_bytes) =
+                multitask::with_current_user_process_state(|_, _, state| {
+                    let ledger = state.memlock();
+                    (ledger.is_locked(old_end - 1), ledger.locked_bytes())
+                })
+                .unwrap_or((false, 0));
+            if is_locked {
+                let privileged = caller_is_privileged();
+                let limit = if privileged { 0 } else { memlock_limit()? };
+                let budget = lock_budget(limit, privileged);
+                let extension = request.new_len - request.old_len;
+                if locked_bytes.saturating_add(extension) > budget {
+                    return Err(LINUX_ENOMEM);
+                }
+                Some(budget)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         let response = match call_syscalld_fast_mem(
             SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
             request.old_addr,
@@ -851,17 +887,14 @@ pub(super) fn syscall_linux_mremap(
             Err(errno) => return Err(errno),
         };
         let result = decode_exact_payload::<u64>(&response.payload, response.payload_len)?;
-        if extension_locked {
+        if let Some(budget) = extension_budget {
             let start = result + request.old_len;
             let end = result + request.new_len;
             // Admitted above; a concurrent locker that used the budget since leaves
             // the extension unlocked, which is the conservative outcome.
-            if let Ok(limit) = memlock_limit() {
-                let budget = lock_budget(limit, caller_is_privileged());
-                let _ = multitask::with_current_user_process_state_mut(|_, _, state| {
-                    let _ = state.memlock_mut().lock(start, end, budget);
-                });
-            }
+            let _ = multitask::with_current_user_process_state_mut(|_, _, state| {
+                let _ = state.memlock_mut().lock(start, end, budget);
+            });
         }
         Ok(result)
     })())
@@ -1029,6 +1062,23 @@ mod tests {
         assert_eq!(
             complement_of_holes(A, A + 2 * PAGE, &[]),
             [(A, A + 2 * PAGE)]
+        );
+    }
+
+    #[test]
+    fn pkey_mprotect_accepts_zero_and_minus_one_ignoring_upper_32_bits() {
+        assert!(pkey_mprotect_key_valid(0));
+        assert!(pkey_mprotect_key_valid(u64::MAX));
+        assert!(pkey_mprotect_key_valid(0xFFFF_FFFF));
+        assert!(pkey_mprotect_key_valid(0xDEAD_0000_0000_0000));
+        assert!(pkey_mprotect_key_valid(0xDEAD_0000_FFFF_FFFF));
+        assert!(!pkey_mprotect_key_valid(1));
+        assert!(!pkey_mprotect_key_valid(0x1_0000_0001));
+        assert!(!pkey_mprotect_key_valid((-2_i32 as u32) as u64));
+        assert_eq!(syscall_linux_pkey_mprotect(A, PAGE, 0, 1), linux_errno(LINUX_EINVAL));
+        assert_eq!(
+            syscall_linux_pkey_mprotect(A, PAGE, 0, 0x1_0000_0001),
+            linux_errno(LINUX_EINVAL)
         );
     }
 }

@@ -382,11 +382,13 @@ pub struct EndpointWakeSet {
 }
 
 impl EndpointWakeSet {
-    fn reserve_for_endpoint_teardown(&mut self, receiver_count: usize) {
-        self.receivers.reserve(receiver_count);
-        // Callers and reply scheduling contexts are bounded by live reply objects.
-        self.callers.reserve(MAX_REPLY_OBJECTS);
-        self.scheduling_contexts.reserve(MAX_REPLY_OBJECTS);
+    fn reserve_for_endpoint_teardown(&mut self, reply_bound: usize) {
+        let bound = reply_bound.min(MAX_REPLY_OBJECTS);
+        if bound != 0 {
+            // Callers and reply scheduling contexts are bounded by live reply objects.
+            self.callers.reserve(bound);
+            self.scheduling_contexts.reserve(bound);
+        }
     }
 
     fn push_caller(&mut self, task_id: u64) {
@@ -842,6 +844,7 @@ enum EndpointResponse {
     Data {
         bytes: Vec<u8>,
         attached_handles: Vec<KernelTransferredHandle>,
+        prepared_handles: Option<Vec<KernelTransferredHandle>>,
     },
     Error(IpcError),
 }
@@ -908,19 +911,6 @@ fn set_endpoint_cancel_reply_binding_fault(enabled: bool) {
 #[cfg(test)]
 fn set_endpoint_recv_stale_head_fault(enabled: bool) {
     *ENDPOINT_RECV_STALE_HEAD_FAULT.lock() = enabled.then_some(0);
-}
-
-#[cfg(test)]
-fn inject_endpoint_enqueue_binding_fault(message: &mut EndpointMessageObject) {
-    match *ENDPOINT_ENQUEUE_BINDING_FAULT.lock() {
-        Some(EndpointEnqueueBindingFault::EndpointId) => {
-            message.endpoint_id = message.endpoint_id.wrapping_add(1);
-        }
-        Some(EndpointEnqueueBindingFault::ReplyId) => {
-            message.reply_id = message.reply_id.wrapping_add(1);
-        }
-        None => {}
-    }
 }
 
 #[cfg(test)]
@@ -1091,12 +1081,9 @@ pub fn retain_shared_region(region: KernelSharedRegionHandle) -> bool {
 }
 
 pub fn release_shared_region(region: KernelSharedRegionHandle) {
-    let remove = SHARED_REGIONS
-        .with(region.raw(), SharedRegionObject::release)
-        .unwrap_or(false);
-    if remove {
-        let removed = SHARED_REGIONS.remove(region.raw());
-        let removed = removed.expect("last shared-region reference lost its object");
+    if let Some(((), Some(removed))) =
+        SHARED_REGIONS.with_mut_remove_if(region.raw(), |object| ((), object.release()))
+    {
         enqueue_shared_region_reclaim(removed);
     }
 }
@@ -1104,7 +1091,7 @@ pub fn release_shared_region(region: KernelSharedRegionHandle) {
 pub fn acquire_shared_region_mapping(
     region: KernelSharedRegionHandle,
 ) -> Option<KernelSharedRegionMappingHold> {
-    retain_shared_region(region).then_some(KernelSharedRegionMappingHold::new(region))
+    retain_shared_region(region).then(|| KernelSharedRegionMappingHold::new(region))
 }
 
 fn enqueue_shared_region_reclaim(object: SharedRegionObject) {
@@ -1403,6 +1390,10 @@ fn enqueue_endpoint_call_with_handles_priority_and_optional_custody(
     )
 }
 
+fn endpoint_queue_is_full(endpoint: &EndpointObject) -> bool {
+    endpoint.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES
+}
+
 fn enqueue_endpoint_call_with_handles_faultable(
     endpoint: KernelEndpointHandle,
     caller_task_id: u64,
@@ -1440,19 +1431,29 @@ fn enqueue_endpoint_call_with_handles_faultable(
     let mut kmem_guard = MessageKmemGuard(message_kmem);
 
     let receiver_owner = ENDPOINTS
-        .with(endpoint.raw(), |endpoint| {
-            if request.len() > endpoint.max_request_bytes { return Err(IpcError::InvalidArgument); }
+        .with_mut(endpoint.raw(), |endpoint| {
+            if request.len() > endpoint.max_request_bytes {
+                return Err(IpcError::InvalidArgument);
+            }
             if attached_handles.len() > endpoint.max_request_handles {
-                Err(IpcError::InvalidArgument)
-            } else { Ok(endpoint.owner) }
+                return Err(IpcError::InvalidArgument);
+            }
+            if endpoint_queue_is_full(endpoint) {
+                endpoint.queue_full_hits = endpoint.queue_full_hits.wrapping_add(1);
+                return Err(IpcError::NoMemory);
+            }
+            Ok(endpoint.owner)
         })
         .ok_or(IpcError::InvalidHandle)??;
 
     let mut request_handles = Vec::new();
-    request_handles
-        .try_reserve_exact(MAX_ENDPOINT_TRANSFER_HANDLES.saturating_mul(2))
-        .map_err(|_| IpcError::NoMemory)?;
-    request_handles.extend_from_slice(attached_handles);
+    if !attached_handles.is_empty() {
+        // Retirement may collect this request and a maximum-sized reply.
+        request_handles
+            .try_reserve_exact(attached_handles.len() + MAX_ENDPOINT_TRANSFER_HANDLES)
+            .map_err(|_| IpcError::NoMemory)?;
+        request_handles.extend_from_slice(attached_handles);
+    }
     let request = copy_endpoint_bytes(request)?;
     let message_id = ENDPOINT_MESSAGES
         .insert(EndpointMessageObject {
@@ -1481,16 +1482,26 @@ fn enqueue_endpoint_call_with_handles_faultable(
             return Err(IpcError::NoMemory);
         }
     };
-    let _ = ENDPOINT_MESSAGES.with_mut(message_id, |message| message.reply_id = reply_id);
     #[cfg(test)]
-    let _ = ENDPOINT_MESSAGES.with_mut(message_id, inject_endpoint_enqueue_binding_fault);
+    let binding_fault = *ENDPOINT_ENQUEUE_BINDING_FAULT.lock();
 
     let receiver_to_wake = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
-        if endpoint_object.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+        if endpoint_queue_is_full(endpoint_object) {
             endpoint_object.queue_full_hits = endpoint_object.queue_full_hits.wrapping_add(1);
             return None;
         }
         let published = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
+            message.reply_id = reply_id;
+            #[cfg(test)]
+            match binding_fault {
+                Some(EndpointEnqueueBindingFault::EndpointId) => {
+                    message.endpoint_id = message.endpoint_id.wrapping_add(1);
+                }
+                Some(EndpointEnqueueBindingFault::ReplyId) => {
+                    message.reply_id = message.reply_id.wrapping_add(1);
+                }
+                None => {}
+            }
             if message.endpoint_id != endpoint.raw() || message.reply_id != reply_id {
                 return false;
             }
@@ -1531,7 +1542,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
 /// from quota/allocator exhaustion on synchronous IPC wait paths.
 pub fn endpoint_pending_queue_full(endpoint: KernelEndpointHandle) -> bool {
     ENDPOINTS.with(endpoint.raw(), |endpoint_object| {
-        endpoint_object.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES
+        endpoint_queue_is_full(endpoint_object)
     }) == Some(true)
 }
 
@@ -2439,13 +2450,17 @@ fn prepare_endpoint_response(
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<EndpointResponse, IpcError> {
     let mut handles = Vec::new();
-    handles
-        .try_reserve_exact(MAX_ENDPOINT_TRANSFER_HANDLES.saturating_mul(2))
-        .map_err(|_| IpcError::NoMemory)?;
-    handles.extend_from_slice(attached_handles);
+    if !attached_handles.is_empty() {
+        // Reserve for any receiver-prepared batch before taking slot locks.
+        handles
+            .try_reserve_exact(MAX_ENDPOINT_TRANSFER_HANDLES)
+            .map_err(|_| IpcError::NoMemory)?;
+        handles.extend_from_slice(attached_handles);
+    }
     Ok(EndpointResponse::Data {
         bytes: copy_endpoint_bytes(response)?,
         attached_handles: handles,
+        prepared_handles: None,
     })
 }
 
@@ -2462,19 +2477,7 @@ fn complete_endpoint_reply_prepared(
     required_owner: Option<EndpointOwner>,
     response: EndpointResponse,
 ) -> Result<ReplyCompletion, IpcError> {
-    let message_id = REPLIES
-        .with(reply.raw(), |reply_object| {
-            if required_owner
-                .is_some_and(|owner| !endpoint_owner_allows(reply_object.receiver_owner, owner))
-            {
-                return Err(IpcError::PermissionDenied);
-            }
-            if reply_object.consumed {
-                return Err(IpcError::InvalidArgument);
-            }
-            Ok(reply_object.message_id)
-        })
-        .ok_or(IpcError::InvalidHandle)??;
+    let message_id = published_reply_message_id(reply.raw()).ok_or(IpcError::InvalidHandle)?;
 
     // Keep ownership outside both slot locks until the exact reply identity
     // has been revalidated. If the transaction loses a race, the backing
@@ -2514,21 +2517,13 @@ fn complete_endpoint_reply_prepared(
                         }
                     }
                     if let Some(EndpointResponse::Data {
-                        attached_handles, ..
+                        prepared_handles: response_prepared,
+                        ..
                     }) = response.as_mut()
                     {
-                        if let Some(mut prepared_handles) = message.prepared_reply_handles.take() {
-                            // `prepare_endpoint_response` reserves the combined
-                            // protocol maximum before either slot lock is held.
-                            // The reply transition therefore cannot allocate.
-                            debug_assert!(
-                                attached_handles.capacity()
-                                    >= attached_handles
-                                        .len()
-                                        .saturating_add(prepared_handles.len())
-                            );
-                            attached_handles.append(&mut prepared_handles);
-                        }
+                        // Keep batches separate under the locks and merge them
+                        // afterward using already reserved capacity.
+                        *response_prepared = message.prepared_reply_handles.take();
                     }
                     let caller_task_id = message.caller_task_id;
                     message.response = response.take();
@@ -2572,75 +2567,121 @@ pub fn take_endpoint_response_detailed(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<EndpointResponseTake, IpcError> {
+    enum RawTake {
+        Pending,
+        Response {
+            bytes: Vec<u8>,
+            attached_handles: Vec<KernelTransferredHandle>,
+            prepared_handles: Option<Vec<KernelTransferredHandle>>,
+        },
+        Error {
+            error: IpcError,
+            attached_handles: Vec<KernelTransferredHandle>,
+            prepared_handles: Option<Vec<KernelTransferredHandle>>,
+        },
+    }
+
     let message_id = published_reply_message_id(reply.raw()).ok_or(IpcError::InvalidHandle)?;
 
-    let (result, consumed) = ENDPOINT_MESSAGES
-        .with_mut(message_id, |message| {
-            REPLIES
-                .with_mut(reply.raw(), |reply_object| {
-                    if reply_object.message_id != message_id || reply_object.consumed {
-                        return Err(IpcError::InvalidHandle);
+    let ((result, retired_reply), retired_message) = ENDPOINT_MESSAGES
+        .with_mut_remove_if(message_id, |message| {
+            let Some((inner, retired_reply)) = REPLIES.with_mut_remove_if(reply.raw(), |reply_object| {
+                if reply_object.message_id != message_id || reply_object.consumed {
+                    return (Err(IpcError::InvalidHandle), false);
+                }
+                match message.response.as_ref() {
+                    None => (Ok(RawTake::Pending), false),
+                    Some(EndpointResponse::Data {
+                        attached_handles, ..
+                    }) if attached_handles.len() > handle_capacity => {
+                        (Err(IpcError::BufferTooSmall), false)
                     }
-                    match message.response.as_ref() {
-                        None => Ok((EndpointResponseTake::Pending, false)),
-                        Some(EndpointResponse::Data {
-                            attached_handles, ..
-                        }) if attached_handles.len() > handle_capacity => {
-                            Err(IpcError::BufferTooSmall)
+                    Some(EndpointResponse::Data {
+                        attached_handles,
+                        prepared_handles,
+                        ..
+                    }) => {
+                        let remaining = handle_capacity.saturating_sub(attached_handles.len());
+                        if prepared_handles.as_ref().is_some_and(|handles| handles.len() > remaining) {
+                            return (Err(IpcError::BufferTooSmall), false);
                         }
-                        Some(EndpointResponse::Data { .. }) => {
-                            let Some(EndpointResponse::Data {
+                        let Some(EndpointResponse::Data {
+                            bytes,
+                            attached_handles,
+                            prepared_handles,
+                        }) = message.response.take()
+                        else {
+                            unreachable!("response was checked above");
+                        };
+                        reply_object.consumed = true;
+                        (
+                            Ok(RawTake::Response {
                                 bytes,
                                 attached_handles,
-                            }) = message.response.take()
-                            else {
-                                unreachable!("response was checked above");
-                            };
-                            reply_object.consumed = true;
-                            Ok((
-                                EndpointResponseTake::Response((bytes, attached_handles)),
-                                true,
-                            ))
-                        }
-                        Some(EndpointResponse::Error(err)) => {
-                            let err = *err;
-                            message.response.take();
-                            let mut discarded_request_handles =
-                                core::mem::take(&mut message.attached_handles);
-                            if let Some(mut prepared_handles) =
-                                message.prepared_reply_handles.take()
-                            {
-                                // Request storage reserves the complete
-                                // combined bound at enqueue, so endpoint
-                                // failure can return both batches while the
-                                // message/reply slots remain locked.
-                                debug_assert!(
-                                    discarded_request_handles.capacity()
-                                        >= discarded_request_handles
-                                            .len()
-                                            .saturating_add(prepared_handles.len())
-                                );
-                                discarded_request_handles.append(&mut prepared_handles);
-                            }
-                            reply_object.consumed = true;
-                            Ok((
-                                EndpointResponseTake::Error {
-                                    error: err,
-                                    discarded_request_handles,
-                                },
-                                true,
-                            ))
-                        }
+                                prepared_handles,
+                            }),
+                            true,
+                        )
                     }
-                })
-                .ok_or(IpcError::InvalidHandle)?
+                    Some(EndpointResponse::Error(err)) => {
+                        let err = *err;
+                        message.response.take();
+                        let attached_handles = core::mem::take(&mut message.attached_handles);
+                        let prepared_handles = message.prepared_reply_handles.take();
+                        reply_object.consumed = true;
+                        (
+                            Ok(RawTake::Error {
+                                error: err,
+                                attached_handles,
+                                prepared_handles,
+                            }),
+                            true,
+                        )
+                    }
+                }
+            }) else {
+                return ((Err(IpcError::InvalidHandle), None), false);
+            };
+            let retire_message = retired_reply.is_some();
+            ((inner, retired_reply), retire_message)
         })
-        .ok_or(IpcError::InvalidHandle)??;
-    if consumed {
-        drop(ENDPOINT_MESSAGES.remove(message_id));
-        let _ = REPLIES.remove(reply.raw());
+        .ok_or(IpcError::InvalidHandle)?;
+    drop(retired_reply);
+    drop(retired_message);
+
+    let merge_handles =
+        |mut primary: Vec<KernelTransferredHandle>,
+         prepared: Option<Vec<KernelTransferredHandle>>| {
+            if let Some(mut extra) = prepared {
+                if primary.is_empty() {
+                    primary = extra;
+                } else if !extra.is_empty() {
+                    assert!(primary.capacity() - primary.len() >= extra.len());
+                    primary.append(&mut extra);
+                }
+            }
+            primary
+        };
+
+    match result? {
+        RawTake::Pending => Ok(EndpointResponseTake::Pending),
+        RawTake::Response {
+            bytes,
+            attached_handles,
+            prepared_handles,
+        } => Ok(EndpointResponseTake::Response((
+            bytes,
+            merge_handles(attached_handles, prepared_handles),
+        ))),
+        RawTake::Error {
+            error,
+            attached_handles: request_handles,
+            prepared_handles,
+        } => Ok(EndpointResponseTake::Error {
+            error,
+            discarded_request_handles: merge_handles(request_handles, prepared_handles),
+        }),
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -2678,63 +2719,75 @@ pub fn cancel_endpoint_call_with_transfers(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<CancelledCall, IpcError> {
-    let fast_binding = REPLIES
-        .with(reply.raw(), |reply_object| {
-            reply_object.fast_frame.as_ref().map(|frame| {
-                (
-                    frame.endpoint_id,
-                    frame.caller_task_id,
-                    frame.state == FastCallState::RequestReady,
-                )
-            })
-        })
-        .flatten();
-    if let Some((endpoint_id, bound_caller, request_was_published)) = fast_binding {
-        if bound_caller != caller_task_id {
-            return Err(IpcError::InvalidArgument);
-        }
-        let mut was_queued = false;
-        let _ = ENDPOINTS.with_mut(endpoint_id, |endpoint| {
-            if endpoint.fast_reply == Some(reply.raw()) {
-                endpoint.fast_reply.take();
-                was_queued = request_was_published;
-            }
-        });
-        let scheduling_context = REPLIES
-            .with_mut(reply.raw(), |reply_object| {
-                if reply_object.consumed {
-                    return Err(IpcError::InvalidHandle);
-                }
-                reply_object.consumed = true;
-                Ok(reply_object.scheduling_context.take())
-            })
-            .ok_or(IpcError::InvalidHandle)??;
-        drop(REPLIES.remove(reply.raw()));
-        return Ok(CancelledCall {
-            transfers: Vec::new(),
-            disposition: if was_queued {
-                CancelledCallDisposition::Queued
-            } else {
-                CancelledCallDisposition::InFlight
-            },
-            scheduling_context,
-        });
+    enum CancelTarget {
+        Fast {
+            endpoint_id: u64,
+            bound_caller: u64,
+            request_was_published: bool,
+        },
+        Queued {
+            message_id: u64,
+        },
     }
-    let message_id = REPLIES
-        .with(reply.raw(), |reply| {
-            (!reply.consumed).then_some(reply.message_id)
-        })
-        .flatten()
-        .ok_or(IpcError::InvalidHandle)?;
-    let endpoint_id = ENDPOINT_MESSAGES
-        .with(message_id, |message| {
-            (message.caller_task_id == caller_task_id).then_some(message.endpoint_id)
-        })
-        .flatten()
-        .ok_or(IpcError::InvalidArgument)?;
 
-    let mut marked = false;
-    let mut was_queued = false;
+    let target = REPLIES
+        .with(reply.raw(), |reply_object| {
+            if let Some(frame) = reply_object.fast_frame.as_ref() {
+                Ok(CancelTarget::Fast {
+                    endpoint_id: frame.endpoint_id,
+                    bound_caller: frame.caller_task_id,
+                    request_was_published: frame.state == FastCallState::RequestReady,
+                })
+            } else if !reply_object.consumed {
+                Ok(CancelTarget::Queued {
+                    message_id: reply_object.message_id,
+                })
+            } else {
+                Err(IpcError::InvalidHandle)
+            }
+        })
+        .ok_or(IpcError::InvalidHandle)??;
+
+    let message_id = match target {
+        CancelTarget::Fast {
+            endpoint_id,
+            bound_caller,
+            request_was_published,
+        } => {
+            if bound_caller != caller_task_id {
+                return Err(IpcError::InvalidArgument);
+            }
+            let mut was_queued = false;
+            let _ = ENDPOINTS.with_mut(endpoint_id, |endpoint| {
+                if endpoint.fast_reply == Some(reply.raw()) {
+                    endpoint.fast_reply.take();
+                    was_queued = request_was_published;
+                }
+            });
+            let (scheduling_context, retired) = REPLIES
+                .with_mut_remove_if(reply.raw(), |reply_object| {
+                    if reply_object.consumed {
+                        return (Err(IpcError::InvalidHandle), false);
+                    }
+                    reply_object.consumed = true;
+                    (Ok(reply_object.scheduling_context.take()), true)
+                })
+                .ok_or(IpcError::InvalidHandle)?;
+            drop(retired);
+            let scheduling_context = scheduling_context?;
+            return Ok(CancelledCall {
+                transfers: Vec::new(),
+                disposition: if was_queued {
+                    CancelledCallDisposition::Queued
+                } else {
+                    CancelledCallDisposition::InFlight
+                },
+                scheduling_context,
+            });
+        }
+        CancelTarget::Queued { message_id } => message_id,
+    };
+
     #[cfg(test)]
     let binding_reply_id = if *ENDPOINT_CANCEL_REPLY_BINDING_FAULT.lock() {
         reply.raw().wrapping_add(1)
@@ -2743,14 +2796,23 @@ pub fn cancel_endpoint_call_with_transfers(
     };
     #[cfg(not(test))]
     let binding_reply_id = reply.raw();
-    let binding_matches = ENDPOINT_MESSAGES
+
+    let endpoint_id = ENDPOINT_MESSAGES
         .with(message_id, |message| {
-            endpoint_cancel_binding_matches(message, binding_reply_id, caller_task_id)
+            let endpoint_id = (message.caller_task_id == caller_task_id).then_some(message.endpoint_id)
+                .ok_or(IpcError::InvalidArgument)?;
+            let binding_matches = message.reply_id == binding_reply_id;
+            if !binding_matches {
+                return Err(IpcError::InvalidHandle);
+            }
+            Ok(endpoint_id)
         })
-        .unwrap_or(false);
-    if !binding_matches {
-        return Err(IpcError::InvalidHandle);
-    }
+        // A response taker can retire the exact message between the two
+        // slab lookups. Absence is terminal, not a caller mismatch.
+        .ok_or(IpcError::InvalidHandle)??;
+
+    let mut marked = false;
+    let mut was_queued = false;
     if ENDPOINTS
         .with_mut(endpoint_id, |endpoint| {
             let before = endpoint.pending_len();
@@ -2795,22 +2857,17 @@ pub fn cancel_endpoint_calls_for_task(
     mut release_scheduling_context: impl FnMut(KernelReplyHandle, ReplySchedulingContextCustody),
 ) -> usize {
     let mut cancelled = 0usize;
-    // A remote receiver may consume the exact reply after the scan selected
-    // its message but before this retire path acquires its terminal locks.
-    // Once that receiver has set reply.consumed it owns the final removal.
-    // Keep such generations out of subsequent scans of this *same* pass:
-    // otherwise the find-first loop repeatedly sees the in-flight terminal
-    // message and panics after MAX_ENDPOINT_MESSAGE_OBJECTS iterations.
-    let mut other_terminal = [0_u64; MAX_ENDPOINT_MESSAGE_OBJECTS];
-    let mut other_terminal_count = 0usize;
-    for _ in 0..MAX_ENDPOINT_MESSAGE_OBJECTS {
-        let Some(message_id) = ENDPOINT_MESSAGES.find_handle(|message| {
-            message.published
-                && message.caller_task_id == task_id
-                && !other_terminal[..other_terminal_count].contains(&message.reply_id)
-        }) else {
+    // A single pass over occupied slots avoids O(K * N) rescanning and avoids
+    // revisiting entries whose reply already crossed a concurrent terminal
+    // transition on another CPU.
+    let mut next_message_index = 0usize;
+    while let Some(message_id) = ENDPOINT_MESSAGES.find_handle_from(next_message_index, |message| {
+        message.published && message.caller_task_id == task_id
+    }) {
+        let Some(slot_index) = slab::slot_index::<MAX_ENDPOINT_MESSAGE_OBJECTS>(message_id) else {
             break;
         };
+        next_message_index = slot_index + 1;
         let Some(reply_id) = ENDPOINT_MESSAGES.with(message_id, |message| message.reply_id) else {
             continue;
         };
@@ -2819,15 +2876,13 @@ pub fn cancel_endpoint_calls_for_task(
         ) {
             Ok(call) => call,
             Err(IpcError::InvalidHandle) => {
-                // Either the exact message disappeared, or its reply already
-                // has a different terminal owner. The latter leaves a narrow
-                // interval before the winning consumer removes the message.
-                if ENDPOINT_MESSAGES.with(message_id, |_| ()).is_none() {
-                    continue;
-                }
-                if REPLIES.with(reply_id, |reply| reply.consumed) == Some(true) {
-                    other_terminal[other_terminal_count] = reply_id;
-                    other_terminal_count += 1;
+                // Either a concurrent terminal consumer already set `reply.consumed`
+                // and/or removed one or both slab objects. Check `REPLIES` first,
+                // then recheck `ENDPOINT_MESSAGES` in case `REPLIES` was removed
+                // before `ENDPOINT_MESSAGES`.
+                if REPLIES.with(reply_id, |reply| reply.consumed) == Some(true)
+                    || ENDPOINT_MESSAGES.with(message_id, |_| ()).is_none()
+                {
                     continue;
                 }
                 panic!(
@@ -2844,34 +2899,24 @@ pub fn cancel_endpoint_calls_for_task(
         }
         cancelled += 1;
     }
-    if ENDPOINT_MESSAGES
-        .find_handle(|message| {
-            message.published
-                && message.caller_task_id == task_id
-                && !other_terminal[..other_terminal_count].contains(&message.reply_id)
-        })
-        .is_some()
-    {
-        panic!(
-            "task {} endpoint cancellation exceeded global message capacity {}",
-            task_id, MAX_ENDPOINT_MESSAGE_OBJECTS
-        );
-    }
-    for _ in 0..MAX_REPLY_OBJECTS {
-        let Some(reply_id) = REPLIES.find_handle(|reply| {
-            reply
-                .fast_frame
-                .as_ref()
-                .is_some_and(|frame| frame.caller_task_id == task_id && !reply.consumed)
-        }) else {
-            return cancelled;
+
+    let mut next_reply_index = 0usize;
+    while let Some(reply_id) = REPLIES.find_handle_from(next_reply_index, |reply| {
+        reply
+            .fast_frame
+            .as_ref()
+            .is_some_and(|frame| frame.caller_task_id == task_id && !reply.consumed)
+    }) {
+        let Some(slot_index) = slab::slot_index::<MAX_REPLY_OBJECTS>(reply_id) else {
+            break;
         };
+        next_reply_index = slot_index + 1;
         let cancelled_call = match cancel_endpoint_call_with_transfers(
             KernelReplyHandle::from_raw(reply_id), task_id,
         ) {
             Ok(call) => call,
             // The exact fast reply may have been consumed and removed since
-            // find_handle. The predicate excludes every consumed reply.
+            // find_handle_from. The predicate excludes every consumed reply.
             Err(IpcError::InvalidHandle) => continue,
             Err(error) => panic!(
                 "published task-owned fast call cancellation failed task={task_id} reply={reply_id} error={error:?}"
@@ -2881,17 +2926,6 @@ pub fn cancel_endpoint_calls_for_task(
             release_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
         }
         cancelled += 1;
-    }
-    if REPLIES
-        .find_handle(|reply| {
-            reply
-                .fast_frame
-                .as_ref()
-                .is_some_and(|frame| frame.caller_task_id == task_id && !reply.consumed)
-        })
-        .is_some()
-    {
-        panic!("task {task_id} fast endpoint cancellation exceeded reply capacity");
     }
     cancelled
 }
@@ -2906,6 +2940,7 @@ fn transfers_from_message(mut message: EndpointMessageObject) -> Vec<KernelTrans
     }
     if let Some(EndpointResponse::Data {
         attached_handles: mut response_handles,
+        prepared_handles,
         ..
     }) = message.response.take()
     {
@@ -2913,6 +2948,12 @@ fn transfers_from_message(mut message: EndpointMessageObject) -> Vec<KernelTrans
             core::mem::swap(&mut transfers, &mut response_handles);
         }
         transfers.extend(response_handles);
+        if let Some(mut prepared) = prepared_handles {
+            if transfers.capacity() < transfers.len().saturating_add(prepared.len()) {
+                core::mem::swap(&mut transfers, &mut prepared);
+            }
+            transfers.extend(prepared);
+        }
     }
     transfers
 }
@@ -2987,59 +3028,82 @@ pub fn fail_endpoints_owned_by_process(process_id: u64, err: IpcError) -> Endpoi
 
 fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeSet {
     let mut wake_set = EndpointWakeSet::default();
-    while let Some((endpoint_id, endpoint)) =
-        ENDPOINTS.take_first_matching(|endpoint| endpoint.owner == Some(owner))
-    {
-        ENDPOINT_QUOTAS.lock().release(owner);
-        endpoint.refund_kmem();
-        wake_set.reserve_for_endpoint_teardown(endpoint.waiting_receivers.len());
-        for receiver in endpoint.waiting_receivers {
-            wake_set.push_receiver(receiver.task_id);
-        }
-        // A receiver removes fast_reply when it takes the request, but the
-        // live reply still belongs to this endpoint until completion. Fail both
-        // published and already-taken frames when the owner exits.
-        REPLIES.visit_mut(|reply_id, reply| {
-            let Some(frame) = reply.fast_frame.as_mut() else {
-                return;
-            };
-            if reply.used || reply.consumed || frame.endpoint_id != endpoint_id {
-                return;
+    let mut owned_inline = [0_u64; MAX_ENDPOINTS_PER_PROCESS];
+    let mut owned_inline_len = 0usize;
+    let mut owned_overflow = Vec::new();
+
+    ENDPOINTS.drain_matching(
+        |endpoint| endpoint.owner == Some(owner),
+        |endpoint_id, endpoint| {
+            ENDPOINT_QUOTAS.lock().release(owner);
+            endpoint.refund_kmem();
+            wake_set.receivers.reserve(endpoint.waiting_receivers.len());
+            for receiver in endpoint.waiting_receivers {
+                wake_set.push_receiver(receiver.task_id);
             }
-            frame.state = FastCallState::ErrorReady;
-            frame.terminal_error = Some(err);
-            reply.used = true;
-            wake_set.push_caller(frame.caller_task_id);
-            if let Some(custody) = reply.scheduling_context.take() {
-                wake_set.push_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
+            if owned_inline_len < owned_inline.len() {
+                owned_inline[owned_inline_len] = endpoint_id;
+                owned_inline_len += 1;
+            } else {
+                owned_overflow.push(endpoint_id);
             }
-        });
-        ENDPOINT_MESSAGES.visit_mut(|message_id, message| {
-            if !message.published
-                || message.endpoint_id != endpoint_id
-                || message.response.is_some()
-            {
-                return;
-            }
-            let failed = REPLIES.with_mut(message.reply_id, |reply| {
-                if reply.message_id != message_id || reply.consumed {
-                    return (false, None);
-                }
-                reply.used = true;
-                message.response = Some(EndpointResponse::Error(err));
-                (true, reply.scheduling_context.take())
-            });
-            if let Some((true, scheduling_context)) = failed {
-                wake_set.push_caller(message.caller_task_id);
-                if let Some(custody) = scheduling_context {
-                    wake_set.push_scheduling_context(
-                        KernelReplyHandle::from_raw(message.reply_id),
-                        custody,
-                    );
-                }
-            }
-        });
+        },
+    );
+
+    if owned_inline_len == 0 {
+        return wake_set;
     }
+
+    let owned_contains = |endpoint_id: u64| {
+        owned_inline[..owned_inline_len].contains(&endpoint_id)
+            || owned_overflow.contains(&endpoint_id)
+    };
+
+    wake_set.reserve_for_endpoint_teardown(REPLIES.occupied_count());
+
+    // A receiver removes fast_reply when it takes the request, but the
+    // live reply still belongs to this endpoint until completion. Fail both
+    // published and already-taken frames when the owner exits.
+    REPLIES.visit_mut(|reply_id, reply| {
+        let Some(frame) = reply.fast_frame.as_mut() else {
+            return;
+        };
+        if reply.used || reply.consumed || !owned_contains(frame.endpoint_id) {
+            return;
+        }
+        frame.state = FastCallState::ErrorReady;
+        frame.terminal_error = Some(err);
+        reply.used = true;
+        wake_set.push_caller(frame.caller_task_id);
+        if let Some(custody) = reply.scheduling_context.take() {
+            wake_set.push_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
+        }
+    });
+    ENDPOINT_MESSAGES.visit_mut(|message_id, message| {
+        if !message.published
+            || message.response.is_some()
+            || !owned_contains(message.endpoint_id)
+        {
+            return;
+        }
+        let failed = REPLIES.with_mut(message.reply_id, |reply| {
+            if reply.message_id != message_id || reply.consumed {
+                return (false, None);
+            }
+            reply.used = true;
+            message.response = Some(EndpointResponse::Error(err));
+            (true, reply.scheduling_context.take())
+        });
+        if let Some((true, scheduling_context)) = failed {
+            wake_set.push_caller(message.caller_task_id);
+            if let Some(custody) = scheduling_context {
+                wake_set.push_scheduling_context(
+                    KernelReplyHandle::from_raw(message.reply_id),
+                    custody,
+                );
+            }
+        }
+    });
     wake_set
 }
 

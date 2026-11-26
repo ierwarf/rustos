@@ -15,6 +15,9 @@ static INPUT_WAITERS: TrackedSpinLock<Vec<u64>, { LockClass::InputWaiter as u8 }
 // untrusted application waiters for a finite shared slot.
 static INPUTD_INGESTION_WAITER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) static INPUT_WAIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Test-only: no production caller registers an ordinary (non-inputd) waiter any
 // more; only the retire-time `disarm_input_waiter` and the wake sweep remain.
 #[cfg(test)]
@@ -120,6 +123,7 @@ mod tests {
 
     #[test]
     fn retired_task_disarm_releases_both_input_wait_classes() {
+        let _serial = INPUT_WAIT_TEST_LOCK.lock().unwrap();
         let task_id = u64::MAX - 601;
         assert!(arm_input_waiter(task_id));
         assert!(arm_inputd_ingestion_waiter(task_id));
@@ -131,6 +135,7 @@ mod tests {
 
     #[test]
     fn input_waiter_queue_scales_past_legacy_slot_limits() {
+        let _serial = INPUT_WAIT_TEST_LOCK.lock().unwrap();
         for i in 0..1500_u64 {
             assert!(arm_input_waiter(10_000 + i));
         }

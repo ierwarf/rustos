@@ -106,21 +106,26 @@ impl FutexWaiterTable {
                 mm_generation,
                 address_space_root,
                 uaddr,
-            } => mm_generation
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ address_space_root.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-                ^ uaddr.wrapping_mul(0x94D0_49BB_1331_11EB),
+            } => {
+                mm_generation.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ address_space_root.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                    ^ uaddr.wrapping_mul(0x94D0_49BB_1331_11EB)
+            }
             FutexKey::Shared { backing } => match backing {
                 multitask::SharedFutexBackingKey::Memfd {
                     object_id,
                     byte_offset,
-                } => object_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ byte_offset.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                } => {
+                    object_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ byte_offset.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                }
                 multitask::SharedFutexBackingKey::SharedRegion {
                     region_id,
                     byte_offset,
-                } => region_id.wrapping_mul(0x94D0_49BB_1331_11EB)
-                    ^ byte_offset.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                } => {
+                    region_id.wrapping_mul(0x94D0_49BB_1331_11EB)
+                        ^ byte_offset.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                }
             },
         };
         ((h ^ (h >> 32)) as usize) & (FUTEX_KEY_BUCKETS - 1)
@@ -271,47 +276,48 @@ impl FutexWaiterTable {
         }
         (wake_count, requeue_count)
     }
+}
 
-    fn select_requeue_vec(
-        &mut self,
-        from_key: FutexKey,
-        to_key: FutexKey,
-        max_wake: usize,
-        max_requeue: usize,
-        bitset: u32,
-        woken_tasks: &mut alloc::vec::Vec<u64>,
-    ) -> usize {
-        if max_wake == 0 && max_requeue == 0 {
-            return 0;
+const INLINE_WAKE_CAP: usize = 16;
+
+enum WakeTaskBuf {
+    Inline([u64; INLINE_WAKE_CAP]),
+    Heap(alloc::vec::Vec<u64>),
+}
+
+impl WakeTaskBuf {
+    fn new() -> Self {
+        Self::Inline([0; INLINE_WAKE_CAP])
+    }
+
+    fn covers(&self, max_wake: usize, slot_bound: usize) -> bool {
+        self.as_slice().len() >= max_wake.min(slot_bound)
+    }
+
+    fn grow(&mut self, max_wake: usize, slot_bound: usize) -> Result<(), i64> {
+        if self.covers(max_wake, slot_bound) {
+            return Ok(());
         }
-        let mut wake_count = 0usize;
-        let mut requeue_count = 0usize;
-        let mut cursor = self.key_buckets[Self::key_bucket(from_key)];
-        while cursor != FUTEX_EMPTY {
-            let next = self.slots[cursor as usize].key_next;
-            let waiter = self.slots[cursor as usize].waiter;
-            if waiter.key == from_key && (waiter.bitset & bitset) != 0 {
-                if wake_count < max_wake {
-                    if woken_tasks.try_reserve(1).is_err() {
-                        break;
-                    }
-                    woken_tasks.push(waiter.task_id);
-                    self.remove_slot(cursor);
-                    wake_count += 1;
-                } else if requeue_count < max_requeue {
-                    if from_key != to_key {
-                        self.unlink_key(cursor, from_key);
-                        self.slots[cursor as usize].waiter.key = to_key;
-                        self.link_key(cursor, to_key);
-                    }
-                    requeue_count += 1;
-                } else {
-                    break;
-                }
-            }
-            cursor = next;
+        let cap = max_wake.min(slot_bound.saturating_add(64));
+        let mut vec = alloc::vec::Vec::new();
+        vec.try_reserve_exact(cap).map_err(|_| LINUX_ENOMEM)?;
+        vec.resize(cap, 0);
+        *self = Self::Heap(vec);
+        Ok(())
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        match self {
+            Self::Inline(buf) => buf.as_mut_slice(),
+            Self::Heap(vec) => vec.as_mut_slice(),
         }
-        requeue_count
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Inline(buf) => buf.as_slice(),
+            Self::Heap(vec) => vec.as_slice(),
+        }
     }
 }
 
@@ -433,7 +439,11 @@ fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
             Ok(())
         }
         c if c == linux_abi::FUTEX_WAIT_BITSET || c == linux_abi::FUTEX_WAKE_BITSET => {
-            if val3 as u32 == 0 { Err(LINUX_EINVAL) } else { Ok(()) }
+            if val3 as u32 == 0 {
+                Err(LINUX_EINVAL)
+            } else {
+                Ok(())
+            }
         }
         c if c == linux_abi::FUTEX_WAKE_OP => decode_wake_op(val3 as u32).map(|_| ()),
         _ => Err(LINUX_ENOSYS),
@@ -773,63 +783,78 @@ fn futex_wait(
 ) -> Result<u64, i64> {
     let deadline_tick = futex_wait_deadline_tick(op, timeout_ptr)?;
     let (task_id, address_space_root, retained) = current_futex_binding()?;
-    while !multitask::arm_block_current_task() {
-        if multitask::current_task_id() != Some(task_id) {
-            return Err(LINUX_ENOSYS);
+    loop {
+        while !multitask::arm_block_current_task() {
+            if multitask::current_task_id() != Some(task_id) {
+                return Err(LINUX_ENOSYS);
+            }
+            if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+                return Err(LINUX_ETIMEDOUT);
+            }
+            multitask::cond_resched();
+        }
+        let registration = retained
+            .try_with_process_state(|process_state| {
+                let key =
+                    futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+                // Linearization point: the retained process mapping is faulted/pinned
+                // by its state owner before the raw waiter lock. The atomic compare
+                // and waiter publication then occur in the same futex transaction, so
+                // a paired WAKE cannot pass between them.
+                let mut waiters = FUTEX_WAITERS.lock();
+                let actual = process_state
+                    .address_space()
+                    .atomic_load_user_u32(uaddr)
+                    .map_err(user_pointer_error_to_linux_errno)?;
+                if actual != expected {
+                    return Err(LINUX_EAGAIN);
+                }
+                waiters.insert(FutexWaiter {
+                    key,
+                    task_id,
+                    bitset,
+                })
+            })
+            .unwrap_or(Err(LINUX_EINTR));
+        if let Err(errno) = registration {
+            let _ = multitask::cancel_block_current_task();
+            return Err(errno);
+        }
+        if super::poll_epoll::has_unmasked_pending_signal() {
+            clear_futex_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            if current_wait_interrupted() {
+                return Err(LINUX_EINTR);
+            }
+            if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+                return Err(LINUX_ETIMEDOUT);
+            }
+            continue;
         }
         if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+            clear_futex_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
             return Err(LINUX_ETIMEDOUT);
         }
-        multitask::cond_resched();
-    }
-    let registration = retained
-        .try_with_process_state(|process_state| {
-            let key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-            // Linearization point: the retained process mapping is faulted/pinned
-            // by its state owner before the raw waiter lock. The atomic compare
-            // and waiter publication then occur in the same futex transaction, so
-            // a paired WAKE cannot pass between them.
-            let mut waiters = FUTEX_WAITERS.lock();
-            let actual = process_state
-                .address_space()
-                .atomic_load_user_u32(uaddr)
-                .map_err(user_pointer_error_to_linux_errno)?;
-            if actual != expected {
-                return Err(LINUX_EAGAIN);
-            }
-            waiters.insert(FutexWaiter {
-                key,
-                task_id,
-                bitset,
-            })
-        })
-        .unwrap_or(Err(LINUX_EINTR));
-    if let Err(errno) = registration {
-        let _ = multitask::cancel_block_current_task();
-        return Err(errno);
-    }
-    if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
-        clear_futex_waiter(task_id);
-        let _ = multitask::cancel_block_current_task();
-        return Err(LINUX_ETIMEDOUT);
-    }
-    if let Some(deadline) = deadline_tick
-        && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
-    {
-        clear_futex_waiter(task_id);
-        let _ = multitask::cancel_block_current_task();
-        // The bounded deadline table is exhausted; Linux has no EBUSY here and
-        // ENOMEM is its errno for a failed kernel allocation.
-        return Err(LINUX_ENOMEM);
-    }
-    match multitask::commit_block_current_task_and_yield() {
-        Some(true) => {}
-        Some(false) => {}
-        None => {
+        if let Some(deadline) = deadline_tick
+            && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
+        {
             clear_futex_waiter(task_id);
-            crate::arch::rtc::disarm_sleep_waiter(task_id);
-            return Err(LINUX_EINVAL);
+            let _ = multitask::cancel_block_current_task();
+            // The bounded deadline table is exhausted; Linux has no EBUSY here and
+            // ENOMEM is its errno for a failed kernel allocation.
+            return Err(LINUX_ENOMEM);
         }
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
+            Some(false) => {}
+            None => {
+                clear_futex_waiter(task_id);
+                crate::arch::rtc::disarm_sleep_waiter(task_id);
+                return Err(LINUX_EINVAL);
+            }
+        }
+        break;
     }
     // REQUEUE may have changed the key while this task slept. Cleanup is tied
     // to task identity, not the key captured before blocking, so timeout and
@@ -956,7 +981,7 @@ fn futex_requeue(
     uaddr2: u64,
     op: u64,
 ) -> Result<u64, i64> {
-    futex_requeue_inner(uaddr, max_wake, max_requeue, uaddr2, op)
+    futex_requeue_inner(uaddr, max_wake, max_requeue, uaddr2, None, op)
 }
 
 fn futex_cmp_requeue(
@@ -967,47 +992,15 @@ fn futex_cmp_requeue(
     expected: u64,
     op: u64,
 ) -> Result<u64, i64> {
-    if (uaddr2 & 0x3) != 0 {
-        return Err(LINUX_EINVAL);
-    }
-    let max_wake = futex_int_count(max_wake)?;
-    let max_requeue = futex_int_count(max_requeue)?;
-    let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids = alloc::vec::Vec::new();
-
-    // Linearization point: retain the exact page-table generation, then hold
-    // the futex bucket while performing one atomic word load and the complete
-    // queue mutation. A user atomic store may race, but it is ordered either
-    // before or after this load; no FUTEX_WAIT/WAKE/REQUEUE operation can slip
-    // between the comparison and requeue commit.
-    let requeued = retained
-        .try_with_process_state(|process_state| {
-            let from_key =
-                futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-            let to_key =
-                futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-            let mut waiters = FUTEX_WAITERS.lock();
-            let actual = process_state
-                .address_space()
-                .atomic_load_user_u32(uaddr)
-                .map_err(address_space_error_to_linux_errno)?;
-            // Linux compares the 32-bit futex word with `(u32)val3`; the upper
-            // register half of an `int` argument is not part of the ABI.
-            if actual != expected as u32 {
-                return Err(LINUX_EAGAIN);
-            }
-            Ok::<usize, i64>(waiters.select_requeue_vec(
-                from_key,
-                to_key,
-                max_wake,
-                max_requeue,
-                linux_abi::FUTEX_BITSET_MATCH_ANY,
-                &mut task_ids,
-            ))
-        })
-        .ok_or(LINUX_EINTR)??;
-    let woken = wake_selected_futex_tasks(&task_ids, task_ids.len());
-    Ok((woken + requeued) as u64)
+    // Linux compares the 32-bit futex word; the upper register half is ignored.
+    futex_requeue_inner(
+        uaddr,
+        max_wake,
+        max_requeue,
+        uaddr2,
+        Some(expected as u32),
+        op,
+    )
 }
 
 fn futex_wake_op(
@@ -1025,65 +1018,84 @@ fn futex_wake_op(
     let max_wake1 = futex_wake_limit(max_wake1);
     let max_wake2 = futex_wake_limit(max_wake2);
     let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids1 = alloc::vec::Vec::new();
-    let mut task_ids2 = alloc::vec::Vec::new();
-    retained
-        .try_with_process_state(|process_state| {
-            let key1 = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-            let key2 = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-            let mut waiters = FUTEX_WAITERS.lock();
-            let mut oldval = process_state
-                .address_space()
-                .atomic_load_user_u32(uaddr2)
-                .map_err(address_space_error_to_linux_errno)?;
-            loop {
-                let newval = match decoded.op {
-                    0 => decoded.oparg as u32,
-                    1 => oldval.wrapping_add(decoded.oparg as u32),
-                    2 => oldval | (decoded.oparg as u32),
-                    3 => oldval & !(decoded.oparg as u32),
-                    _ => oldval ^ (decoded.oparg as u32),
-                };
-                match process_state
-                    .address_space()
-                    .atomic_compare_exchange_user_u32(uaddr2, oldval, newval)
-                    .map_err(address_space_error_to_linux_errno)?
-                {
-                    Ok(_) => break,
-                    Err(observed) => oldval = observed,
+    let mut task_ids1 = WakeTaskBuf::new();
+    let mut task_ids2 = WakeTaskBuf::new();
+    let (wake1, wake2) = loop {
+        let attempt = retained
+            .try_with_process_state(|process_state| {
+                let key1 =
+                    futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+                let key2 =
+                    futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+                let mut waiters = FUTEX_WAITERS.lock();
+                let bound = waiters.slots.len();
+                if !task_ids1.covers(max_wake1, bound) || !task_ids2.covers(max_wake2, bound) {
+                    return Ok(Err(bound));
                 }
-            }
-            let cond = match decoded.cmp {
-                0 => (oldval as i32) == decoded.cmparg,
-                1 => (oldval as i32) != decoded.cmparg,
-                2 => (oldval as i32) < decoded.cmparg,
-                3 => (oldval as i32) <= decoded.cmparg,
-                4 => (oldval as i32) > decoded.cmparg,
-                _ => (oldval as i32) >= decoded.cmparg,
-            };
-            waiters.select_requeue_vec(
-                key1,
-                key1,
-                max_wake1,
-                0,
-                linux_abi::FUTEX_BITSET_MATCH_ANY,
-                &mut task_ids1,
-            );
-            if cond {
-                waiters.select_requeue_vec(
-                    key2,
-                    key2,
-                    max_wake2,
+                let mut oldval = process_state
+                    .address_space()
+                    .atomic_load_user_u32(uaddr2)
+                    .map_err(address_space_error_to_linux_errno)?;
+                loop {
+                    let newval = match decoded.op {
+                        0 => decoded.oparg as u32,
+                        1 => oldval.wrapping_add(decoded.oparg as u32),
+                        2 => oldval | (decoded.oparg as u32),
+                        3 => oldval & !(decoded.oparg as u32),
+                        _ => oldval ^ (decoded.oparg as u32),
+                    };
+                    match process_state
+                        .address_space()
+                        .atomic_compare_exchange_user_u32(uaddr2, oldval, newval)
+                        .map_err(address_space_error_to_linux_errno)?
+                    {
+                        Ok(_) => break,
+                        Err(observed) => oldval = observed,
+                    }
+                }
+                let cond = match decoded.cmp {
+                    0 => (oldval as i32) == decoded.cmparg,
+                    1 => (oldval as i32) != decoded.cmparg,
+                    2 => (oldval as i32) < decoded.cmparg,
+                    3 => (oldval as i32) <= decoded.cmparg,
+                    4 => (oldval as i32) > decoded.cmparg,
+                    _ => (oldval as i32) >= decoded.cmparg,
+                };
+                let (wake1, _) = waiters.select_requeue(
+                    key1,
+                    key1,
+                    max_wake1,
                     0,
                     linux_abi::FUTEX_BITSET_MATCH_ANY,
-                    &mut task_ids2,
+                    task_ids1.as_mut_slice(),
                 );
+                let wake2 = if cond {
+                    waiters
+                        .select_requeue(
+                            key2,
+                            key2,
+                            max_wake2,
+                            0,
+                            linux_abi::FUTEX_BITSET_MATCH_ANY,
+                            task_ids2.as_mut_slice(),
+                        )
+                        .0
+                } else {
+                    0
+                };
+                Ok::<_, i64>(Ok((wake1, wake2)))
+            })
+            .ok_or(LINUX_EINTR)??;
+        match attempt {
+            Ok(counts) => break counts,
+            Err(bound) => {
+                task_ids1.grow(max_wake1, bound)?;
+                task_ids2.grow(max_wake2, bound)?;
             }
-            Ok::<(), i64>(())
-        })
-        .ok_or(LINUX_EINTR)??;
-    let woken1 = wake_selected_futex_tasks(&task_ids1, task_ids1.len());
-    let woken2 = wake_selected_futex_tasks(&task_ids2, task_ids2.len());
+        }
+    };
+    let woken1 = wake_selected_futex_tasks(task_ids1.as_slice(), wake1);
+    let woken2 = wake_selected_futex_tasks(task_ids2.as_slice(), wake2);
     Ok((woken1 + woken2) as u64)
 }
 
@@ -1092,6 +1104,7 @@ fn futex_requeue_inner(
     max_wake: u64,
     max_requeue: u64,
     uaddr2: u64,
+    expected: Option<u32>,
     op: u64,
 ) -> Result<u64, i64> {
     if (uaddr2 & 0x3) != 0 {
@@ -1100,25 +1113,46 @@ fn futex_requeue_inner(
     let max_wake = futex_int_count(max_wake)?;
     let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids = alloc::vec::Vec::new();
-    let requeued = retained
-        .try_with_process_state(|process_state| {
-            let from_key =
-                futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-            let to_key =
-                futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-            let mut waiters = FUTEX_WAITERS.lock();
-            Ok::<usize, i64>(waiters.select_requeue_vec(
-                from_key,
-                to_key,
-                max_wake,
-                max_requeue,
-                linux_abi::FUTEX_BITSET_MATCH_ANY,
-                &mut task_ids,
-            ))
-        })
-        .ok_or(LINUX_EINTR)??;
-    let woken = wake_selected_futex_tasks(&task_ids, task_ids.len());
+    let mut task_ids = WakeTaskBuf::new();
+    let (wake_count, requeued) = loop {
+        let attempt = retained
+            .try_with_process_state(|process_state| {
+                let from_key =
+                    futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+                let to_key =
+                    futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+                let mut waiters = FUTEX_WAITERS.lock();
+                // Compare and commit under the same waiter lock. If the table
+                // outgrew the scratch buffer, retry without changing any waiter.
+                if let Some(expected) = expected {
+                    let actual = process_state
+                        .address_space()
+                        .atomic_load_user_u32(uaddr)
+                        .map_err(address_space_error_to_linux_errno)?;
+                    if actual != expected {
+                        return Err(LINUX_EAGAIN);
+                    }
+                }
+                let bound = waiters.slots.len();
+                if !task_ids.covers(max_wake, bound) {
+                    return Ok(Err(bound));
+                }
+                Ok::<_, i64>(Ok(waiters.select_requeue(
+                    from_key,
+                    to_key,
+                    max_wake,
+                    max_requeue,
+                    linux_abi::FUTEX_BITSET_MATCH_ANY,
+                    task_ids.as_mut_slice(),
+                )))
+            })
+            .ok_or(LINUX_EINTR)??;
+        match attempt {
+            Ok(counts) => break counts,
+            Err(bound) => task_ids.grow(max_wake, bound)?,
+        }
+    };
+    let woken = wake_selected_futex_tasks(task_ids.as_slice(), wake_count);
     Ok((woken + requeued) as u64)
 }
 
@@ -1276,7 +1310,6 @@ fn take_futex_waiter_from(waiters: &mut [Option<FutexWaiter>], task_id: u64) -> 
 }
 
 fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
-    const INLINE_WAKE_CAP: usize = 16;
     if max_wake == 0 {
         return 0;
     }

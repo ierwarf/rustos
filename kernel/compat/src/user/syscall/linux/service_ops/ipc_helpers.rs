@@ -561,12 +561,18 @@ pub fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Result<(), 
     Ok(())
 }
 
+fn check_dirfd_handle_kind(kind: multitask::RemoteVfsHandleKind, path: &str) -> Result<(), i64> {
+    if !path.is_empty() && kind != multitask::RemoteVfsHandleKind::Directory {
+        Err(LINUX_ENOTDIR)
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn resolve_vfs_dirfd_remote_id(dirfd: u64, path: &str) -> Result<u64, i64> {
     if !path.starts_with('/') && !is_linux_at_fdcwd_for_vfs(dirfd) {
         let remote = current_remote_vfs_handle(dirfd).ok_or(LINUX_EBADF)?;
-        if remote.kind() != multitask::RemoteVfsHandleKind::Directory {
-            return Err(LINUX_ENOTDIR);
-        }
+        check_dirfd_handle_kind(remote.kind(), path)?;
         return Ok(remote.remote_id());
     }
     Ok(0)
@@ -577,7 +583,11 @@ pub fn populate_vfs_path_base(
     dirfd: u64,
     path: &str,
 ) -> Result<(), i64> {
-    request.dirfd = dirfd;
+    request.dirfd = if is_linux_at_fdcwd_for_vfs(dirfd) {
+        linux_abi::AT_FDCWD as u64
+    } else {
+        dirfd
+    };
     // A generated proc directory is a typed snapshot, not a remote VFS
     // handle. Send its canonical proc path back to vfsd so that namespace
     // lookup and the caller-only PID check still happen there.
@@ -607,12 +617,32 @@ fn proc_directory_child_path(base: &str, path: &str) -> alloc::string::String {
 
 #[cfg(test)]
 mod proc_directory_base_tests {
-    use super::proc_directory_child_path;
+    use super::{check_dirfd_handle_kind, multitask, proc_directory_child_path, LINUX_ENOTDIR};
 
     #[test]
     fn relative_path_retains_components_for_vfs_namespace_resolution() {
         assert_eq!(proc_directory_child_path("/proc/7/fd", "3"), "/proc/7/fd/3");
         assert_eq!(proc_directory_child_path("/proc/7/task/7", "../7/stat"), "/proc/7/task/7/../7/stat");
+    }
+
+    #[test]
+    fn empty_path_allows_non_directory_remote_vfs_handles() {
+        assert_eq!(
+            check_dirfd_handle_kind(multitask::RemoteVfsHandleKind::File, ""),
+            Ok(())
+        );
+        assert_eq!(
+            check_dirfd_handle_kind(multitask::RemoteVfsHandleKind::Device, ""),
+            Ok(())
+        );
+        assert_eq!(
+            check_dirfd_handle_kind(multitask::RemoteVfsHandleKind::File, "child"),
+            Err(LINUX_ENOTDIR)
+        );
+        assert_eq!(
+            check_dirfd_handle_kind(multitask::RemoteVfsHandleKind::Directory, "child"),
+            Ok(())
+        );
     }
 }
 

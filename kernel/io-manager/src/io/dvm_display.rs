@@ -650,10 +650,18 @@ pub(crate) fn query_gpu_atlas_completion(
     if slot >= GPU_SLOT_STATE.len() {
         return DvmGpuCompletionOutcome::Invalid;
     }
-    // ORDERING: Acquire pairs with the AcqRel CAS that publishes SUBMITTED, so the
-    // slot's capability words stored before it are visible below.
-    match GPU_SLOT_STATE[slot].load(Ordering::Acquire) {
-        GPU_SLOT_SUBMITTED => {}
+    // Retirement is single-owner: claim SUBMITTED -> WRITING before reading
+    // slot metadata or shared completion bytes so concurrent queriers cannot
+    // observe a cleared/reused slot and falsely revoke the transport.
+    // ORDERING: AcqRel claims the slot and pairs with the submitter's AcqRel
+    // SUBMITTED CAS so the slot's capability words are visible below.
+    match GPU_SLOT_STATE[slot].compare_exchange(
+        GPU_SLOT_SUBMITTED,
+        GPU_SLOT_WRITING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
         // FREE here means the caller still holds a ticket for a submission
         // that no longer exists: a DVM offline epoch reset (`reset_gpu_slots`)
         // wiped it while the transport stayed installed and re-activated.
@@ -661,12 +669,22 @@ pub(crate) fn query_gpu_atlas_completion(
         // completion that can never arrive (uiserver then times out with
         // errno 110 / stalls). Unavailable (ENODEV) tells it the provider was
         // lost so it re-primes a fresh context.
-        GPU_SLOT_FREE => return DvmGpuCompletionOutcome::Unavailable,
-        _ => return DvmGpuCompletionOutcome::Pending,
+        Err(GPU_SLOT_FREE) => return DvmGpuCompletionOutcome::Unavailable,
+        Err(_) => return DvmGpuCompletionOutcome::Pending,
     }
+    let restore_submitted = || {
+        // ORDERING: AcqRel hands the claim back; failure only observes a reset.
+        let _ = GPU_SLOT_STATE[slot].compare_exchange(
+            GPU_SLOT_WRITING,
+            GPU_SLOT_SUBMITTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    };
     // ORDERING: Acquire pairs with the Release store of the slot sequence at submit.
     let expected_sequence = GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire);
     let Some(sequence_offset) = dvm_gpu_atlas_completion_sequence_offset(binding_slot) else {
+        restore_submitted();
         return DvmGpuCompletionOutcome::Invalid;
     };
     let observed_sequence = read_u64(sequence_offset);
@@ -675,9 +693,11 @@ pub(crate) fn query_gpu_atlas_completion(
         if polls % GPU_PENDING_REDOORBELL_POLLS == 0 {
             signal_gpu_dvm();
         }
+        restore_submitted();
         return DvmGpuCompletionOutcome::Pending;
     }
     if observed_sequence > expected_sequence {
+        restore_submitted();
         // ORDERING: Acquire read of the acknowledged control sequence, used only to
         // label the revoke record written to the host.
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
@@ -685,10 +705,12 @@ pub(crate) fn query_gpu_atlas_completion(
         return DvmGpuCompletionOutcome::Unavailable;
     }
     let Some(completion_offset) = dvm_gpu_atlas_completion_offset(binding_slot) else {
+        restore_submitted();
         return DvmGpuCompletionOutcome::Invalid;
     };
     let mut bytes = [0_u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES];
     if read_bytes(completion_offset, &mut bytes).is_none() {
+        restore_submitted();
         return DvmGpuCompletionOutcome::Unavailable;
     }
     // ORDERING: the DVM stores the completion body before its sequence word, which
@@ -699,6 +721,7 @@ pub(crate) fn query_gpu_atlas_completion(
     // ORDERING: Acquire fence, see the note above: sequence -> body ordering relies on x86 TSO plus volatile program order.
     fence(Ordering::Acquire);
     let Some(completion) = DvmGpuAtlasCompletion::decode(&bytes) else {
+        restore_submitted();
         log_malformed_gpu_completion(binding_slot, expected_sequence, &bytes);
         // ORDERING: Acquire echo of the acknowledged control sequence for the revoke
         // record; the malformed completion itself was decoded from the local copy.
@@ -718,6 +741,7 @@ pub(crate) fn query_gpu_atlas_completion(
         || completion.render.context_epoch != GPU_SLOT_CONTEXT_EPOCH[slot].load(Ordering::Acquire)
         || completion.render.submit_value != GPU_SLOT_SUBMIT_VALUE[slot].load(Ordering::Acquire)
     {
+        restore_submitted();
         // ORDERING: Acquire echo of the acknowledged control sequence for the revoke record.
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-capability-mismatch", control_sequence);
@@ -729,44 +753,13 @@ pub(crate) fn query_gpu_atlas_completion(
         || lifecycle_claim.epoch()
             != u64::from(GPU_SLOT_CONTEXT_EPOCH[slot].load(Ordering::Acquire))
     {
+        restore_submitted();
         return DvmGpuCompletionOutcome::Unavailable;
     }
     let Some(ack_offset) = dvm_gpu_atlas_completion_ack_offset(binding_slot) else {
+        restore_submitted();
         return DvmGpuCompletionOutcome::Invalid;
     };
-    // Retirement is single-owner: the surface handle is process-wide, so two
-    // threads can query one slot concurrently. Without an exclusive claim the
-    // loser would run the clear below after the winner freed the slot and a
-    // new submission republished it, wiping that submission's capability words
-    // and freeing a slot the DVM still owns. Claiming SUBMITTED -> WRITING
-    // makes submitters see the slot busy and other queriers see it pending.
-    // ORDERING: AcqRel claims the slot and, on success, observes every Release
-    // store a racing submit made before its SUBMITTED publication.
-    let claimed = GPU_SLOT_STATE[slot].compare_exchange(
-        GPU_SLOT_SUBMITTED,
-        GPU_SLOT_WRITING,
-        // ORDERING: AcqRel claim; Acquire on failure observes the owner.
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-    if claimed.is_err() {
-        return DvmGpuCompletionOutcome::Pending;
-    }
-    // ORDERING: Acquire pairs with the submit's Release sequence store.
-    if GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire) != expected_sequence {
-        // The slot was retired and resubmitted between the first state load and
-        // this claim; the bytes validated above belong to the old submission.
-        // ORDERING: AcqRel hands the claim back; a failed CAS means a reset
-        // freed the slot and it must not be resurrected.
-        let _ = GPU_SLOT_STATE[slot].compare_exchange(
-            GPU_SLOT_WRITING,
-            GPU_SLOT_SUBMITTED,
-            // ORDERING: AcqRel hand-back; failure only observes a reset.
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        return DvmGpuCompletionOutcome::Pending;
-    }
     write_u64(ack_offset, expected_sequence);
     // ORDERING: retirement is under the exclusive SUBMITTED -> WRITING claim. The
     // capability words are cleared first and the Release FREE store last, so a

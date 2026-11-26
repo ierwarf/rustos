@@ -109,8 +109,10 @@ pub use crate::user::linux::{
     LinuxVma, LinuxVmaFlags, LinuxVmaName,
 };
 pub use crate::user::eventfd::{EventFdError, EventFdHandle, EVENTFD_MAX_COUNTER};
+pub use crate::user::timerfd::{TimerFdError, TimerFdHandle, TimerFdRead, TimerFdSpec};
 pub use crate::user::local_wait::{
-    readiness_of as local_fd_readiness_of, LocalReadiness, LocalRelease, LocalWake,
+    deadline_ns_of as local_fd_deadline_ns_of, readiness_of as local_fd_readiness_of,
+    LocalReadiness, LocalRelease, LocalWake,
 };
 pub use crate::user::memfd::{MemfdError, MemfdHandle, MemfdMappingHold, ProcSnapshotInfo};
 pub use crate::user::pipe::{

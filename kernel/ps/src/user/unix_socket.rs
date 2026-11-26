@@ -809,7 +809,15 @@ impl UnixSocketHandle {
                     drained.append(&mut msg.rights);
                 }
             }
-            EndpointRole::Dgram { recv_queue, .. } => {
+            EndpointRole::Dgram {
+                recv_queue,
+                generation,
+                ..
+            } => {
+                wake = Some(LocalWake {
+                    token,
+                    generation: generation.saturating_add(1),
+                });
                 for mut msg in recv_queue {
                     drained.append(&mut msg.rights);
                 }
@@ -1497,7 +1505,7 @@ impl UnixSocketHandle {
             if empty {
                 ch.sides[side].recv_queue.pop_front();
             }
-            if remaining == 0 {
+            if remaining == 0 || !rights.is_empty() {
                 break;
             }
         }
@@ -2338,5 +2346,80 @@ mod tests {
         assert_eq!(readiness(&a).events & linux_abi::EPOLLOUT, 0);
         let _ = a.release_descriptor_reference();
         let _ = b.release_descriptor_reference();
+    }
+
+    #[test]
+    fn stream_zero_byte_scm_rights_followed_by_data_and_rights_preserves_both() {
+        let creds = test_creds(78);
+        let (a, b) = UnixSocketHandle::new_pair(UnixSocketType::Stream, false, creds, None).unwrap();
+
+        let efd1 = EventFdHandle::new(1, false, false).unwrap();
+        assert!(efd1.try_acquire_descriptor_reference());
+        let passed1 = PassedHandle::new_with_rights(
+            KernelHandle::EventFd(efd1.clone()),
+            0,
+            KernelHandle::EventFd(efd1.clone()).default_rights(0),
+        );
+
+        let efd2 = EventFdHandle::new(2, false, false).unwrap();
+        assert!(efd2.try_acquire_descriptor_reference());
+        let passed2 = PassedHandle::new_with_rights(
+            KernelHandle::EventFd(efd2.clone()),
+            0,
+            KernelHandle::EventFd(efd2.clone()).default_rights(0),
+        );
+
+        a.try_send(b"", alloc::vec![passed1], creds, None).unwrap();
+        a.try_send(b"abc", alloc::vec![passed2], creds, None).unwrap();
+
+        let msg1 = b.try_recv(64, false).unwrap();
+        assert!(msg1.data.is_empty());
+        assert_eq!(msg1.rights.len(), 1);
+        assert_eq!(msg1.rights[0].handle().token().object_id(), efd1.token_id());
+
+        let msg2 = b.try_recv(64, false).unwrap();
+        assert_eq!(msg2.data, b"abc");
+        assert_eq!(msg2.rights.len(), 1);
+        assert_eq!(msg2.rights[0].handle().token().object_id(), efd2.token_id());
+
+        drop(msg1);
+        drop(msg2);
+        assert!(!efd1.release_descriptor_reference().last);
+        assert!(efd1.release_descriptor_reference().last);
+        assert!(!efd2.release_descriptor_reference().last);
+        assert!(efd2.release_descriptor_reference().last);
+        let _ = a.release_descriptor_reference();
+        let _ = b.release_descriptor_reference();
+    }
+
+    #[test]
+    fn full_dgram_receiver_close_wakes_blocked_sender() {
+        let creds = test_creds(79);
+        let (a, b) = UnixSocketHandle::new_pair(UnixSocketType::Dgram, true, creds, None).unwrap();
+        let mut last = None;
+        for _ in 0..=UNIX_MAX_QUEUED_MESSAGES {
+            match a.try_send(b"", Vec::new(), creds, None) {
+                Ok(_) => {}
+                Err((err, _)) => {
+                    last = Some(err);
+                    break;
+                }
+            }
+        }
+        let Some(UnixSocketError::PeerWouldBlock { token, generation }) = last else {
+            panic!("expected PeerWouldBlock, got {last:?}");
+        };
+        assert_eq!(token, b.token_id());
+
+        let (rel, drained) = b.release_descriptor_reference();
+        assert!(rel.last);
+        assert!(drained.is_empty());
+        let wake = rel.wake.expect("closing a dgram receiver must publish a wake");
+        assert_eq!(wake.token, token);
+        assert!(wake.generation > generation);
+
+        let err = a.try_send(b"after-close", Vec::new(), creds, None).unwrap_err();
+        assert_eq!(err.0, UnixSocketError::ConnectionRefused);
+        let _ = a.release_descriptor_reference();
     }
 }

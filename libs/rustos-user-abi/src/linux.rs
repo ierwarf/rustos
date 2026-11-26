@@ -220,6 +220,17 @@ raw_u64! {
     SYS_SETPGID = linux::__NR_setpgid;
     SYS_GETSID = linux::__NR_getsid;
     SYS_SETSID = linux::__NR_setsid;
+    SYS_TIMERFD_CREATE = linux::__NR_timerfd_create;
+    SYS_TIMERFD_SETTIME = linux::__NR_timerfd_settime;
+    SYS_TIMERFD_GETTIME = linux::__NR_timerfd_gettime;
+    SYS_NAME_TO_HANDLE_AT = linux::__NR_name_to_handle_at;
+    SYS_PKEY_MPROTECT = linux::__NR_pkey_mprotect;
+    SYS_PKEY_ALLOC = linux::__NR_pkey_alloc;
+    SYS_PKEY_FREE = linux::__NR_pkey_free;
+    TFD_CLOEXEC = linux::TFD_CLOEXEC;
+    TFD_NONBLOCK = linux::TFD_NONBLOCK;
+    TFD_TIMER_ABSTIME = linux::TFD_TIMER_ABSTIME;
+    TFD_TIMER_CANCEL_ON_SET = linux::TFD_TIMER_CANCEL_ON_SET;
     TCGETS = linux_ioctl::TCGETS;
     TCSETS = linux_ioctl::TCSETS;
     TCSETSW = linux_ioctl::TCSETSW;
@@ -341,6 +352,7 @@ raw_u64! {
     MAP_EXECUTABLE = linux::MAP_EXECUTABLE;
     CLOCK_REALTIME = linux::CLOCK_REALTIME;
     CLOCK_MONOTONIC = linux::CLOCK_MONOTONIC;
+    CLOCK_BOOTTIME = linux::CLOCK_BOOTTIME;
     TIMER_ABSTIME = linux::TIMER_ABSTIME;
     RLIMIT_CPU = linux::RLIMIT_CPU;
     RLIMIT_FSIZE = linux::RLIMIT_FSIZE;
@@ -606,10 +618,17 @@ const MMAP_COLLISION_GUARD: u64 = 64 * 1024 * 1024;
 const MAX_RESERVED_MAPPINGS: usize = 64;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinuxTimespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxItimerspec {
+    pub it_interval: LinuxTimespec,
+    pub it_value: LinuxTimespec,
 }
 
 #[repr(C)]
@@ -1904,6 +1923,8 @@ mod tests {
 crate::user_wire!(LinuxMsghdr { msg_name: u64, msg_namelen: u32, __pad0: u32, msg_iov: u64, msg_iovlen: u64, msg_control: u64, msg_controllen: u64, msg_flags: u32, __pad1: u32 });
 crate::user_wire!(LinuxRusage { ru_utime: LinuxTimeval, ru_stime: LinuxTimeval, ru_maxrss: i64, ru_ixrss: i64, ru_idrss: i64, ru_isrss: i64, ru_minflt: i64, ru_majflt: i64, ru_nswap: i64, ru_inblock: i64, ru_oublock: i64, ru_msgsnd: i64, ru_msgrcv: i64, ru_nsignals: i64, ru_nvcsw: i64, ru_nivcsw: i64 });
 crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });
+crate::user_wire!(LinuxTimespec { tv_sec: i64, tv_nsec: i64 });
+crate::user_wire!(LinuxItimerspec { it_interval: LinuxTimespec, it_value: LinuxTimespec });
 crate::user_wire!(LinuxSockaddrIn6 { sin6_family: u16, sin6_port: u16, sin6_flowinfo: u32, sin6_addr: [u8; 16], sin6_scope_id: u32 });
 crate::user_wire!(LinuxInotifyEventHeader { wd: i32, mask: u32, cookie: u32, len: u32 });
 crate::user_wire!(LinuxSysinfo { uptime: i64, loads: [u64; 3], totalram: u64, freeram: u64, sharedram: u64, bufferram: u64, totalswap: u64, freeswap: u64, procs: u16, pad: u16, _pad2: u32, totalhigh: u64, freehigh: u64, mem_unit: u32, _pad3: u32 });

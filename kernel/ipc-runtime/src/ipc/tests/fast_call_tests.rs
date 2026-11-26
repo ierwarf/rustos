@@ -298,12 +298,14 @@ fn endpoint_lock_acquisitions_during<R>(body: impl FnOnce() -> R) -> (R, u64) {
     (value, census[class])
 }
 
-/// The exact withdrawal enters the slab once; the whole-slab form enters it
-/// once per slot, which is what made it the most-acquired endpoint site.
+/// The exact withdrawal enters the slab once; the whole-slab form walks every
+/// occupied slot via the occupancy bitset while skipping empty slots.
 #[test]
 fn an_exact_waiter_withdrawal_enters_the_slab_once() {
     with_isolated_ipc_test(|| {
         let endpoint = super::super::create_endpoint().expect("create endpoint");
+        let _idle_endpoints: [_; 9] =
+            core::array::from_fn(|_| super::super::create_endpoint().expect("idle endpoint"));
         super::super::add_endpoint_receiver_waiter(endpoint, 31).expect("park");
         let (removed, exact) = endpoint_lock_acquisitions_during(|| {
             super::super::remove_endpoint_waiter_for_task(endpoint, 31)
@@ -317,8 +319,8 @@ fn an_exact_waiter_withdrawal_enters_the_slab_once() {
         });
         assert_eq!(removed, 1);
         assert!(
-            walked > exact * 8,
-            "the whole-slab form is expected to enter once per slot, got {walked}"
+            walked > exact * 8 && walked < super::super::MAX_ENDPOINT_OBJECTS as u64,
+            "the whole-slab form should visit only occupied slots (10), got {walked}"
         );
     });
 }

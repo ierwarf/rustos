@@ -22,10 +22,11 @@ const MAX_SYMBOL_BYTES: u64 = 32 * 1024;
 // Diagnostic adapters for the current 64-bit, cache-aligned IPC slabs. Exact
 // linked symbol sizes must agree before any handle-derived row is read.
 const IPC_SLABS: &[(&str, u64, u64)] = &[
-    ("kernel_ipc_runtime::ipc::ENDPOINTS", 512, 192),
-    ("kernel_ipc_runtime::ipc::REPLIES", 128, 768),
-    ("kernel_ipc_runtime::ipc::ENDPOINT_MESSAGES", 128, 192),
+    ("kernel_ipc_runtime::ipc::ENDPOINTS", 512, 256),
+    ("kernel_ipc_runtime::ipc::REPLIES", 512, 768),
+    ("kernel_ipc_runtime::ipc::ENDPOINT_MESSAGES", 512, 256),
 ];
+const IPC_SLAB_OCCUPANCY_BYTES: u64 = 128;
 const MAX_IPC_ROWS: usize = 64;
 const MAX_STACK_ROWS: usize = 24;
 /// First address of the kernel half. Heap chunks, `Task` objects and guarded
@@ -311,12 +312,11 @@ impl Monitor {
             "IPC diagnostic row budget exceeded"
         );
         let &(base, size) = tables.get(name).context("linked IPC slab is absent")?;
-        // Slots come first; what follows is the cache-padded per-CPU insertion
-        // hints (one 64-byte line per tracked CPU), so the tail grows with the
-        // CPU capacity and only its shape is checked, not a fixed size.
-        let tail = size.saturating_sub(capacity * stride);
+        // The C-layout slab begins with slots; the tail is the occupancy
+        // bitmap and one 64-byte insertion hint per tracked CPU.
+        let hints = size.saturating_sub(capacity * stride + IPC_SLAB_OCCUPANCY_BYTES);
         ensure!(
-            size >= capacity * stride + 64 && tail % 64 == 0 && tail <= 64 * 64,
+            hints >= 64 && hints % 64 == 0 && hints <= 64 * 64,
             "linked IPC slab layout changed: {name}"
         );
         let address = base
@@ -735,7 +735,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&monitor.transcript).contains("COMMAND cont"));
         let tables = BTreeMap::from([(
             IPC_SLABS[0].0.to_owned(),
-            (0x1000, IPC_SLABS[0].1 * IPC_SLABS[0].2 + 64),
+            (0x1000, IPC_SLABS[0].1 * IPC_SLABS[0].2 + IPC_SLAB_OCCUPANCY_BYTES + 64),
         )]);
         let mut seen = (0..MAX_IPC_ROWS as u64).map(|index| (0, index)).collect();
         assert!(monitor.ipc_row(&tables, 0, 0x10065, &mut seen).is_err());

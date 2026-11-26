@@ -248,10 +248,12 @@ So the barrier is load-bearing *and* the litmus is sensitive to its removal.
 
 Boot filling and normal replenishment must publish the same claim authority.
 `FaultFramePool::initialize` owns `Cold -> Filling -> Ready`: it fills private
-slots, sets `available` to the complete capacity, and only then Release-publishes
-`Ready`. A reservation's Acquire of `Ready` observes both slots and count.
-A failed fill releases every private frame, leaves zero claims, and publishes
-`Cold` for retry; a second initialization of `Ready` allocates nothing.
+slots and initializes their ready bits and availability census before
+Release-publishing `Ready`. A reservation's Acquire of `Ready` observes all
+three. A failed fill releases every private frame, leaves zero claims, and
+publishes `Cold` for retry; a second initialization of `Ready` allocates nothing.
+The physical allocator excludes page zero even if firmware marks it usable:
+zero is reserved for absent frame slots and absent page-table roots.
 Previously boot stored frames directly but skipped the count update performed
 by `publish`, sealing 2048 occupied slots with zero available claims. Every
 reserve then reported exhaustion, and replenishment found no empty slot to
@@ -272,11 +274,12 @@ That is a 129× minimum-latency and 10.0× median-latency improvement. A second
 candidate run measured 992,400 cycles minimum and 7,282,600 cycles p50, so the
 gain is not a single-run artifact.
 
-The availability count is **authority, not a census**: a claimer decrements it
-before it may scan the slot array, so an empty pool is rejected in one atomic
-operation and two claimers can never be promised the same frame. The previous
-shape recomputed depth by sweeping the whole array on every fault, which is
-O(pool) on the fault path *and* cannot state either property.
+The ready bit is now the authority for its exact slot; the availability count
+is a refill hint and diagnostic census. Refill fills a vacant slot and accounts
+for it before Release-publishing its bit. A claimant first clears that exact
+bit with AcqRel, then takes the frame and reopens the slot. The IRQ-off scan
+visits each bitmap word once and never spins on a reservation made solely
+against a count. An empty scan requests refill and returns exhaustion.
 
 ### The writer lock is per process
 
