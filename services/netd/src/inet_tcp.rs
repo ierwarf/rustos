@@ -380,7 +380,11 @@ pub(super) fn handle_inet_send_in_state(
         match socket.send_slice(bytes) {
             Ok(sent) => {
                 response.value = sent as u64;
+                let filled = !socket.can_send();
                 stack.poll_budget(16);
+                if filled {
+                    state.inet_sockets.mark_dirty(request.socket_token);
+                }
                 return 0;
             }
             Err(_) => return libc::EPIPE,
@@ -445,7 +449,13 @@ pub(super) fn handle_inet_recv_in_state(
                 if recvmsg {
                     response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
                 }
+                // A local drain can change readiness without any packet I/O.
+                // Record it before the next ingress can make the socket readable again.
+                let drained = !peek && !socket.can_recv();
                 stack.poll_budget(8);
+                if drained {
+                    state.inet_sockets.mark_dirty(request.socket_token);
+                }
                 return 0;
             }
             Err(_) => return libc::ECONNRESET,
@@ -969,9 +979,9 @@ mod tests {
         }
     }
 
-    fn new_tcp(sockets: &mut SocketSet<'static>) -> SocketHandle {
-        let rx = tcp::SocketBuffer::new(vec![0; 4096]);
-        let tx = tcp::SocketBuffer::new(vec![0; 4096]);
+    fn new_tcp(sockets: &mut SocketSet<'static>, capacity: usize) -> SocketHandle {
+        let rx = tcp::SocketBuffer::new(vec![0; capacity]);
+        let tx = tcp::SocketBuffer::new(vec![0; capacity]);
         let handle = sockets.add(tcp::Socket::new(rx, tx));
         forget_tcp_termination(handle);
         handle
@@ -980,6 +990,10 @@ mod tests {
     /// Establishes client<->server over smoltcp loopback and returns the
     /// pieces so each test can end the connection its own way.
     fn established() -> (Interface, Loopback, SocketSet<'static>, i64, SocketHandle, SocketHandle) {
+        established_with_capacity(4096)
+    }
+
+    fn established_with_capacity(capacity: usize) -> (Interface, Loopback, SocketSet<'static>, i64, SocketHandle, SocketHandle) {
         let mut device = Loopback::new(Medium::Ethernet);
         let mut iface = Interface::new(
             Config::new(HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([2, 0, 0, 0, 0, 1]))),
@@ -992,8 +1006,8 @@ mod tests {
                 .unwrap();
         });
         let mut sockets = SocketSet::new(Vec::new());
-        let server = new_tcp(&mut sockets);
-        let client = new_tcp(&mut sockets);
+        let server = new_tcp(&mut sockets, capacity);
+        let client = new_tcp(&mut sockets, capacity);
         sockets
             .get_mut::<tcp::Socket>(server)
             .listen(IpListenEndpoint { addr: None, port: 7000 })
@@ -1039,6 +1053,44 @@ mod tests {
             connect_budget: None,
         });
         state
+    }
+
+    #[test]
+    fn draining_tcp_receive_queue_rearms_readable_generation() {
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).send_slice(b"a").unwrap();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let mut state = state_with_tcp(iface, sockets, client);
+        let before = state.socket_readiness_generation(7);
+        let request = NetdIpcRequest {
+            op: SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+            socket_token: 7,
+            arg2: 1,
+            ..Default::default()
+        };
+        let mut response = NetdIpcResponse::default();
+        assert_eq!(handle_inet_recv_in_state(&mut state, &request, &mut response), 0);
+        assert_eq!(response.value, 1);
+        assert_eq!(response.payload[0], b'a');
+        let drained = state.socket_readiness_generation(7);
+        assert!(drained > before, "a local drain must publish not-readable");
+        let stack = state.inet.as_mut().unwrap();
+        stack.sockets.get_mut::<tcp::Socket>(server).send_slice(b"b").unwrap();
+        poll_loopback(&mut stack.iface, &mut device, &mut stack.sockets, &mut clock);
+        stack.readiness_dirty = true;
+        assert!(state.socket_readiness_generation(7) > drained);
+    }
+
+    #[test]
+    fn filling_tcp_send_queue_rearms_writable_generation() {
+        let (iface, _device, sockets, _clock, client, _) = established_with_capacity(1024);
+        let mut state = state_with_tcp(iface, sockets, client);
+        let before = state.socket_readiness_generation(7);
+        let request = NetdIpcRequest { socket_token: 7, ..Default::default() };
+        let mut response = NetdIpcResponse::default();
+        assert_eq!(handle_inet_send_in_state(&mut state, &request, &[7; 1024], &mut response), 0);
+        assert_eq!(response.value, 1024);
+        assert!(state.socket_readiness_generation(7) > before);
     }
 
     #[test]

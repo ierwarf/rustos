@@ -17,11 +17,11 @@
 // Ring0 owns only fixed ivshmem mapping and bounded SPSC ring access. Linux
 // networking and RustOS socket/TCP policy remain in their respective user
 // services; a DVM never supplies a pointer or descriptor chain to RustOS.
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 use driver_domain_protocol::{
-    DVM_NET_APERTURE_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_SLOT_BYTES, DvmNetHeader,
-    validate_dvm_ethernet_frame,
+    DVM_NET_APERTURE_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_RX_WAIT_ARMED_OFFSET,
+    DVM_NET_SLOT_BYTES, DVM_NET_TX_WAIT_ARMED_OFFSET, DvmNetHeader, validate_dvm_ethernet_frame,
 };
 
 use crate::network::{PacketError, PacketTransportStatus};
@@ -30,6 +30,8 @@ use crate::sync::{KernelWaitGuard, KernelWaitLock};
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 const IVSHMEM_SHARED_MEMORY_BAR: usize = 2;
+#[path = "network_notification.rs"]
+mod notification;
 const TX_PRODUCER_OFFSET: usize = 40;
 const TX_CONSUMER_OFFSET: usize = 44;
 const RX_PRODUCER_OFFSET: usize = 48;
@@ -38,6 +40,9 @@ const SLOT_LEN_BYTES: usize = 4;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static RX_WAITER: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 static STATE: KernelWaitLock<
     Option<DvmNetworkState>,
     { nucleus_core::util::lockdep::LockClass::DvmNetworkStateWait as u8 },
@@ -53,6 +58,7 @@ static TRANSPORT_LEASE: KernelWaitLock<
 
 struct DvmNetworkState {
     base: *mut u8,
+    notification: Option<notification::Doorbell>,
     header: DvmNetHeader,
     tx_producer: u32,
     rx_consumer: u32,
@@ -179,6 +185,14 @@ pub(crate) fn try_install() -> bool {
             last_rejection = "header-outside-bar";
             return false;
         }
+        let notification = match notification::Doorbell::install(device) {
+            Ok(notification) => notification,
+            Err(reason) => {
+                crate::driver::mmio::unmap(mapped.cast());
+                last_rejection = reason;
+                return false;
+            }
+        };
         let tx_producer = read_u32(mapped, TX_PRODUCER_OFFSET);
         let initial_rx_consumer = read_u32(mapped, RX_CONSUMER_OFFSET);
         let initial_rx_producer = read_u32(mapped, RX_PRODUCER_OFFSET);
@@ -197,6 +211,7 @@ pub(crate) fn try_install() -> bool {
             };
         installed = Some(DvmNetworkState {
             base: mapped,
+            notification,
             header,
             // A ring mapped after the DVM has started must not replay frames
             // which predate the current transport generation lease. Do not
@@ -225,6 +240,8 @@ pub(crate) fn try_install() -> bool {
     let slots = state.header.slot_count;
     let mtu = state.header.mtu;
     let region = state.header.region_bytes;
+    let vector = state.notification.as_ref().map_or(0, notification::Doorbell::vector);
+    let _ = vector; // Diagnostics may be compiled out.
     *state_guard = Some(state);
     // ORDERING: Release publishes the completed `*state_guard = Some(state)`
     // (mapped base, validated header, seeded cursors) to the Acquire loads of
@@ -234,12 +251,29 @@ pub(crate) fn try_install() -> bool {
     // diagnostic flag with no dependent data, Release is merely conservative.
     UNAVAILABLE_LOGGED.store(false, Ordering::Release);
     crate::debug::println!(
-        "dvm-network: shared transport installed slots={} mtu={} region={}",
+        "dvm-network: shared transport installed slots={} mtu={} region={} msix={}",
         slots,
         mtu,
-        region
+        region,
+        vector
     );
     true
+}
+
+fn network_interrupt(_vector: u8) {
+    // No locks, packet work, or peer-controlled addresses in IRQ context.
+    RX_IRQ_COUNT.fetch_add(1, Ordering::Release);
+    let task = RX_WAITER.load(Ordering::Acquire);
+    if task != 0 {
+        let _ = crate::multitask::wake_task(task);
+    }
+}
+
+fn wait_arm(base: *mut u8, offset: usize) -> &'static AtomicU32 {
+    debug_assert!(matches!(offset, DVM_NET_RX_WAIT_ARMED_OFFSET | DVM_NET_TX_WAIT_ARMED_OFFSET));
+    // SAFETY: callers supply a kernel-lifetime WB network aperture and one
+    // of the ABI's aligned atomic words within the header page.
+    unsafe { &*base.add(offset).cast::<AtomicU32>() }
 }
 
 const fn fixed_network_shared_bar_shape(is_io: bool, prefetchable: bool, size: u64) -> bool {
@@ -288,6 +322,109 @@ pub(crate) fn transport_status(authorize: impl FnOnce() -> bool) -> Result<Packe
     })
 }
 
+struct ReceiveWaiter(u64);
+
+impl ReceiveWaiter {
+    fn claim(task: u64) -> Result<Self, PacketError> {
+        let state = STATE.lock();
+        let state = state.as_ref().ok_or(PacketError::NoDevice)?;
+        if state.notification.is_none() {
+            return Err(PacketError::Unsupported);
+        }
+        let previous = RX_WAITER.load(Ordering::Acquire);
+        if previous != 0 && crate::multitask::is_user_task_alive(previous) {
+            return Err(PacketError::Busy);
+        }
+        wait_arm(state.base, DVM_NET_RX_WAIT_ARMED_OFFSET).store(0, Ordering::Release);
+        RX_WAITER.store(task, Ordering::Release);
+        Ok(Self(task))
+    }
+}
+
+impl Drop for ReceiveWaiter {
+    fn drop(&mut self) {
+        let state = STATE.lock();
+        if RX_WAITER.load(Ordering::Acquire) == self.0 {
+            if let Some(state) = state.as_ref() {
+                wait_arm(state.base, DVM_NET_RX_WAIT_ARMED_OFFSET).store(0, Ordering::Release);
+            }
+            RX_WAITER.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Wait for a hint or the bounded watchdog; neither advances a cursor.
+/// Check the active epoch and actual ring before and after scheduler arming.
+pub(crate) fn wait_receive(timeout_ms: u64, authorize: impl Fn() -> bool) -> Result<(), PacketError> {
+    use crate::{arch::rtc, multitask};
+
+    let task = multitask::current_task_id().filter(|id| *id != 0).ok_or(PacketError::Invalid)?;
+    let epoch = {
+        let lease = authorized_lease(&TRANSPORT_LEASE, &authorize)?;
+        if !lease.is_active() {
+            return Err(PacketError::NoDevice);
+        }
+        lease.epoch
+    };
+    let _waiter = ReceiveWaiter::claim(task)?;
+    let check = |arm: bool| {
+        let lease = authorized_lease(&TRANSPORT_LEASE, &authorize)?;
+        if lease.epoch != epoch {
+            return Err(PacketError::Revoked);
+        }
+        let state = STATE.lock();
+        let state = state.as_ref().ok_or(PacketError::NoDevice)?;
+        if arm {
+            wait_arm(state.base, DVM_NET_RX_WAIT_ARMED_OFFSET).store(1, Ordering::SeqCst);
+        }
+        let available = read_u32(state.base, RX_PRODUCER_OFFSET).wrapping_sub(state.rx_consumer);
+        if available > state.header.slot_count {
+            return Err(PacketError::Invalid);
+        }
+        Ok(available != 0)
+    };
+    let deadline = rtc::ticks().saturating_add(timeout_ms.saturating_mul(rtc::ticks_per_second())
+        .div_ceil(1000).max(1));
+    let initial_irq = RX_IRQ_COUNT.load(Ordering::Acquire);
+    let mut parked = false;
+    loop {
+        if check(false)? {
+            if parked && RX_IRQ_COUNT.load(Ordering::Acquire) != initial_irq
+                && !RX_IRQ_WAKE_LOGGED.swap(true, Ordering::Relaxed)
+            {
+                #[cfg(not(test))]
+                nucleus_core::debug::write_debugcon_only_line(
+                    b"dvm-network: RX doorbell woke packet waiter",
+                );
+            }
+            return Ok(());
+        }
+        if rtc::ticks() >= deadline {
+            return Ok(());
+        }
+        if !multitask::arm_block_current_task() {
+            return Err(PacketError::Busy);
+        }
+        match check(true) {
+            Ok(false) => {}
+            outcome => {
+                let _ = multitask::cancel_block_current_task();
+                return outcome.map(|_| ());
+            }
+        }
+        if !rtc::arm_sleep_waiter_until_tick(task, deadline) {
+            let _ = multitask::cancel_block_current_task();
+            return Err(PacketError::Busy);
+        }
+        let blocked = multitask::commit_block_current_task_and_yield();
+        rtc::disarm_sleep_waiter(task);
+        parked |= blocked == Some(true);
+        if blocked.is_none() {
+            return Err(PacketError::Invalid);
+        }
+    }
+}
+
 pub(crate) fn transmit(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
     // Lock ordering is always control lease, then ring state.  Revocation
     // waits for an already-started bounded packet operation, then makes every
@@ -324,6 +461,9 @@ pub(crate) fn transmit(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result
     fence(Ordering::Release);
     state.tx_producer = state.tx_producer.wrapping_add(1);
     write_u32(state.base, TX_PRODUCER_OFFSET, state.tx_producer);
+    if let Some(doorbell) = &state.notification {
+        doorbell.after_transmit(wait_arm(state.base, DVM_NET_TX_WAIT_ARMED_OFFSET));
+    }
     Ok(frame.len())
 }
 

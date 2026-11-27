@@ -399,8 +399,11 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   tracing a 192-pixel square, so the test cannot type into a focused shell or
   masquerade as a trembling cursor. It neither enables QMP nor a host-to-DVM
   input endpoint, and normal DVM boots do not run this self-test.
-- `--dvm-network-shmem` adds a private 512 KiB fixed-ring `ivshmem-plain`
-  aperture to both guests. RustOS owns only bounded Ethernet-frame ring access;
+- `--dvm-network-shmem` adds a private 512 KiB fixed-ring aperture to each
+  guest. The default `ivshmem-plain` path remains polling-based.
+  `KVM_DVM_NETWORK_DOORBELL=1` selects the experimental one-vector MSI-X
+  transport for comparison, without changing the ring format. RustOS owns
+  only bounded Ethernet-frame ring access;
   Linux owns the virtio-net NIC and raw socket relay; `netd` retains socket/TCP
   policy. RustOS has no native virtio-net device in this topology.
 - `--exercise-network` requires both `--gui-dvm-surfaces` and

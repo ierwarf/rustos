@@ -11,6 +11,10 @@ pub const DVM_NET_MAGIC: [u8; 8] = *b"RSDVMNT1";
 pub const DVM_NET_VERSION: u32 = 1;
 pub const DVM_NET_HEADER_BYTES: u32 = 4096;
 pub const DVM_NET_RECORD_BYTES: usize = 64;
+/// Consumer-owned wake hints in the mutable header page, outside the record.
+/// A producer may consume (clear) an arm only after publishing its cursor.
+pub const DVM_NET_TX_WAIT_ARMED_OFFSET: usize = 64;
+pub const DVM_NET_RX_WAIT_ARMED_OFFSET: usize = 68;
 pub const DVM_NET_SLOT_COUNT: u32 = 64;
 pub const DVM_NET_SLOT_BYTES: u32 = 2048;
 pub const DVM_NET_MTU: u32 = 1514;

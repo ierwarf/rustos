@@ -1349,6 +1349,10 @@ pub const NET_BROKER_OP_PACKET_RX: u16 = 0x8003;
 pub const NET_BROKER_OP_PACKET_LEASE_GRANT: u16 = 0x8004;
 pub const NET_BROKER_OP_PACKET_LEASE_REVOKE: u16 = 0x8005;
 pub const NET_BROKER_OP_PACKET_LEASE_RESET: u16 = 0x8006;
+/// Wait for RX progress or the timer (arg0: milliseconds, arg1..5: zero).
+/// This is a hint only; it does not consume a frame.
+pub const NET_BROKER_OP_PACKET_WAIT_RX: u16 = 0x8007;
+pub const NET_BROKER_PACKET_WAIT_MAX_MS: u64 = 20;
 /// Prepare initial socket descriptors attached to the current netd reply.
 /// This is deliberately a prepare operation: it never installs an fd into the
 /// target process before that caller accepts the exact reply capability.

@@ -82,28 +82,47 @@ pub(super) fn start_inet_readiness_worker() {
 }
 
 pub(super) fn inet_readiness_worker_loop() {
+    const MIN_WAIT: Duration = Duration::from_millis(1);
+    const ACTIVE_TURNS: u8 = 8;
+    let mut warm_turns = 0;
+    let mut doorbell_supported = true;
     loop {
-        let wait_for = {
+        let (use_doorbell, wait_for) = {
             let mut state = lock_net_state();
-            let poll_delay = if let Some(stack) = state.inet.as_mut() {
-                stack.poll_budget(INET_READINESS_POLL_BUDGET);
-                let now = smol_now();
-                stack
-                    .iface
-                    .poll_delay(now, &stack.sockets)
-                    .map(|d| Duration::from_millis(d.total_millis()))
-            } else {
-                None
-            };
+            let (progress, poll_delay) = state.inet.as_mut().map_or((false, None), |stack| {
+                let progress = stack.poll_budget(INET_READINESS_POLL_BUDGET);
+                let delay = stack.iface.poll_delay(smol_now(), &stack.sockets)
+                    .map(|d| Duration::from_millis(d.total_millis()));
+                (progress, delay)
+            });
             if state.inet_sockets.is_empty() {
-                INET_IDLE_POLL_INTERVAL
+                warm_turns = 0;
+                (false, INET_IDLE_POLL_INTERVAL)
             } else {
-                match poll_delay {
-                    Some(delay) => delay.clamp(Duration::from_millis(1), INET_READINESS_POLL_INTERVAL),
-                    None => INET_READINESS_POLL_INTERVAL,
+                if progress {
+                    warm_turns = ACTIVE_TURNS;
+                }
+                if warm_turns != 0 {
+                    // Batch a live burst rather than interrupting for each fragment.
+                    warm_turns -= 1;
+                    (false, MIN_WAIT)
+                } else {
+                    (true, poll_delay.unwrap_or(INET_READINESS_POLL_INTERVAL)
+                        .clamp(MIN_WAIT, INET_READINESS_POLL_INTERVAL))
                 }
             }
         };
+        // Do not hold NetState while parked. The broker double-checks the
+        // ring and revalidates lease/owner around every scheduler wait.
+        if use_doorbell && doorbell_supported {
+            match packet_provider::packet_wait_rx(wait_for) {
+                Ok(()) => continue,
+                // Only a mapped, boot-lifetime polling transport reports this.
+                // Authority/lease failures must not permanently disable retry.
+                Err(libc::EOPNOTSUPP) => doorbell_supported = false,
+                Err(_) => {}
+            }
+        }
         let (lock, cv) = inet_worker_wake_signal();
         if let Ok(guard) = lock.lock() {
             let _ = cv.wait_timeout(guard, wait_for);

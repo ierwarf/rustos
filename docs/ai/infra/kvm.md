@@ -281,7 +281,21 @@
   Ethernet aperture. RustOS may map only the validated header and fixed slots;
   it never follows DVM descriptors or allocations. Linux's `rustos-dvm-net`
   relay owns the DVM virtio-net NIC, while RustOS `netd` keeps socket namespace,
-  TCP, and route policy. `--exercise-network` requires both topology flags,
+  TCP, and route policy. Before publishing readiness, the relay disables and
+  verifies software GRO on the DVM NIC: AF_PACKET otherwise sees merged
+  packets that do not fit the one-wire-frame slot. The default remains
+  `ivshmem-plain`: the MSI-X candidate has not passed the throughput gate.
+  With `KVM_DVM_NETWORK_DOORBELL=1`, a private server assigns RustOS peer 0
+  and Linux peer 1 without changing the frame layout. Each consumer arms and
+  rechecks its ring before waiting; each producer coalesces kicks by consuming
+  that arm after cursor publication. Both peers keep short bounded polls
+  during packet bursts to avoid per-fragment interrupts. Bounded watchdogs
+  recover lost hints; Linux retries a full RX ring or blocked TX without
+  spinning. The ring is authoritative even if a nudge is lost. See
+  [QEMU ivshmem](https://www.qemu.org/docs/master/specs/ivshmem-spec.html),
+  [Linux ring ordering](https://docs.kernel.org/core-api/circular-buffers.html),
+  and [Linux UIO](https://docs.kernel.org/driver-api/uio-howto.html).
+  `--exercise-network` requires both topology flags,
   uses the private KVM copy of
   `netprobe` against the QEMU gateway and requires both ring directions to
   advance within their 64-slot invariants. This proves the KVM data transport,

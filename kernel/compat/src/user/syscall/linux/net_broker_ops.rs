@@ -3,7 +3,8 @@ use super::*;
 use rustos_user_abi::syscall::{
     NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
-    NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION,
+    NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PACKET_WAIT_RX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION,
+    NET_BROKER_PACKET_WAIT_MAX_MS,
     NetBrokerPrepareSocketPublication, RustosNetBrokerArgs,
     ServiceCapability, net_broker_socket_publication_shape_valid,
 };
@@ -25,6 +26,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
         NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
         NET_BROKER_OP_PACKET_RX => broker_packet_rx(args),
+        NET_BROKER_OP_PACKET_WAIT_RX => broker_packet_wait_rx(args),
         NET_BROKER_OP_PACKET_LEASE_GRANT => broker_packet_lease(args, true),
         NET_BROKER_OP_PACKET_LEASE_REVOKE => broker_packet_lease(args, false),
         NET_BROKER_OP_PACKET_LEASE_RESET => broker_packet_lease_reset(args),
@@ -110,7 +112,7 @@ fn ipc_error_to_linux_errno(error: kernel_ipc_runtime::api::IpcError) -> i64 {
 /// Snapshot authority before waiting for the transport lock, then revalidate
 /// its exact owner/epoch inside that lock. The entry capability check alone
 /// cannot authorize an operation that sleeps across netd replacement.
-fn packet_authority() -> Result<impl FnOnce() -> bool, i64> {
+fn packet_authority() -> Result<impl Fn() -> bool, i64> {
     let pid = multitask::current_user_process_id().ok_or(LINUX_ESRCH)?;
     let expected = ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_NETD)
         .filter(|(owner, _)| *owner == pid)
@@ -172,6 +174,17 @@ fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         .map_err(packet_error_to_linux_errno)
 }
 
+fn broker_packet_wait_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    if !(1..=NET_BROKER_PACKET_WAIT_MAX_MS).contains(&args.arg0)
+        || [args.arg1, args.arg2, args.arg3, args.arg4, args.arg5] != [0; 5]
+    {
+        return Err(LINUX_EINVAL);
+    }
+    kernel_io_manager::api::network::wait_receive(args.arg0, packet_authority()?)
+        .map(|()| 0)
+        .map_err(packet_error_to_linux_errno)
+}
+
 fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     let cap = usize::try_from(args.arg1).map_err(|_| LINUX_EINVAL)?;
     if cap == 0 || cap > kernel_io_manager::api::network::PACKET_MTU {
@@ -189,6 +202,7 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
 
 fn packet_error_to_linux_errno(err: kernel_io_manager::api::network::PacketError) -> i64 {
     match err {
+        kernel_io_manager::api::network::PacketError::Unsupported => LINUX_EOPNOTSUPP,
         kernel_io_manager::api::network::PacketError::NoDevice => LINUX_ENODEV,
         kernel_io_manager::api::network::PacketError::Invalid => LINUX_EINVAL,
         kernel_io_manager::api::network::PacketError::Busy => LINUX_EAGAIN,

@@ -6,6 +6,40 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## RustOS Internet transfer performance (2026-11-27, 1-vCPU KVM)
+
+- Same IPv4 HTTP endpoint, one TCP connection per transfer, 1 KiB x5 and
+  4 MiB x3 each direction; native Linux before/after and a Linux KVM guest
+  on the same QEMU virtio-net/NAT are controls. Results and packet captures:
+  `build/net-speed-bench/`. The private probe image does not ship.
+- Baseline: 1 KiB Internet download median 1.415 s, upload 74.4 ms; 4 MiB
+  0/3 in each direction. Software GRO produced oversized AF_PACKET frames;
+  disabling it removed the ~1.3 s retransmit delay but not the bulk stalls.
+  After TCP drain/fill started dirtying readiness generations, all bulk
+  transfers completed. Short adaptive polling in both guests plus one
+  ring's ingress budget raised idle 1-vCPU Internet bulk to 44.6–69.6 /
+  79.6–93.5 Mbps (download/upload across session medians). Paired native
+  Linux repeat: 183–186 / 99–106 Mbps. At 50% host CPU pressure RustOS
+  delivered 40.0 / 80.6 Mbps. 2 and 4 vCPUs did not close the gap. Both
+  shorter ACK delay and an extra yielded repoll were tried and reverted.
+- `final-repeat/` has the timing profile; `sustained/` has the 16 MiB trial.
+  RustOS completed local 16 MiB both ways at 69.4 / 109.0 Mbps and Internet
+  upload at 99.1 Mbps (native 180.6 Mbps). Both clients received HTTP 403
+  for 16 MiB Internet download; do not treat that as a transport failure.
+- KVM accepted at exit 0. Netd native tests passed (126, 1 ignored), DVM
+  relay selftest and artifact verification passed, and targeted ring TLC
+  passed. The full PR gate and physical NIC line rate were not tested.
+- Added an optional one-vector notification backend (`KVM_DVM_NETWORK_DOORBELL=1`)
+  separate from the unchanged frame layout. Both interrupt directions were
+  independently observed in KVM. The first MSI-X candidates delivered only
+  ~33–38 Mbps WAN bulk. The old RustOS image with the same Linux relay
+  was also slow. After changing the relay's volatile byte copies to aligned
+  32-bit copies plus exact tails, matched runs (`notification-compare/`)
+  delivered 87.7/77.9 Mbps with polling and 86.8/75.9 Mbps with MSI-X;
+  local bulk was 102.8/112.2 and 108.2/101.7 Mbps, respectively. All KVM
+  lanes passed. Keep polling as default: no repeatable Internet win or
+  physical line-rate proof. No commit or push requested.
+
 ## Chrome load and input stalls (2026-11-27, static review only)
 
 - User supplied a live-log analysis for Chrome searching `asdf` with 6 GiB

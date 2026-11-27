@@ -47,6 +47,7 @@ fn spawn_guests(
     host_render_node: Option<&Path>,
     display_doorbell: Option<&IvshmemDoorbellServer>,
     block_doorbell: Option<&IvshmemDoorbellServer>,
+    network_doorbell: Option<&IvshmemDoorbellServer>,
     input_doorbell: &IvshmemDoorbellServer,
     input_relay_gate: Arc<AtomicBool>,
 ) -> Result<(Child, Child)> {
@@ -81,6 +82,12 @@ fn spawn_guests(
         stop_guest(&mut rustos);
         return Err(error)
             .context("RustOS did not claim block ivshmem peer ID 0 before DVM launch");
+    }
+
+    if let Err(error) = wait_for_network_peers(network_doorbell, 1) {
+        let mut rustos = rustos;
+        stop_guest(&mut rustos);
+        return Err(error);
     }
 
     let dvm = match spawn_dvm_guest(
@@ -261,9 +268,7 @@ fn spawn_rustos_guest(
             layout.display_geometry.width, layout.display_geometry.height
         ));
     }
-    if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
-        append_dvm_network_ivshmem(&mut rustos_command, shared_network);
-    }
+    append_dvm_network_ivshmem(&mut rustos_command, layout);
     if let Some(doorbell) = layout.dvm_block_doorbell.as_deref() {
         append_dvm_block_doorbell(&mut rustos_command, doorbell);
     }
@@ -414,9 +419,7 @@ fn spawn_dvm_guest(
             DEFAULT_GUEST_MIB,
         );
     }
-    if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
-        append_dvm_network_ivshmem(&mut dvm_command, shared_network);
-    }
+    append_dvm_network_ivshmem(&mut dvm_command, layout);
     if let Some(doorbell) = layout.dvm_block_doorbell.as_deref() {
         append_dvm_block_doorbell(&mut dvm_command, doorbell);
         let disk = layout
@@ -586,16 +589,31 @@ fn append_physical_gpu(
         ));
 }
 
-fn append_dvm_network_ivshmem(command: &mut Command, path: &Path) {
-    command
-        .arg("-object")
-        .arg(format!(
-            "memory-backend-file,id=dvm-network-shm,mem-path={},size={},share=on",
-            path.display(),
-            DVM_NET_REGION_BYTES
-        ))
-        .arg("-device")
-        .arg("ivshmem-plain,memdev=dvm-network-shm");
+fn append_dvm_network_ivshmem(command: &mut Command, layout: &KvmLayout) {
+    if let Some(path) = layout.dvm_network_doorbell.as_deref() {
+        command
+            .arg("-chardev")
+            .arg(format!("socket,id=dvm-network-doorbell,path={}", path.display()))
+            .arg("-device")
+            .arg("ivshmem-doorbell,vectors=1,chardev=dvm-network-doorbell");
+    } else if let Some(path) = layout.dvm_network_shmem.as_deref() {
+        command
+            .arg("-object")
+            .arg(format!(
+                "memory-backend-file,id=dvm-network-shm,mem-path={},size={},share=on",
+                path.display(), DVM_NET_REGION_BYTES
+            ))
+            .arg("-device")
+            .arg("ivshmem-plain,memdev=dvm-network-shm");
+    }
+}
+
+fn wait_for_network_peers(server: Option<&IvshmemDoorbellServer>, peers: usize) -> Result<()> {
+    if let Some(server) = server {
+        server.wait_for_exact_peer_count(peers, DVM_BLOCK_FIRST_PEER_TIMEOUT)
+            .with_context(|| format!("network doorbell did not reach {peers} fixed peers"))?;
+    }
+    Ok(())
 }
 
 fn append_fault_injection(config: &Config, command: &mut Command) {
@@ -1076,6 +1094,7 @@ struct RecoveryHarness<'a> {
     input_doorbell: &'a IvshmemDoorbellServer,
     display_doorbell: Option<&'a IvshmemDoorbellServer>,
     block_doorbell: Option<&'a IvshmemDoorbellServer>,
+    network_doorbell: Option<&'a IvshmemDoorbellServer>,
     input_relay_gate: Arc<AtomicBool>,
 }
 
@@ -1104,6 +1123,7 @@ impl RecoveryHarness<'_> {
                     .wait_for_exact_peer_count(0, DVM_BLOCK_FIRST_PEER_TIMEOUT)
                     .context("block peers did not retire before RustOS reboot")?;
             }
+            wait_for_network_peers(self.network_doorbell, 0)?;
             // LIFECYCLE: only the L0 owner may reinitialize a cross-domain
             // region, and only after every mapped guest in the restart cohort
             // has exited. Recreate the signed/headered initial state instead
@@ -1157,6 +1177,7 @@ impl RecoveryHarness<'_> {
                     .wait_for_exact_peer_count(1, DVM_BLOCK_FIRST_PEER_TIMEOUT)
                     .context("fresh RustOS guest did not reclaim the block peer")?;
             }
+            wait_for_network_peers(self.network_doorbell, 1)?;
             let recovery_relay = start_dvm_input_relay(
                 self.config,
                 self.options.timeout,
@@ -1189,6 +1210,7 @@ impl RecoveryHarness<'_> {
                     .wait_for_exact_peer_count(2, DVM_BLOCK_FIRST_PEER_TIMEOUT)
                     .context("restarted DVM did not reclaim the block peer")?;
             }
+            wait_for_network_peers(self.network_doorbell, 2)?;
             probe = wait_for_rustos_reboot_recovery(
                 rustos,
                 dvm,
@@ -1213,6 +1235,7 @@ impl RecoveryHarness<'_> {
                     .wait_for_exact_peer_count(1, DVM_BLOCK_FIRST_PEER_TIMEOUT)
                     .context("block DVM peer did not retire before restart")?;
             }
+            wait_for_network_peers(self.network_doorbell, 1)?;
             let successor_block_generation = if self.options.dvm_block_shmem {
                 let aperture = self
                     .layout
@@ -1251,6 +1274,7 @@ impl RecoveryHarness<'_> {
                 self.host_render_node,
                 false,
             )?;
+            wait_for_network_peers(self.network_doorbell, 2)?;
             probe = wait_for_dvm_restart_recovery(
                 rustos,
                 dvm,

@@ -2,10 +2,8 @@
 /*
  * Fixed RustOS network-DVM ivshmem adapter.
  *
- * The data BAR is QEMU shared RAM, not device registers.  The adapter binds
- * only the exact RSDVMNT1 layout and exposes one WB mapping to userspace.  It
- * deliberately has no interrupt or raw-register authority: the network relay
- * polls bounded rings whose control words are C11/Rust atomics.
+ * The adapter admits the fixed RSDVMNT1 WB aperture. In MSI-X mode UIO
+ * exposes interrupt counts and a fixed peer-0/vector-0 kick, not BAR0.
  */
 
 #include <linux/build_bug.h>
@@ -20,6 +18,9 @@
 #define RUSTOS_IVSHMEM_VENDOR_ID 0x1af4
 #define RUSTOS_IVSHMEM_DEVICE_ID 0x1110
 #define RUSTOS_IVSHMEM_SHARED_BAR 2
+#define RUSTOS_IVSHMEM_REGISTERS_BAR 0
+#define RUSTOS_IVSHMEM_POSITION_OFFSET 8U
+#define RUSTOS_IVSHMEM_DOORBELL_OFFSET 12U
 #define RUSTOS_DVM_NET_UIO_NAME "rustos-dvm-net"
 
 #define RUSTOS_DVM_NET_VERSION 1U
@@ -46,6 +47,7 @@ static const u8 rustos_dvm_net_magic[8] = {
 
 struct rustos_dvm_net_uio {
 	struct uio_info uio;
+	void __iomem *doorbell;
 	resource_size_t shared_start;
 	resource_size_t shared_bytes;
 };
@@ -128,11 +130,66 @@ static int rustos_dvm_net_mmap(struct uio_info *info,
 			       vma->vm_page_prot);
 }
 
+static irqreturn_t rustos_dvm_net_irq(int irq, struct uio_info *info)
+{
+	return IRQ_HANDLED;
+}
+
+static int rustos_dvm_net_kick(struct uio_info *info, s32 value)
+{
+	struct rustos_dvm_net_uio *state = info->priv;
+
+	if (!state || value != 1)
+		return -EINVAL;
+	/* Order Release cursor publication before the fixed peer-0 nudge. */
+	wmb();
+	writel(0, state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+	return 0;
+}
+
+static void rustos_dvm_net_free_vectors(void *data)
+{
+	pci_free_irq_vectors(data);
+}
+
+static int rustos_dvm_net_init_notification(struct pci_dev *pdev,
+					    struct rustos_dvm_net_uio *state)
+{
+	struct resource *registers = &pdev->resource[RUSTOS_IVSHMEM_REGISTERS_BAR];
+	int result;
+
+	state->uio.version = "1";
+	state->uio.irq = UIO_IRQ_NONE;
+	if (!pdev->msix_cap)
+		return 0;
+	if (!(registers->flags & IORESOURCE_MEM) ||
+	    resource_size(registers) < RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32) ||
+	    pci_msix_vec_count(pdev) != 1)
+		return -ENODEV;
+	state->doorbell = pcim_iomap(pdev, RUSTOS_IVSHMEM_REGISTERS_BAR,
+				    RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32));
+	if (!state->doorbell)
+		return -ENOMEM;
+	if (readl(state->doorbell + RUSTOS_IVSHMEM_POSITION_OFFSET) != 1)
+		return -ENODEV;
+	result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX);
+	if (result < 0)
+		return result;
+	result = devm_add_action_or_reset(&pdev->dev, rustos_dvm_net_free_vectors, pdev);
+	if (result)
+		return result;
+	state->uio.version = "2";
+	state->uio.irq = pci_irq_vector(pdev, 0);
+	state->uio.handler = rustos_dvm_net_irq;
+	state->uio.irqcontrol = rustos_dvm_net_kick;
+	return 0;
+}
+
 static int rustos_dvm_net_probe(struct pci_dev *pdev,
 				const struct pci_device_id *id)
 {
 	struct rustos_dvm_net_uio *state;
-	struct resource *shared;
+	struct resource *shared = &pdev->resource[RUSTOS_IVSHMEM_SHARED_BAR];
 	int result;
 
 	result = pcim_enable_device(pdev);
@@ -141,16 +198,15 @@ static int rustos_dvm_net_probe(struct pci_dev *pdev,
 	result = rustos_dvm_net_validate_aperture(pdev);
 	if (result)
 		return result;
-
-	shared = &pdev->resource[RUSTOS_IVSHMEM_SHARED_BAR];
 	state = devm_kzalloc(&pdev->dev, sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
+	result = rustos_dvm_net_init_notification(pdev, state);
+	if (result)
+		return result;
 	state->shared_start = shared->start;
 	state->shared_bytes = resource_size(shared);
 	state->uio.name = RUSTOS_DVM_NET_UIO_NAME;
-	state->uio.version = "1";
-	state->uio.irq = UIO_IRQ_NONE;
 	state->uio.mmap = rustos_dvm_net_mmap;
 	state->uio.mem[0].name = "rustos-dvm-net-aperture-wb";
 	state->uio.mem[0].memtype = UIO_MEM_PHYS;
@@ -162,8 +218,8 @@ static int rustos_dvm_net_probe(struct pci_dev *pdev,
 	result = devm_uio_register_device(&pdev->dev, &state->uio);
 	if (!result)
 		dev_info(&pdev->dev,
-			 "RustOS network UIO bound: WB BAR2=%pa+%pa\n",
-			 &shared->start, &state->shared_bytes);
+			 "RustOS network UIO bound: MSI-X=%ld WB BAR2=%pa+%pa\n",
+			 (long)state->uio.irq, &shared->start, &state->shared_bytes);
 	return result;
 }
 

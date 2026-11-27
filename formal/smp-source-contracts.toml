@@ -774,7 +774,7 @@ tokens = [
     "let Some(interrupt_install) = arm_block_ring_interrupt(device)",
     "*guard = Some(state);",
     "INSTALLED.store(true, Ordering::Release);",
-    "interrupt_install.retain_permanent();",
+    "IRQ_VECTOR.store(interrupt_install.retain_permanent(), Ordering::Release);",
 ]
 
 [[required_sequences]]

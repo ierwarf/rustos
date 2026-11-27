@@ -102,6 +102,14 @@ pub(super) fn await_authenticated_packet_provider(request: &NetdIpcRequest) -> R
     )
 }
 
+pub(super) fn packet_wait_rx(duration: Duration) -> Result<(), i32> {
+    call_packet_broker(
+        rustos_user_abi::syscall::NET_BROKER_OP_PACKET_WAIT_RX,
+        duration.as_millis() as u64,
+        0,
+    ).map(|_| ())
+}
+
 pub(super) fn packet_tx(frame: &[u8]) -> Result<usize, i32> {
     call_packet_broker(
         NET_BROKER_OP_PACKET_TX,

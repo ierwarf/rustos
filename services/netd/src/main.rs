@@ -223,7 +223,8 @@ const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// condition that is certain instead, and return to the tight cadence the
 /// moment a socket exists.
 const INET_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INET_READINESS_POLL_BUDGET: usize = 32;
+// Drain up to one 64-slot transport ring per worker turn.
+const INET_READINESS_POLL_BUDGET: usize = 64;
 /// Upper bound on how long a timer-only smoltcp socket transition may go
 /// unobserved by the readiness table. Twice the worker cadence, so a silent
 /// transition is seen by at most the second worker tick after it happens.

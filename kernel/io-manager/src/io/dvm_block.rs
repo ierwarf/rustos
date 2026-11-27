@@ -35,11 +35,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::sync::KernelWaitLock;
 
-#[path = "block_interrupt_install.rs"]
-mod interrupt_install;
 #[path = "dvm_block/revoke.rs"]
 mod revoke;
-use interrupt_install::{BlockInterruptInstall, program_msix_entry};
+use super::ivshmem_interrupt::{SingleVectorInstall, arm_single_ring_interrupt};
 use revoke::DvmBlockRevokeReason;
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
@@ -49,13 +47,6 @@ const IVSHMEM_SHARED_MEMORY_BAR: usize = 2;
 const IVSHMEM_DOORBELL_OFFSET: usize = 12;
 const BLOCK_DVM_PEER_ID: u16 = 1;
 const BLOCK_DVM_REQUEST_VECTOR_INDEX: u16 = 0;
-const BLOCK_RING_MSIX_VECTOR_COUNT: u16 = 1;
-const MSIX_ENTRY_BYTES: usize = 16;
-const MSIX_ENTRY_ADDRESS_LOW_OFFSET: usize = 0;
-const MSIX_ENTRY_ADDRESS_HIGH_OFFSET: usize = 4;
-const MSIX_ENTRY_DATA_OFFSET: usize = 8;
-const MSIX_ENTRY_VECTOR_CONTROL_OFFSET: usize = 12;
-const MSIX_ENTRY_VECTOR_MASKED: u32 = 1;
 const WAITER_CHUNK_LEN: usize = 64;
 const MAX_WAITER_CHUNKS: usize = 4096;
 type WaiterChunk = [AtomicU64; WAITER_CHUNK_LEN];
@@ -1047,7 +1038,7 @@ pub(crate) fn try_install() -> bool {
     *guard = Some(state);
     // ORDERING: Release publishes INSTALLED after STATE was populated (the guard is released after this store).
     INSTALLED.store(true, Ordering::Release);
-    interrupt_install.retain_permanent();
+    IRQ_VECTOR.store(interrupt_install.retain_permanent(), Ordering::Release);
     true
 }
 
@@ -1348,68 +1339,8 @@ fn write_record(base: *mut u8, bytes: &[u8; DVM_BLOCK_RECORD_BYTES]) {
     }
 }
 
-fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<BlockInterruptInstall> {
-    // Claim the function before the first configuration write. An exclusive
-    // claim is the correct strength here: this transport owns its ivshmem
-    // function outright and nothing else may reprogram its MSI-X state.
-    let attach = crate::arch::pci::attach(device, crate::arch::pci::PciAttachMode::Exclusive)?;
-    let Some(capability) = device.msix_capability() else {
-        return None;
-    };
-    if capability.table_entries() != BLOCK_RING_MSIX_VECTOR_COUNT {
-        return None;
-    }
-    let Some(table_resource) = capability.table_resource(device) else {
-        return None;
-    };
-    let Ok(table_len) = usize::try_from(table_resource.size) else {
-        return None;
-    };
-    let Ok(table_offset) = usize::try_from(capability.table_offset()) else {
-        return None;
-    };
-    if table_offset
-        .checked_add(MSIX_ENTRY_BYTES)
-        .is_none_or(|end| end > table_len)
-    {
-        return None;
-    }
-    capability.set_function_masked(&attach, true);
-    capability.set_enabled(&attach, false);
-    let Some(mut vector_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
-        return None;
-    };
-    if !vector_lease.register_handler(block_ring_interrupt) {
-        return None;
-    }
-    let Some(message) = vector_lease.message() else {
-        return None;
-    };
-    let table = crate::driver::mmio::map_uncached(table_resource.start, table_len).cast::<u8>();
-    if table.is_null() {
-        return None;
-    }
-    // SAFETY: `table` maps `table_len` bytes of uncached MSI-X table and table_offset + MSIX_ENTRY_BYTES <= table_len was
-    // checked above; the entry offsets are 4-byte aligned, volatile MMIO, and the mapping outlives the block.
-    unsafe {
-        program_msix_entry(table.add(table_offset), message);
-        // ORDERING: SeqCst fence completes programming the entry before it is unmasked.
-        core::sync::atomic::fence(Ordering::SeqCst);
-        table
-            .add(table_offset + MSIX_ENTRY_VECTOR_CONTROL_OFFSET)
-            .cast::<u32>()
-            .write_volatile(0);
-    }
-    // ORDERING: SeqCst fence completes the unmask before MSI-X is enabled in PCI config space.
-    core::sync::atomic::fence(Ordering::SeqCst);
-    capability.set_enabled(&attach, true);
-    capability.set_function_masked(&attach, false);
-    crate::driver::mmio::unmap(table.cast());
-    Some(BlockInterruptInstall {
-        capability,
-        attach: Some(attach),
-        vector: Some(vector_lease.commit()),
-    })
+fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<SingleVectorInstall> {
+    arm_single_ring_interrupt(device, block_ring_interrupt)
 }
 
 fn load_u32(base: *mut u8, offset: usize, ordering: Ordering) -> u32 {

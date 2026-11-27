@@ -171,12 +171,18 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         options.physical_usb_bdf.is_some(),
         &run_dir,
     );
-    let dvm_network_shmem = if options.dvm_network_shmem {
+    let (dvm_network_shmem, dvm_network_doorbell) = if options.dvm_network_shmem {
         let path = shmem_dir.join("dvm-network.ivshmem");
         create_dvm_network_shmem(&path)?;
-        Some(path)
+        let doorbell = match std::env::var("KVM_DVM_NETWORK_DOORBELL") {
+            Ok(value) if value == "1" => Some(run_dir.join("dvm-network-doorbell.sock")),
+            Ok(value) if value == "0" => None,
+            Err(std::env::VarError::NotPresent) => None,
+            _ => bail!("KVM_DVM_NETWORK_DOORBELL must be 0 or 1"),
+        };
+        (Some(path), doorbell)
     } else {
-        None
+        (None, None)
     };
     let (dvm_block_aperture, dvm_block_doorbell, dvm_block_disk) = if options.dvm_block_shmem {
         let disk = run_dir.join("dvm-block-disk.img");
@@ -295,6 +301,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         display_geometry,
         dvm_display_doorbell,
         dvm_network_shmem,
+        dvm_network_doorbell,
         dvm_block_aperture,
         dvm_block_doorbell,
         dvm_block_disk,
@@ -1551,6 +1558,21 @@ fn start_dvm_display_doorbell(layout: &KvmLayout) -> Result<Option<IvshmemDoorbe
         .open(shared_display)
         .with_context(|| format!("open DVM display backing {}", shared_display.display()))?;
     Ok(Some(IvshmemDoorbellServer::start(doorbell, &backing)?))
+}
+
+fn start_dvm_network_doorbell(layout: &KvmLayout) -> Result<Option<IvshmemDoorbellServer>> {
+    let (Some(aperture), Some(socket)) = (
+        layout.dvm_network_shmem.as_deref(),
+        layout.dvm_network_doorbell.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(aperture)
+        .context("open network doorbell aperture")?;
+    Ok(Some(IvshmemDoorbellServer::start_single_vector(socket, &file)?))
 }
 
 fn start_dvm_block_doorbell(layout: &KvmLayout) -> Result<Option<IvshmemDoorbellServer>> {

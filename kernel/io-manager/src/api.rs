@@ -301,6 +301,10 @@ pub mod network {
         crate::network::receive_frame(out, authorize)
     }
 
+    pub fn wait_receive(timeout_ms: u64, authorize: impl Fn() -> bool) -> Result<(), PacketError> {
+        crate::io::dvm_network::wait_receive(timeout_ms, authorize)
+    }
+
     pub fn grant_dvm_transport_lease(generation: u32, authorize: impl FnOnce() -> bool) -> bool {
         crate::io::dvm_network::grant_transport_lease(generation, authorize)
     }

@@ -78,6 +78,12 @@ impl<T> SocketTable<T> {
         }
     }
 
+    pub(super) fn mark_dirty(&mut self, token: u64) {
+        if !self.all_dirty {
+            self.dirty.insert(token);
+        }
+    }
+
     pub(super) fn mark_all_dirty(&mut self) {
         self.all_dirty = true;
     }

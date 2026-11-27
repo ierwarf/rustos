@@ -166,12 +166,17 @@ timer-only smoltcp transitions, instead of after every poll turn. All socket pol
 query netd readiness generation (one `NETD_IPC_OP_POLL_BATCH` exchange per scan,
 per-socket generations), register the shared bounded wait token, and
 re-query before sleeping and after wake. Because the DVM packet ring currently
-exposes no userspace interrupt edge, netd owns one fixed 10 ms INET ingress
-worker (100 ms while no INET sockets exist). It admits at most 32 ingress
-packets per turn. Every shared-stack poll, including polls inside request
+exposes only a brokered interrupt hint, netd owns one INET ingress worker.
+After a receive batch, it uses a short 1 ms batching cadence for up to eight
+quiet turns. When idle with sockets, it waits for RX through the broker without
+holding the network state lock; the next TCP timer and a 10 ms watchdog bound
+each wait. With no INET sockets it uses its 100 ms condition-variable wait. It admits at most one
+64-slot ring's worth of ingress packets per turn. Every shared-stack poll, including polls inside request
 handlers, and cross-socket datagram/error staging participates in one tracked
-network-state transaction. Socket-table mutations retain dirty identities;
-Unix checks also include their old/current peer, without scanning unrelated
+network-state transaction. Socket-table mutations retain dirty identities.
+Draining a TCP receive queue or filling its send queue also dirties that
+socket, even when no packet was processed, so the next readable or writable
+edge advances the generation. Unix checks also include their old/current peer, without scanning unrelated
 Unix sockets. Shared INET advancement examines the resident INET set, as
 smoltcp itself does; the packet budget is not a socket-count-independent CPU
 bound. Changed readiness and its per-socket generation are recorded under the

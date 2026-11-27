@@ -412,6 +412,18 @@ The capability-gated
 `NET_BROKER_OP_PACKET_STATUS` ABI distinguishes `UNAVAILABLE` (no valid
 aperture), `AWAITING_AUTHENTICATED_CONTROL` (mapped but fail-closed), and
 `ACTIVE`; netd may use only a bounded wait while authentication is pending.
+The optional KVM MSI-X backend uses one vector per peer, with RustOS at
+position 0 and Linux at position 1. A legacy polling attachment never reads
+or writes notification words. Header-page words at offsets 64 (TX) and
+68 (RX) are aligned atomic wake hints, not frame records or authority. The
+consumer arms and rechecks its cursor before parking. The producer publishes
+its cursor before taking the arm and sending a fixed peer/vector nudge. Linux
+can read interrupt counts and send that fixed kick through UIO, not map BAR0.
+`NET_BROKER_OP_PACKET_WAIT_RX` takes a 1–20 ms timeout and zeroes the other
+arguments. Only the current netd owner may wait; the kernel revalidates the
+lease and uses a single bounded waiter. Polling-only attachments return
+`EOPNOTSUPP` once their active transport is identified. An IRQ, timeout, or
+cursor check never consumes a frame, and an IRQ does not grant packet authority.
 `DISPLAY_INFO_FLAG_DVM_SCANOUT` is a one-way provenance bit propagated from
 the DVM framebuffer registration. It can only downgrade trust: it never
 attests the display. `COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS` reports

@@ -83,6 +83,7 @@ struct KvmLayout {
     display_geometry: DisplayGeometry,
     dvm_display_doorbell: Option<PathBuf>,
     dvm_network_shmem: Option<PathBuf>,
+    dvm_network_doorbell: Option<PathBuf>,
     dvm_block_aperture: Option<PathBuf>,
     dvm_block_doorbell: Option<PathBuf>,
     dvm_block_disk: Option<PathBuf>,
@@ -421,6 +422,7 @@ fn run_one_smoke_unarchived(
     let input_relay_gate = Arc::new(AtomicBool::new(false));
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     let block_doorbell = start_dvm_block_doorbell(&layout)?;
+    let network_doorbell = start_dvm_network_doorbell(&layout)?;
     let guest_display = smoke_guest_display(&options)?;
     let host_render_node = if guest_display != GuestDisplay::Physical {
         Some(require_host_render_node()?)
@@ -451,6 +453,7 @@ fn run_one_smoke_unarchived(
         host_render_node.as_deref(),
         display_doorbell.as_ref(),
         block_doorbell.as_ref(),
+        network_doorbell.as_ref(),
         &input_doorbell,
         Arc::clone(&input_relay_gate),
     )?;
@@ -497,6 +500,7 @@ fn run_one_smoke_unarchived(
             input_doorbell: &input_doorbell,
             display_doorbell: display_doorbell.as_ref(),
             block_doorbell: block_doorbell.as_ref(),
+            network_doorbell: network_doorbell.as_ref(),
             input_relay_gate: Arc::clone(&input_relay_gate),
         }
         .run(&mut rustos, &mut dvm, probe)
@@ -928,6 +932,7 @@ pub(crate) fn kvm_run_command(
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     log_kvm_start_phase("started-display-doorbell", started_at);
     let block_doorbell = start_dvm_block_doorbell(&layout)?;
+    let network_doorbell = start_dvm_network_doorbell(&layout)?;
     log_kvm_start_phase("started-block-doorbell", started_at);
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
@@ -939,6 +944,7 @@ pub(crate) fn kvm_run_command(
         Some(&host_render_node),
         display_doorbell.as_ref(),
         block_doorbell.as_ref(),
+        network_doorbell.as_ref(),
         &input_doorbell,
         input_relay_gate,
     )?;

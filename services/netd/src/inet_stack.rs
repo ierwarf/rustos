@@ -183,17 +183,18 @@ impl InetStack {
         )
     }
 
+    /// Returns whether this turn consumed ingress, independently of readiness.
     pub(super) fn poll_budget(&mut self, budget: usize) -> bool {
-        let mut readiness_changed = false;
+        let mut made_ingress_progress = false;
         for _ in 0..budget {
-            let (processed_ingress, changed) = self.poll_one();
-            readiness_changed |= changed;
+            let (processed_ingress, _) = self.poll_one();
+            made_ingress_progress |= processed_ingress;
             if !processed_ingress && self.device.loopback_rx.is_empty() {
                 break;
             }
         }
         self.reap_closing();
-        readiness_changed
+        made_ingress_progress
     }
 
     pub(super) fn next_ephemeral_port(&mut self) -> Option<u16> {

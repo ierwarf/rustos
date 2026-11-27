@@ -14,6 +14,28 @@ int main(void) {
     struct raw_endpoint raw = {0};
 
     assert(memory);
+    const uint8_t sample[] = {1, 3, 5, 7, 9, 11, 13, 15};
+    uint8_t copy[sizeof(sample) + 2];
+    for (size_t len = 0; len <= sizeof(sample); ++len) {
+        memset(memory + TX_RING, 0xa5, 16);
+        memset(copy, 0xa5, sizeof(copy));
+        frame_to_shared(memory + TX_RING + 4, sample, len);
+        frame_from_shared(copy + 1, memory + TX_RING + 4, len);
+        assert(memcmp(copy + 1, sample, len) == 0);
+        assert(copy[0] == 0xa5 && copy[len + 1] == 0xa5);
+        assert(memory[TX_RING + 3] == 0xa5 && memory[TX_RING + 4 + len] == 0xa5);
+    }
+    assert(arm_tx_wait(&net) == 0);
+    assert(le32(memory + TX_WAIT_ARMED) == 1);
+    put32(memory + TX_HEAD, 1);
+    assert(arm_tx_wait(&net) == 1);
+    put32(memory + TX_HEAD, SLOT_COUNT + 1);
+    assert(arm_tx_wait(&net) == 0);
+    put32(memory + TX_HEAD, 0);
+    assert(!take_rx_wait_arm(memory));
+    put32(memory + RX_WAIT_ARMED, 1);
+    assert(take_rx_wait_arm(memory));
+    assert(!take_rx_wait_arm(memory));
     memcpy(memory, MAGIC, 8);
     put32(memory + 8, 1);
     put32(memory + 12, HEADER_BYTES);

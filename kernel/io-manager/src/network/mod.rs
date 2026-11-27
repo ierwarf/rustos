@@ -14,6 +14,7 @@ pub enum PacketTransportStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketError {
+    Unsupported,
     NoDevice,
     Invalid,
     Busy,
