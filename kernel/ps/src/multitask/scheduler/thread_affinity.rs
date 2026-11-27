@@ -108,9 +108,15 @@ impl Grant {
         self.cohort.begin_effects();
         // Ordinary source transfer/dispatch CAS share Identity/cohort admission;
         // none can change this owner to an excluded CPU across the mask store.
-        let migrate = runqueue::owner(self.slot)
+        let owner_snap = runqueue::owner(self.slot);
+        let migrate = owner_snap
             .cpu
             .is_some_and(|cpu| requested & (1u64 << cpu) == 0);
+        if migrate && owner_snap.state == runqueue::RunOwnerState::Paired {
+            if let Some(pair_cpu) = owner_snap.cpu {
+                super::pair::request_break_for_affinity(pair_cpu, self.slot, owner_snap.generation);
+            }
+        }
         runqueue::affinity_payload::set_affinity_owned(
             self.slot, self.id, requested, process_mask, migrate, &self.cohort
         );

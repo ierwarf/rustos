@@ -73,6 +73,8 @@ pub use crate::multitask::{
     with_process_state_by_generation_mut,
     with_validated_fault_address_space, ExecRefusal,
 };
+#[cfg(rustos_ipc_phase_profile)]
+pub use crate::multitask::{diag_switch_call_once, diag_switch_server_loop, diag_switch_stop};
 pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentUserSnapshot, FastIpcCallHandoffOutcome,
     PagerChargeSnapshot, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,

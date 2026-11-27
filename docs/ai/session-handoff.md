@@ -6,6 +6,28 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## IPC optimization planning (2026-11-27, linked-image audit)
+
+- [Queued slowpath and tail plan](performance/ipc-queued-tail-plan.md) audits
+  the accepted forced-queue archive and linked CALL/wake/wait/REPLY_RECV.
+  Idle p50/p99 are 23,680/48,080 ticks; all eight longest rounds are dominated
+  by CALL-to-RECV, but host vs guest cause remains unresolved. First steps:
+  eliminate the second kernel-owned payload copy and add diagnostic-only
+  tail attribution. No fixed tick or per-stage saving gate remains.
+- [L1–L3 implementation and acceptance plan](performance/ipc-l1-l3-plan.md) binds
+  the existing 5,600/8,640-tick register IPC result to the `f9a70967` linked
+  and staged images and records source boundaries, phase gates and the
+  audit census. No kernel/ABI implementation or new timing was performed.
+- Linked direct stubs create and zero a 432-byte scheduler context in each
+  direction, but their successful parked-register tail already skips IRET.
+  L1 removes the reply-slot transaction, L2 keeps one owner across both
+  switches, and L3 removes the synthetic context and then the redundant
+  parked take. Start with B0 boundary/switch diagnostics; do not bypass
+  physical stack ACK, authority, or SIMD/SYSRET checks.
+- Draft, ELF dumps, and owner-observer census: `docs/ai/performance/` and
+  `build/ipc-l1-l3-plan/` (queued dumps under `queued-tail/`). No new build,
+  tests, measurements or formal run; no commit or push.
+
 ## RustOS Internet transfer performance (2026-11-27, 1-vCPU KVM)
 
 - Same IPv4 HTTP endpoint, one TCP connection per transfer, 1 KiB x5 and

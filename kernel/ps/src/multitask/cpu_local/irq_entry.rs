@@ -25,6 +25,7 @@ impl DispatchEntry {
         let cpu = scope.cpu();
         assert!(scheduler_initialized(), "IRQ entry before bootstrap publication");
         assert!(cpu_task_slot_admitted(cpu), "IRQ entry lacks admitted Current");
+        scheduler::pair::dissolve_if_live(&scope);
         // ORDERING: bootstrap/current publication precedes this same-CPU capture.
         let from = CURRENT_TASK_SLOTS[cpu].load(Ordering::Acquire);
         let turn = dispatch_turn::begin(scope, from);

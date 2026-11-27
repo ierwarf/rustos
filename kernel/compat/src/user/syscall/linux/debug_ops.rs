@@ -175,11 +175,14 @@ pub(super) fn syscall_linux_rustos_product_executable_snapshot_evidence(args_ptr
 /// probe's own measurement window so a probe that finishes inside one window
 /// cannot leave its tail-end charges stranded, undrained, and invisible to a
 /// log capture that stops as soon as the probe's own end marker appears.
-pub(super) fn syscall_linux_rustos_phase_profile_drain() -> u64 {
+pub(super) fn syscall_linux_rustos_phase_profile_drain(mode: u64, min_gap_tsc: u64) -> u64 {
+    let emit_tail_events = mode == nucleus_core::debug::ipc_tail::TAIL_DRAIN_MAGIC;
     (super::ipc_profile::force_drain_ipc_call_profile()
         + super::ipc_server_profile::force_drain_ipc_server_profile()
         + kernel_ps::api::force_drain_user_copy_profile()
-        + crate::memory::phys::drain_frame_batch_profile(crate::arch::rtc::ticks(), 0)) as u64
+        + crate::memory::phys::drain_frame_batch_profile(crate::arch::rtc::ticks(), 0)
+        + nucleus_core::debug::ipc_tail::drain_ipc_tail_rings(emit_tail_events, min_gap_tsc))
+        as u64
 }
 
 pub(super) fn linux_errno(errno: i64) -> u64 {

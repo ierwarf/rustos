@@ -179,6 +179,31 @@ pub(in crate::multitask) fn set_reason(slot: usize, kind: u8, id: u64) {
     });
 }
 
+/// Atomically dissolves a `Paired` partner back into `Blocked` with its exact
+/// wait identity while holding `WaitEpochLeaf`, preventing any racing
+/// `TypedWake` from observing a `Blocked` word before `(kind, id)` is written.
+pub(in crate::multitask::scheduler) fn dissolve_paired_to_blocked(
+    slot: usize,
+    kind: u8,
+    id: u64,
+    break_to_blocked: impl FnOnce() -> super::RunOwnerSnapshot,
+) -> super::RunOwnerSnapshot {
+    validate_reason(kind, id);
+    epoch::with(slot, |state| {
+        assert!(state.advance(), "paired break wait epoch exhausted");
+        let blocked = break_to_blocked();
+        if kind != REASON_NONE {
+            // ORDERING: publish wait reason ID before packed kind under the epoch leaf.
+            task_table::get(slot).wait_reason_id.store(id, Ordering::Release);
+            super::set_wait_reason(slot, kind);
+        } else {
+            // ORDERING: clear scalar wait reason ID under the epoch leaf after park break.
+            task_table::get(slot).wait_reason_id.store(0, Ordering::Release);
+        }
+        blocked
+    })
+}
+
 /// Publishes an arm and its exact reason in one store.
 ///
 /// The identity is stored first, so any reader that observes the published

@@ -242,7 +242,7 @@ pub(in crate::multitask) fn take_sync_handoff_reply_custody_fail_window()
 /// ever reached. Indices mirror `runqueue::RunOwnerState`'s discriminants
 /// (0=Dormant, 1=Local, 2=RemoteQueued, 3=Running, 4=Migrating, 5=Blocked,
 /// 6=Retiring, 7=Retired).
-pub(in crate::multitask) const SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT: usize = 8;
+pub(in crate::multitask) const SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT: usize = 10;
 
 static SYNC_HANDOFF_GENERATION_FAIL_STATE: [core::sync::atomic::AtomicU64;
     SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT] =

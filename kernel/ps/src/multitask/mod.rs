@@ -166,6 +166,8 @@ pub use self::irq::{
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
     timer_interrupt_handler_addr, yield_now,
 };
+#[cfg(rustos_ipc_phase_profile)]
+pub use self::irq::{diag_switch_call_once, diag_switch_server_loop, diag_switch_stop};
 pub use self::spawn::{
     spawn_user_process_state_suspended_with_parent_reservation,
     spawn_user_process_vfork_suspended_with_parent_reservation,

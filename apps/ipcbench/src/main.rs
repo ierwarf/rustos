@@ -197,9 +197,17 @@ unsafe fn syscall6(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
 /// See `SYS_RUSTOS_PHASE_PROFILE_DRAIN`: flushes the kernel's
 /// `ipc-call-phase-*`/`usermem-phase-*` counters immediately rather than
 /// waiting for their ordinary once-per-second housekeeping drain.
+const TAIL_DRAIN_MAGIC: u64 = 0x5441_494c;
+
 fn force_drain_phase_profiles() {
     unsafe {
-        syscall0(SYS_RUSTOS_PHASE_PROFILE_DRAIN);
+        syscall1(SYS_RUSTOS_PHASE_PROFILE_DRAIN, 0);
+    }
+}
+
+fn force_drain_phase_profiles_with_tails() {
+    unsafe {
+        syscall2(SYS_RUSTOS_PHASE_PROFILE_DRAIN, TAIL_DRAIN_MAGIC, 0);
     }
 }
 
@@ -1242,6 +1250,15 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         "ipc_rt_intra_process_register_reply_recv" => ipc_probes::probe_ipc_register_reply_recv(tsc_khz),
         "ipc_rt_intra_process_large_reply_recv" => ipc_probes::probe_ipc_large_reply_recv(tsc_khz),
         "ipc_rt_intra_process_queued_reply_recv" => ipc_probes::probe_ipc_queued_reply_recv(tsc_khz),
+        "ipc_rt_diag_register_echo" => ipc_probes::probe_ipc_diag_register_echo(tsc_khz),
+        "ipc_rt_diag_switch_floor" => ipc_probes::probe_ipc_diag_switch_floor(tsc_khz),
+        "ipc_rt_queued_0fd_16b" => ipc_probes::probe_ipc_queued_0fd_16b(tsc_khz),
+        "ipc_rt_queued_fd_16b" => ipc_probes::probe_ipc_queued_fd_16b(tsc_khz),
+        "ipc_rt_queued_reg_16b" => ipc_probes::probe_ipc_queued_reg_16b(tsc_khz),
+        "ipc_rt_queued_256b" => ipc_probes::probe_ipc_queued_256b(tsc_khz),
+        "ipc_rt_queued_32k" => ipc_probes::probe_ipc_queued_32k(tsc_khz),
+        "ipc_rt_queued_backlog" => ipc_probes::probe_ipc_queued_backlog(tsc_khz),
+        "ipc_rt_queued_cross_proc" => ipc_probes::probe_ipc_queued_cross_proc(tsc_khz),
         "ipc_rt_cross_process_syscalld_getuid" => ipc_probes::probe_syscall_offload(tsc_khz),
         "fork_exit_wait" => probe_fork_exit_wait(tsc_khz),
         "fork_cow_private_write" => probe_fork_cow_private_write(tsc_khz, 64, 4),
@@ -1452,7 +1469,7 @@ fn main() {
             // synchronized to a probe's own finish time, so whatever
             // accumulated since its last window closed would otherwise sit in
             // the live counters, undrained and invisible to the log.
-            force_drain_phase_profiles();
+            force_drain_phase_profiles_with_tails();
         }
         None => run_all_probes(tsc_khz),
     }

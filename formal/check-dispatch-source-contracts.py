@@ -684,14 +684,21 @@ ordered(body(wake, 'retained_wake_admitted'), ['TypedWake::capture(&binding, kin
     'clear_wait(slot, typed.as_ref())', 'let outcome = publish(slot, target, cpu)',
     'on_wake(&binding)', 'drop(reader)', 'drop(pin)', 'drop(typed)', 'Ok(binding)'],
     'original receive pending phase encloses billing before wake and original reader through FIFO')
-enqueue = body(Path('kernel/compat/src/user/syscall/linux/ipc_ops.rs').read_text(),
-    'enqueue_call_and_wake_with_handles_for_task')
+ipc_ops_text = Path('kernel/compat/src/user/syscall/linux/ipc_ops.rs').read_text()
+enqueue_wake = body(ipc_ops_text, 'enqueue_wake_after_published')
+enqueue = body(ipc_ops_text, 'enqueue_call_and_wake_with_handles_for_task')
 ordered(enqueue, ['preemption_disabled()', 'held_spin_lock_depth()',
     'ipc_call_admission::reserve(task_id)?', 'enqueue_endpoint_call_with_handles_priority_custody_in_group(',
-    'multitask::commit_ipc_call_handoff(', 'endpoint.raw(), reply.raw(), task_id, receiver_task_id',
+    'enqueue_wake_after_published('],
+    'actual IPC caller prepublication raw refusal and enqueue-before-wake order')
+ordered(enqueue_wake, ['multitask::commit_ipc_call_handoff(', 'endpoint.raw(), reply.raw(), task_id, receiver_task_id',
     'ipc_call_admission::refused_wake_can_keep_delivered_reply(', 'reply, task_id, donation_admitted',
     'cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody)'],
     'actual IPC caller prepublication raw refusal, independent receipt proof or exact bounded cancellation')
+ordered(body(ipc_ops_text, 'call_queued_and_wait_payload'), ['preemption_disabled()', 'held_spin_lock_depth()',
+    'ipc_call_admission::reserve(task_id)?', 'enqueue_endpoint_call_with_handles_priority_custody_owned(',
+    'enqueue_wake_after_published('],
+    'actual queued direct-switch IPC caller prepublication raw refusal and enqueue-before-wake/handoff')
 ordered(body(Path('kernel/compat/src/user/syscall/linux/ipc_call_admission.rs').read_text(),
     'refused_wake_can_keep_delivered_reply'), [
     'endpoint_reply_custody_returned(reply, caller)', '|| (donation_admitted',
@@ -1348,14 +1355,22 @@ ordered(body(ipcbench, 'validated_round_trip_sample'), ['let start = stamp();',
     'let status = call(request, response);', 'let end = stamp();',
     'valid_round_trip_reply(status, request, response).then_some((start, end))'],
     'actual sample verifies the exact reply outside the measured interval')
-ordered(body(ipcbench, 'measure_intra_process_round_trip'), ['for _ in 0..WARMUP',
+ordered(body(ipcbench, 'run_intra_loop'), ['for _ in 0..IPC_ITERS',
+    'validated_round_trip_sample(request, response, call, tsc)',
+    'record_round_trip_sample::<SEQ>('],
+    'every production sample is validated inside the intra-process loop')
+ordered(body(ipcbench, 'record_round_trip_sample'), ['total.push(end.wrapping_sub(start))'],
+    'recorded round trip sample pushes wrapped elapsed ticks')
+ordered(body(ipcbench, 'finish_round_trip_report'), ['report(name, &summarize(total), tsc_khz)'],
+    'round trip report finishes through summary helper')
+ordered(body(ipcbench, 'measure_intra_process_round_trip_with_seq'), ['for _ in 0..WARMUP',
     'valid_round_trip_reply(call(&request, &mut response), &request, &response)',
-    'for _ in 0..IPC_ITERS', 'validated_round_trip_sample(&request, &mut response, &mut call, tsc)',
-    'total.push(end.wrapping_sub(start))', 'request.op = BENCH_OP_STOP;',
+    'run_intra_loop::<',
+    'request.op = BENCH_OP_STOP;',
     'let stopped = valid_round_trip_reply(', 'let joined = server.join().is_ok();',
     'if !round_trip_transcript_complete(ok, stopped, joined, total.len())',
     'skip(name, "ipc-transcript-invalid")', 'return;',
-    'report(name, &summarize(&mut total), tsc_khz)'],
+    'finish_round_trip_report('],
     'warmup, every sample, stop and join form one complete production transcript')
 lane = (base / 'ipc_lane.rs').read_text()
 ordered(body(irq, 'software_schedule_interrupt_dispatch'), ['let mut lane_generic = false',

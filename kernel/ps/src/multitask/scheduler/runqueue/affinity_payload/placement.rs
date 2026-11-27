@@ -41,6 +41,13 @@ impl PlacementGrant {
         );
         self.owner = Some(owner);
     }
+    pub(in crate::multitask::scheduler) fn rebind_paired(&mut self, owner: runqueue::RunOwnerSnapshot) {
+        assert!(
+            owner.state == RunOwnerState::Running && owner.cpu == Some(self.cpu),
+            "paired placement rebind lacks exact Running claim"
+        );
+        self.owner = Some(owner);
+    }
     pub(in crate::multitask) fn same(&self, other: &Self) -> bool {
         self.slot == other.slot
             && self.task_id == other.task_id
@@ -54,6 +61,20 @@ impl PlacementGrant {
                 stack_resources::task_start::read(self.slot).is_some_and(|start| start.id == id)
             })
             && current_identity::execution::banks::owns_execution(self.cpu, self.slot)
+    }
+
+    /// Like [`Self::is_current`], allowing in-place wait-arm/reason edits
+    /// on the same exact `Running` generation custody.
+    pub(in crate::multitask) fn is_current_generation(&self, id: u64, generation: u64) -> bool {
+        let cur = runqueue::owner(self.slot);
+        self.owner.is_some_and(|owner| {
+            owner.generation == generation
+                && cur.state == RunOwnerState::Running
+                && cur.cpu == Some(self.cpu)
+                && cur.generation == generation
+        }) && self.task_id == Some(id)
+            && stack_resources::task_start::read(self.slot).is_some_and(|start| start.id == id)
+            && current_identity::execution::banks::owns_current(self.cpu, self.slot)
     }
 
     /// Borrowed installed permission may authorize a same-Current architecture

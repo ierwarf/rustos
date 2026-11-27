@@ -141,6 +141,15 @@ fn publish_blocked_wake_inner(
         if super::ipc_handoff::local_wake_owner_is_already_owned(observed.state) {
             return RemoteWakeOutcome::AlreadyOwned { cpu: observed.cpu };
         }
+        if observed.state == RunOwnerState::Paired {
+            drop(rq);
+            if let Some(pair_cpu) = observed.cpu {
+                super::super::pair::request_break_with_wake(pair_cpu, slot, observed.generation);
+                #[cfg(not(test))]
+                crate::multitask::irq::request_target_reschedule(pair_cpu);
+            }
+            return RemoteWakeOutcome::Rejected;
+        }
         if observed.state != RunOwnerState::Blocked {
             return RemoteWakeOutcome::Rejected;
         }

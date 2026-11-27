@@ -155,7 +155,57 @@ pub(super) fn consumes_deferred_fast_reply(number: u64) -> bool {
 /// the operation is one of the four register operations, and secondary tracing is a
 /// diagnostic-kernel feature, so only the pending-signal delivery of every Linux
 /// syscall remains before the operation.
+#[cfg(rustos_ipc_phase_profile)]
+const DIAG_REGISTER_ECHO_MAGIC: u64 = 0xB0EC_4000_0000_0001;
+#[cfg(rustos_ipc_phase_profile)]
+const DIAG_SWITCH_SERVER_MAGIC: u64 = 0xB0EC_4000_0000_0002;
+#[cfg(rustos_ipc_phase_profile)]
+const DIAG_SWITCH_CALL_MAGIC: u64 = 0xB0EC_4000_0000_0003;
+#[cfg(rustos_ipc_phase_profile)]
+const DIAG_SWITCH_STOP_MAGIC: u64 = 0xB0EC_4000_0000_0004;
+
 pub(super) fn dispatch_register_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
+    #[cfg(rustos_ipc_phase_profile)]
+    if frame.rax == rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_CALL
+        && frame.rdi == 0
+        && frame.rsi == rustos_user_abi::syscall::IPC_REGISTER_BYTES as u64
+        && frame.r8 == 0
+    {
+        match frame.r9 {
+            DIAG_REGISTER_ECHO_MAGIC => {
+                frame.rax = rustos_user_abi::syscall::IPC_REGISTER_BYTES as u64;
+                frame.rsi = 0;
+                frame.r8 = 0;
+                frame.r9 = 0;
+                return frame.rax;
+            }
+            DIAG_SWITCH_SERVER_MAGIC => {
+                frame.rax = multitask::diag_switch_server_loop() as u64;
+                frame.rsi = 0;
+                frame.r8 = 0;
+                frame.r9 = 0;
+                return frame.rax;
+            }
+            DIAG_SWITCH_CALL_MAGIC => {
+                let (status, out0, out1) = multitask::diag_switch_call_once(frame.rdx, frame.r10);
+                frame.rax = status as u64;
+                frame.rdx = out0;
+                frame.r10 = out1;
+                frame.rsi = 0;
+                frame.r8 = 0;
+                frame.r9 = 0;
+                return frame.rax;
+            }
+            DIAG_SWITCH_STOP_MAGIC => {
+                frame.rax = multitask::diag_switch_stop() as u64;
+                frame.rsi = 0;
+                frame.r8 = 0;
+                frame.r9 = 0;
+                return frame.rax;
+            }
+            _ => {}
+        }
+    }
     // The identity and the pending-signal hint come from one masked observation.
     // A clear hint is conclusive and the operation authenticates with that
     // identity; a raised hint (or no identity) takes the full delivery check and
@@ -181,7 +231,6 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;
     }
-    int_args::normalize_linux_int_fd_args(frame);
     debug_log_secondary_linux_syscall(frame);
 
     let syscall_nr = frame.rax;
@@ -192,223 +241,220 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         return frame.rax;
     }
 
+    let args @ [rdi, rsi, rdx, r10, r8, r9] = int_args::canonical_linux_args(frame);
     let result = match syscall_nr {
-        linux_abi::SYS_READ => syscall_linux_vfs_read(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_WRITE => syscall_linux_vfs_write(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_READ => syscall_linux_vfs_read(rdi, rsi, rdx),
+        linux_abi::SYS_WRITE => syscall_linux_vfs_write(rdi, rsi, rdx),
         linux_abi::SYS_UNLINK => {
-            syscall_linux_vfs_unlinkat(linux_abi::AT_FDCWD as u64, frame.rdi, 0)
+            syscall_linux_vfs_unlinkat(linux_abi::AT_FDCWD as u64, rdi, 0)
         }
-        linux_abi::SYS_RUSTOS_DEBUG_PRINT => syscall_linux_rustos_debug_print(frame.rdi, frame.rsi),
+        linux_abi::SYS_RUSTOS_DEBUG_PRINT => syscall_linux_rustos_debug_print(rdi, rsi),
         linux_abi::SYS_RUSTOS_PRODUCT_MILESTONE => {
-            syscall_linux_rustos_product_milestone(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_rustos_product_milestone(rdi, rsi, rdx)
         }
         rustos_user_abi::syscall::SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE => {
-            syscall_linux_rustos_product_executable_snapshot_evidence(frame.rdi)
+            syscall_linux_rustos_product_executable_snapshot_evidence(rdi)
         }
-        linux_abi::SYS_RUSTOS_PHASE_PROFILE_DRAIN => syscall_linux_rustos_phase_profile_drain(),
+        linux_abi::SYS_RUSTOS_PHASE_PROFILE_DRAIN => {
+            syscall_linux_rustos_phase_profile_drain(rdi, rsi)
+        }
         rustos_user_abi::syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_SNAPSHOT => {
-            syscall_sched_context_snapshot(frame.rdi)
+            syscall_sched_context_snapshot(rdi)
         }
         linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {
-            syscall_linux_rustos_smp_qualification_bind(frame.rdi)
+            syscall_linux_rustos_smp_qualification_bind(rdi)
         }
-        linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(frame.rdi),
+        linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(rdi),
         SYS_RUSTOS_SCHED_DEMOTE_SELF => syscall_linux_rustos_sched_demote_self(),
         linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER => {
-            syscall_linux_rustos_proc_prepare_broker(frame.rdi)
+            syscall_linux_rustos_proc_prepare_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BROKER => {
-            syscall_linux_rustos_proc_map_file_broker(frame.rdi)
+            syscall_linux_rustos_proc_map_file_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_MAP_ZEROED_BROKER => {
-            syscall_linux_rustos_proc_map_zeroed_broker(frame.rdi)
+            syscall_linux_rustos_proc_map_zeroed_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_MAP_DATA_BROKER => {
-            syscall_linux_rustos_proc_map_data_broker(frame.rdi)
+            syscall_linux_rustos_proc_map_data_broker(rdi)
         }
         SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER => {
-            syscall_linux_rustos_proc_set_windows_runtime_broker(frame.rdi)
+            syscall_linux_rustos_proc_set_windows_runtime_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_COMMIT_BROKER => {
-            syscall_linux_rustos_proc_commit_broker(frame.rdi)
+            syscall_linux_rustos_proc_commit_broker(rdi)
         }
-        SYS_RUSTOS_PROC_ACTIVATE_BROKER => syscall_linux_rustos_proc_activate_broker(frame.rdi),
-        SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER => proc_activate_batch(frame.rdi),
+        SYS_RUSTOS_PROC_ACTIVATE_BROKER => syscall_linux_rustos_proc_activate_broker(rdi),
+        SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER => proc_activate_batch(rdi),
         linux_abi::SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER => {
-            syscall_linux_rustos_proc_validate_deferred_spawn_broker(frame.rdi)
+            syscall_linux_rustos_proc_validate_deferred_spawn_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_ABORT_BROKER => {
-            syscall_linux_rustos_proc_abort_broker(frame.rdi)
+            syscall_linux_rustos_proc_abort_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER => {
-            syscall_linux_rustos_proc_authorize_exec_broker(frame.rdi)
+            syscall_linux_rustos_proc_authorize_exec_broker(rdi)
         }
         SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER => {
-            syscall_linux_rustos_proc_cancel_exec_broker(frame.rdi)
+            syscall_linux_rustos_proc_cancel_exec_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER => {
-            syscall_linux_rustos_proc_map_file_batch_broker(frame.rdi)
+            syscall_linux_rustos_proc_map_file_batch_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER => {
-            syscall_linux_rustos_proc_set_linux_runtime_broker(frame.rdi)
+            syscall_linux_rustos_proc_set_linux_runtime_broker(rdi)
         }
         linux_abi::SYS_RUSTOS_PROC_EXEC_TARGET_BROKER => {
-            syscall_linux_rustos_proc_exec_target_broker(frame.rdi)
+            syscall_linux_rustos_proc_exec_target_broker(rdi)
         }
-        linux_abi::SYS_RUSTOS_PROC_FORK_BROKER => syscall_linux_rustos_proc_fork_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_PROC_FORK_BROKER => syscall_linux_rustos_proc_fork_broker(rdi),
         linux_abi::SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER => {
-            syscall_linux_rustos_proc_signal_queue_broker(frame.rdi)
+            syscall_linux_rustos_proc_signal_queue_broker(rdi)
         }
-        linux_abi::SYS_RUSTOS_MM_BROKER => syscall_linux_rustos_mm_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_MM_BROKER => syscall_linux_rustos_mm_broker(rdi),
         _ if is_pager_fault_syscall(frame.rax) => {
-            dispatch_pager_fault_syscall(frame.rax, frame.rdi)
+            dispatch_pager_fault_syscall(frame.rax, rdi)
         }
-        linux_abi::SYS_RUSTOS_BLOCK_BROKER => syscall_linux_rustos_block_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_BLOCK_BROKER => syscall_linux_rustos_block_broker(rdi),
         _ if broker_ops::is_linux_rustos_broker_syscall(frame.rax) => {
             broker_ops::dispatch_linux_rustos_broker_syscall(frame)
         }
         _ if ipc_ops::is_linux_rustos_ipc_syscall(frame.rax) => {
             ipc_ops::dispatch_linux_rustos_ipc_syscall(frame)
         }
-        linux_abi::SYS_CLOSE => syscall_linux_vfs_close(frame.rdi),
+        linux_abi::SYS_CLOSE => syscall_linux_vfs_close(rdi),
         linux_abi::SYS_SOCKET => {
-            if frame.rdi == linux_abi::AF_UNIX {
-                service_ops::local_unix::syscall_linux_unix_socket(frame.rsi, frame.rdx)
+            if rdi == linux_abi::AF_UNIX {
+                service_ops::local_unix::syscall_linux_unix_socket(rsi, rdx)
             } else {
                 syscall_linux_net4(
                     SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-                    frame.rdi,
-                    frame.rsi,
-                    frame.rdx,
+                    rdi,
+                    rsi,
+                    rdx,
                     0,
                 )
             }
         }
         linux_abi::SYS_SENDTO => service_ops::local_unix::try_sendto(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            rdi, rsi, rdx, r10, r8, r9,
         )
         .unwrap_or_else(|| {
             syscall_linux_net6(
                 SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-                frame.rdi,
-                frame.rsi,
-                frame.rdx,
-                frame.r10,
-                frame.r8,
-                frame.r9,
+                rdi,
+                rsi,
+                rdx,
+                r10,
+                r8,
+                r9,
             )
         }),
         linux_abi::SYS_ACCEPT => {
-            service_ops::local_unix::try_accept4(frame.rdi, frame.rsi, frame.rdx, 0)
+            service_ops::local_unix::try_accept4(rdi, rsi, rdx, 0)
                 .unwrap_or_else(|| {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
+                        rdi,
+                        rsi,
+                        rdx,
                         0,
                     )
                 })
         }
-        linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
+        linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(rdi, rsi),
         linux_abi::SYS_STAT => syscall_linux_vfs_newfstatat(
             linux_abi::AT_FDCWD as u64,
-            frame.rdi,
-            frame.rsi,
+            rdi,
+            rsi,
             0,
         ),
-        linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
+        linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(rdi, rsi),
         linux_abi::SYS_LSTAT => syscall_linux_vfs_newfstatat(
             linux_abi::AT_FDCWD as u64,
-            frame.rdi,
-            frame.rsi,
+            rdi,
+            rsi,
             linux_abi::AT_SYMLINK_NOFOLLOW,
         ),
-        linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i32 as i64),
+        linux_abi::SYS_POLL => syscall_linux_poll(rdi, rsi, rdx as i32 as i64),
         linux_abi::SYS_PPOLL => {
-            let (fds, nfds, timeout, mask, size) =
-                (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
-            syscall_linux_ppoll(frame, fds, nfds, timeout, mask, size)
+            syscall_linux_ppoll(frame, rdi, rsi, rdx, r10, r8)
         }
         linux_abi::SYS_SELECT => {
-            syscall_linux_select(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            syscall_linux_select(rdi, rsi, rdx, r10, r8)
         }
         linux_abi::SYS_PSELECT6 => {
-            let (nfds, rd, wr, ex, timeout, mask) =
-                (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9);
-            syscall_linux_pselect6(frame, nfds, rd, wr, ex, timeout, mask)
+            syscall_linux_pselect6(frame, rdi, rsi, rdx, r10, r8, r9)
         }
         linux_abi::SYS_EPOLL_WAIT => {
-            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i32 as i64)
+            syscall_linux_epoll_wait(rdi, rsi, rdx, r10 as i32 as i64)
         }
         linux_abi::SYS_EPOLL_PWAIT => {
-            let (epfd, events, max, mask, size) =
-                (frame.rdi, frame.rsi, frame.rdx, frame.r8, frame.r9);
-            let timeout_ms = frame.r10 as i32 as i64;
-            syscall_linux_epoll_pwait(frame, epfd, events, max, timeout_ms, mask, size)
+            let timeout_ms = r10 as i32 as i64;
+            syscall_linux_epoll_pwait(frame, rdi, rsi, rdx, timeout_ms, r8, r9)
         }
         linux_abi::SYS_EPOLL_CTL => {
-            syscall_linux_epoll_ctl(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_epoll_ctl(rdi, rsi, rdx, r10)
         }
-        linux_abi::SYS_DUP => syscall_linux_vfs_dup(frame.rdi, 0, 0, VfsDupMode::Dup),
-        linux_abi::SYS_DUP2 => syscall_linux_vfs_dup(frame.rdi, frame.rsi, 0, VfsDupMode::Dup2),
-        linux_abi::SYS_LSEEK => syscall_linux_vfs_lseek(frame.rdi, frame.rsi as i64, frame.rdx),
-        linux_abi::SYS_WRITEV => syscall_linux_vfs_writev(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_DUP => syscall_linux_vfs_dup(rdi, 0, 0, VfsDupMode::Dup),
+        linux_abi::SYS_DUP2 => syscall_linux_vfs_dup(rdi, rsi, 0, VfsDupMode::Dup2),
+        linux_abi::SYS_LSEEK => syscall_linux_vfs_lseek(rdi, rsi as i64, rdx),
+        linux_abi::SYS_WRITEV => syscall_linux_vfs_writev(rdi, rsi, rdx),
         linux_abi::SYS_ACCESS => {
-            syscall_linux_vfs_access(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi, 0)
+            syscall_linux_vfs_access(linux_abi::AT_FDCWD as u64, rdi, rsi, 0)
         }
         linux_abi::SYS_SCHED_YIELD => syscall_linux_sched_yield(),
-        linux_abi::SYS_MOUNT => syscall_linux_vfs_mount(frame.rdi, frame.rsi, frame.rdx, frame.r10),
-        linux_abi::SYS_GETCWD => syscall_linux_vfs_getcwd(frame.rdi, frame.rsi),
+        linux_abi::SYS_MOUNT => syscall_linux_vfs_mount(rdi, rsi, rdx, r10),
+        linux_abi::SYS_GETCWD => syscall_linux_vfs_getcwd(rdi, rsi),
         linux_abi::SYS_MKDIR => {
-            syscall_linux_vfs_mkdir(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi)
+            syscall_linux_vfs_mkdir(linux_abi::AT_FDCWD as u64, rdi, rsi)
         }
-        linux_abi::SYS_CHDIR => syscall_linux_vfs_chdir(linux_abi::AT_FDCWD as u64, frame.rdi),
+        linux_abi::SYS_CHDIR => syscall_linux_vfs_chdir(linux_abi::AT_FDCWD as u64, rdi),
         linux_abi::SYS_MMAP => syscall_linux_mmap(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            rdi, rsi, rdx, r10, r8, r9,
         ),
-        linux_abi::SYS_MPROTECT => syscall_linux_mprotect(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_MUNMAP => syscall_linux_munmap(frame.rdi, frame.rsi),
-        linux_abi::SYS_MADVISE => syscall_linux_madvise(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_SIGALTSTACK => syscall_linux_sigaltstack(frame.rdi, frame.rsi),
-        linux_abi::SYS_BRK => syscall_linux_brk(frame.rdi),
+        linux_abi::SYS_MPROTECT => syscall_linux_mprotect(rdi, rsi, rdx),
+        linux_abi::SYS_MUNMAP => syscall_linux_munmap(rdi, rsi),
+        linux_abi::SYS_MADVISE => syscall_linux_madvise(rdi, rsi, rdx),
+        linux_abi::SYS_SIGALTSTACK => syscall_linux_sigaltstack(rdi, rsi),
+        linux_abi::SYS_BRK => syscall_linux_brk(rdi),
         linux_abi::SYS_RT_SIGACTION => {
-            syscall_linux_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_rt_sigaction(rdi, rsi, rdx, r10)
         }
         linux_abi::SYS_RT_SIGPROCMASK => {
-            syscall_linux_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_rt_sigprocmask(rdi, rsi, rdx, r10)
         }
         linux_abi::SYS_RT_SIGRETURN => syscall_linux_rt_sigreturn(frame),
-        linux_abi::SYS_IOCTL => syscall_linux_ioctl(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_IOCTL => syscall_linux_ioctl(rdi, rsi, rdx),
         linux_abi::SYS_PREAD64 => {
-            syscall_linux_vfs_pread64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_vfs_pread64(rdi, rsi, rdx, r10)
         }
-        linux_abi::SYS_NANOSLEEP => syscall_linux_nanosleep(frame.rdi, frame.rsi),
+        linux_abi::SYS_NANOSLEEP => syscall_linux_nanosleep(rdi, rsi),
         linux_abi::SYS_GETPID => syscall_linux_getpid(),
         linux_abi::SYS_FORK => syscall_linux_fork(frame),
         linux_abi::SYS_VFORK => syscall_linux_vfork(frame),
         linux_abi::SYS_INOTIFY_INIT => syscall_linux_inotify_init(),
-        linux_abi::SYS_INOTIFY_INIT1 => syscall_linux_inotify_init1(frame.rdi),
+        linux_abi::SYS_INOTIFY_INIT1 => syscall_linux_inotify_init1(rdi),
         linux_abi::SYS_INOTIFY_ADD_WATCH => {
-            syscall_linux_inotify_add_watch(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_inotify_add_watch(rdi, rsi, rdx)
         }
-        linux_abi::SYS_INOTIFY_RM_WATCH => syscall_linux_inotify_rm_watch(frame.rdi, frame.rsi),
+        linux_abi::SYS_INOTIFY_RM_WATCH => syscall_linux_inotify_rm_watch(rdi, rsi),
         linux_abi::SYS_WAIT4 => {
             // `pid` is a C `int`; the register's upper half is not ABI, and a
             // zero-extended -1 would otherwise name a nonexistent child.
-            syscall_linux_wait4(frame.rdi as i32 as i64, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_wait4(rdi as i32 as i64, rsi, rdx, r10)
         }
         linux_abi::SYS_CLONE => syscall_linux_clone(frame),
-        linux_abi::SYS_UNAME => syscall_linux_syscalld_uname(frame.rdi),
+        linux_abi::SYS_UNAME => syscall_linux_syscalld_uname(rdi),
         linux_abi::SYS_GETTID => syscall_linux_gettid(),
         linux_abi::SYS_PRLIMIT64 => {
-            syscall_linux_syscalld_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_syscalld_prlimit64(rdi, rsi, rdx, r10)
         }
         linux_abi::SYS_SCHED_GETAFFINITY => {
-            syscall_linux_syscalld_sched_getaffinity(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_syscalld_sched_getaffinity(rdi, rsi, rdx)
         }
         linux_abi::SYS_SCHED_SETAFFINITY => {
-            syscall_linux_syscalld_sched_setaffinity(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_syscalld_sched_setaffinity(rdi, rsi, rdx)
         }
         linux_abi::SYS_GETUID => syscall_linux_syscalld_id_getter(SYSCALL_OFFLOAD_OP_LINUX_GETUID),
         linux_abi::SYS_GETGID => syscall_linux_syscalld_id_getter(SYSCALL_OFFLOAD_OP_LINUX_GETGID),
@@ -419,222 +465,222 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_syscalld_id_getter(SYSCALL_OFFLOAD_OP_LINUX_GETEGID)
         }
         linux_abi::SYS_SETUID => {
-            syscall_linux_syscalld_setid(SYSCALL_OFFLOAD_OP_LINUX_SETUID, frame.rdi)
+            syscall_linux_syscalld_setid(SYSCALL_OFFLOAD_OP_LINUX_SETUID, rdi)
         }
         linux_abi::SYS_SETGID => {
-            syscall_linux_syscalld_setid(SYSCALL_OFFLOAD_OP_LINUX_SETGID, frame.rdi)
+            syscall_linux_syscalld_setid(SYSCALL_OFFLOAD_OP_LINUX_SETGID, rdi)
         }
-        linux_abi::SYS_FCNTL => syscall_linux_vfs_fcntl(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_FCNTL => syscall_linux_vfs_fcntl(rdi, rsi, rdx),
         linux_abi::SYS_READLINK => syscall_linux_vfs_readlinkat(
             linux_abi::AT_FDCWD as u64,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
+            rdi,
+            rsi,
+            rdx,
         ),
         linux_abi::SYS_FUTEX => syscall_linux_futex(
-            frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            frame, rdi, rsi, rdx, r10, r8, r9,
         ),
-        linux_abi::SYS_ARCH_PRCTL => syscall_linux_arch_prctl(frame.rdi, frame.rsi),
+        linux_abi::SYS_ARCH_PRCTL => syscall_linux_arch_prctl(rdi, rsi),
         linux_abi::SYS_PRCTL => {
-            prctl_ops::syscall_linux_prctl(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            prctl_ops::syscall_linux_prctl(rdi, rsi, rdx, r10, r8)
         }
-        linux_abi::SYS_CAPGET => prctl_ops::syscall_linux_capget(frame.rdi, frame.rsi),
-        linux_abi::SYS_CAPSET => prctl_ops::syscall_linux_capset(frame.rdi, frame.rsi),
-        linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(frame.rdi),
-        linux_abi::SYS_CLOCK_GETTIME => syscall_linux_clock_gettime(frame.rdi, frame.rsi),
-        linux_abi::SYS_TIME => syscall_linux_time(frame.rdi),
+        linux_abi::SYS_CAPGET => prctl_ops::syscall_linux_capget(rdi, rsi),
+        linux_abi::SYS_CAPSET => prctl_ops::syscall_linux_capset(rdi, rsi),
+        linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(rdi),
+        linux_abi::SYS_CLOCK_GETTIME => syscall_linux_clock_gettime(rdi, rsi),
+        linux_abi::SYS_TIME => syscall_linux_time(rdi),
         linux_abi::SYS_CLOCK_NANOSLEEP => {
-            syscall_linux_clock_nanosleep(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_clock_nanosleep(rdi, rsi, rdx, r10)
         }
-        linux_abi::SYS_EXECVE => syscall_linux_execve(frame, frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_KILL => syscall_linux_kill(frame.rdi, frame.rsi),
-        linux_abi::SYS_TKILL => syscall_linux_tkill(frame.rdi, frame.rsi),
-        linux_abi::SYS_TGKILL => syscall_linux_tgkill(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_EXECVE => syscall_linux_execve(frame, rdi, rsi, rdx),
+        linux_abi::SYS_KILL => syscall_linux_kill(rdi, rsi),
+        linux_abi::SYS_TKILL => syscall_linux_tkill(rdi, rsi),
+        linux_abi::SYS_TGKILL => syscall_linux_tgkill(rdi, rsi, rdx),
         linux_abi::SYS_OPEN => {
-            syscall_linux_openat(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_openat(linux_abi::AT_FDCWD as u64, rdi, rsi, rdx)
         }
         linux_abi::SYS_CREAT => syscall_linux_openat(
             linux_abi::AT_FDCWD as u64,
-            frame.rdi,
+            rdi,
             linux_abi::O_CREAT | linux_abi::O_WRONLY | linux_abi::O_TRUNC,
-            frame.rsi,
+            rsi,
         ),
-        linux_abi::SYS_OPENAT => syscall_linux_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10),
-        linux_abi::SYS_UNLINKAT => syscall_linux_vfs_unlinkat(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_OPENAT => syscall_linux_openat(rdi, rsi, rdx, r10),
+        linux_abi::SYS_UNLINKAT => syscall_linux_vfs_unlinkat(rdi, rsi, rdx),
         linux_abi::SYS_SOCKETPAIR => {
-            if frame.rdi == linux_abi::AF_UNIX {
+            if rdi == linux_abi::AF_UNIX {
                 service_ops::local_unix::syscall_linux_unix_socketpair(
-                    frame.rsi, frame.rdx, frame.r10,
+                    rsi, rdx, r10,
                 )
             } else {
                 syscall_linux_net4(
                     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
-                    frame.rdi,
-                    frame.rsi,
-                    frame.rdx,
-                    frame.r10,
+                    rdi,
+                    rsi,
+                    rdx,
+                    r10,
                 )
             }
         }
         linux_abi::SYS_BIND => {
-            service_ops::local_unix::try_bind(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+            service_ops::local_unix::try_bind(rdi, rsi, rdx).unwrap_or_else(
                 || {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_BIND,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
+                        rdi,
+                        rsi,
+                        rdx,
                         0,
                     )
                 },
             )
         }
         linux_abi::SYS_CONNECT => {
-            service_ops::local_unix::try_connect(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+            service_ops::local_unix::try_connect(rdi, rsi, rdx).unwrap_or_else(
                 || {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_CONNECT,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
+                        rdi,
+                        rsi,
+                        rdx,
                         0,
                     )
                 },
             )
         }
-        linux_abi::SYS_LISTEN => service_ops::local_unix::try_listen(frame.rdi, frame.rsi)
+        linux_abi::SYS_LISTEN => service_ops::local_unix::try_listen(rdi, rsi)
             .unwrap_or_else(|| {
-                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_LISTEN, frame.rdi, frame.rsi, 0, 0)
+                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_LISTEN, rdi, rsi, 0, 0)
             }),
         linux_abi::SYS_ACCEPT4 => {
-            service_ops::local_unix::try_accept4(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            service_ops::local_unix::try_accept4(rdi, rsi, rdx, r10)
                 .unwrap_or_else(|| {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
-                        frame.r10,
+                        rdi,
+                        rsi,
+                        rdx,
+                        r10,
                     )
                 })
         }
         linux_abi::SYS_GETSOCKNAME => {
-            service_ops::local_unix::try_getsockname(frame.rdi, frame.rsi, frame.rdx)
+            service_ops::local_unix::try_getsockname(rdi, rsi, rdx)
                 .unwrap_or_else(|| {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
+                        rdi,
+                        rsi,
+                        rdx,
                         0,
                     )
                 })
         }
         linux_abi::SYS_GETPEERNAME => {
-            service_ops::local_unix::try_getpeername(frame.rdi, frame.rsi, frame.rdx)
+            service_ops::local_unix::try_getpeername(rdi, rsi, rdx)
                 .unwrap_or_else(|| {
                     syscall_linux_net4(
                         SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
+                        rdi,
+                        rsi,
+                        rdx,
                         0,
                     )
                 })
         }
         linux_abi::SYS_SETSOCKOPT => service_ops::local_unix::try_setsockopt(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+            rdi, rsi, rdx, r10, r8,
         )
         .unwrap_or_else(|| {
             syscall_linux_net6(
                 SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
-                frame.rdi,
-                frame.rsi,
-                frame.rdx,
-                frame.r10,
-                frame.r8,
+                rdi,
+                rsi,
+                rdx,
+                r10,
+                r8,
                 0,
             )
         }),
         linux_abi::SYS_GETSOCKOPT => service_ops::local_unix::try_getsockopt(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+            rdi, rsi, rdx, r10, r8,
         )
         .unwrap_or_else(|| {
             syscall_linux_net6(
                 SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
-                frame.rdi,
-                frame.rsi,
-                frame.rdx,
-                frame.r10,
-                frame.r8,
+                rdi,
+                rsi,
+                rdx,
+                r10,
+                r8,
                 0,
             )
         }),
-        linux_abi::SYS_SHUTDOWN => service_ops::local_unix::try_shutdown(frame.rdi, frame.rsi)
+        linux_abi::SYS_SHUTDOWN => service_ops::local_unix::try_shutdown(rdi, rsi)
             .unwrap_or_else(|| {
-                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, frame.rdi, frame.rsi, 0, 0)
+                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, rdi, rsi, 0, 0)
             }),
-        linux_abi::SYS_SENDMSG => syscall_linux_sendmsg(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_SENDMSG => syscall_linux_sendmsg(rdi, rsi, rdx),
         linux_abi::SYS_RECVFROM => service_ops::local_unix::try_recvfrom(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            rdi, rsi, rdx, r10, r8, r9,
         )
         .unwrap_or_else(|| {
             syscall_linux_net6(
                 SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
-                frame.rdi,
-                frame.rsi,
-                frame.rdx,
-                frame.r10,
-                frame.r8,
-                frame.r9,
+                rdi,
+                rsi,
+                rdx,
+                r10,
+                r8,
+                r9,
             )
         }),
-        linux_abi::SYS_RECVMSG => syscall_linux_recvmsg(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_GETDENTS64 => syscall_linux_vfs_getdents64(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_RECVMSG => syscall_linux_recvmsg(rdi, rsi, rdx),
+        linux_abi::SYS_GETDENTS64 => syscall_linux_vfs_getdents64(rdi, rsi, rdx),
         linux_abi::SYS_EXECVEAT => {
-            syscall_linux_execveat(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            syscall_linux_execveat(frame, rdi, rsi, rdx, r10, r8)
         }
         linux_abi::SYS_NEWFSTATAT => {
-            syscall_linux_vfs_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_vfs_newfstatat(rdi, rsi, rdx, r10)
         }
-        linux_abi::SYS_UMOUNT2 => syscall_linux_vfs_umount2(frame.rdi, frame.rsi),
+        linux_abi::SYS_UMOUNT2 => syscall_linux_vfs_umount2(rdi, rsi),
         linux_abi::SYS_READLINKAT => {
-            syscall_linux_vfs_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_vfs_readlinkat(rdi, rsi, rdx, r10)
         }
         // `faccessat` takes three arguments; its fourth register is not a flag
         // word (glibc's flag-carrying form is `faccessat2`).
         linux_abi::SYS_FACCESSAT => {
-            syscall_linux_vfs_access(frame.rdi, frame.rsi, frame.rdx, 0)
+            syscall_linux_vfs_access(rdi, rsi, rdx, 0)
         }
-        linux_abi::SYS_SET_ROBUST_LIST => syscall_linux_set_robust_list(frame.rdi, frame.rsi),
+        linux_abi::SYS_SET_ROBUST_LIST => syscall_linux_set_robust_list(rdi, rsi),
         linux_abi::SYS_GET_ROBUST_LIST => {
-            syscall_linux_get_robust_list(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_get_robust_list(rdi, rsi, rdx)
         }
         linux_abi::SYS_DUP3 => {
-            syscall_linux_vfs_dup(frame.rdi, frame.rsi, frame.rdx, VfsDupMode::Dup3)
+            syscall_linux_vfs_dup(rdi, rsi, rdx, VfsDupMode::Dup3)
         }
-        linux_abi::SYS_EPOLL_CREATE1 => syscall_linux_epoll_create1(frame.rdi),
+        linux_abi::SYS_EPOLL_CREATE1 => syscall_linux_epoll_create1(rdi),
         // `size` is only a historical hint, but must be positive.
         linux_abi::SYS_EPOLL_CREATE => {
-            if (frame.rdi as u32 as i32) <= 0 {
+            if (rdi as u32 as i32) <= 0 {
                 linux_errno(LINUX_EINVAL)
             } else {
                 syscall_linux_epoll_create1(0)
             }
         }
-        linux_abi::SYS_UMASK => syscall_linux_syscalld_umask(frame.rdi),
+        linux_abi::SYS_UMASK => syscall_linux_syscalld_umask(rdi),
         linux_abi::SYS_GETRANDOM => {
-            syscall_linux_syscalld_getrandom(frame.rdi, frame.rsi, frame.rdx)
+            syscall_linux_syscalld_getrandom(rdi, rsi, rdx)
         }
         linux_abi::SYS_STATX => {
-            syscall_linux_vfs_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            syscall_linux_vfs_statx(rdi, rsi, rdx, r10, r8)
         }
-        linux_abi::SYS_RSEQ => syscall_linux_rseq(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        linux_abi::SYS_RSEQ => syscall_linux_rseq(rdi, rsi, rdx, r10),
         linux_abi::SYS_CLONE3 => syscall_linux_clone3(frame),
-        linux_abi::SYS_MEMFD_CREATE => syscall_linux_memfd_create(frame.rdi, frame.rsi),
-        linux_abi::SYS_EXIT => syscall_process_exit(frame.rdi, false),
-        linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi, true),
-        _ => dispatch_ext::dispatch(frame)
+        linux_abi::SYS_MEMFD_CREATE => syscall_linux_memfd_create(rdi, rsi),
+        linux_abi::SYS_EXIT => syscall_process_exit(rdi, false),
+        linux_abi::SYS_EXIT_GROUP => syscall_process_exit(rdi, true),
+        _ => dispatch_ext::dispatch(frame, args)
             .unwrap_or_else(|| error_ops::unimplemented_linux_syscall(frame)),
     };
     // A sibling thread whose process entered `exit_group` while this syscall

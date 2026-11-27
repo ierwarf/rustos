@@ -1,6 +1,7 @@
 pub mod boot_trace;
 #[cfg(rustos_debug_print_enabled)]
 mod deferred;
+pub mod ipc_tail;
 mod kdiag_macros;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_class;

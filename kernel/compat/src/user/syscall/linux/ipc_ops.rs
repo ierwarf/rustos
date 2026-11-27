@@ -1336,13 +1336,6 @@ fn validate_call_shape(request_len: u64, reply_capacity: u64) -> LinuxResult<(us
     Ok((request_len, reply_capacity))
 }
 
-fn validate_ipc_call_reply_buffer(reply_ptr: u64, reply_capacity: usize) -> LinuxResult<()> {
-    if reply_capacity != 0 {
-        validate_user_write_as(reply_ptr, reply_capacity)?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn finish_ipc_call_response(
     kind: &str,
@@ -1369,8 +1362,6 @@ fn finish_ipc_call_response(
             drop_transfer_descriptors(reply_handles);
             return Err(LINUX_EOVERFLOW);
         }
-        validate_received_handle_outputs(recv_fds_ptr, recv_fd_count_ptr, reply_handles.len())
-            .inspect_err(|_| drop_transfer_descriptors(reply_handles))?;
         if reply_handles.is_empty() {
             let zero = 0_u16.to_ne_bytes();
             let mut writes = [(recv_fd_count_ptr, zero.as_slice()), (0, &[])];
@@ -1382,26 +1373,30 @@ fn finish_ipc_call_response(
             };
             usermem::write_current_user_bytes_batch(&writes[..count])
                 .map_err(address_space_error_to_linux_errno)?;
-        } else if let Err(errno) =
-            install_received_handles_with_copyout(reply_handles, |fds, count| {
-                let count_bytes = count.to_ne_bytes();
-                let mut writes = [
-                    (recv_fds_ptr, received_fd_bytes(fds)),
-                    (recv_fd_count_ptr, count_bytes.as_slice()),
-                    (0, &[]),
-                ];
-                let write_count = if response.is_empty() {
-                    2
-                } else {
-                    writes[2] = (reply_ptr, response);
-                    3
-                };
-                usermem::write_current_user_bytes_batch(&writes[..write_count])
-                    .map_err(address_space_error_to_linux_errno)
-            })
-        {
-            drop_transfer_descriptors(reply_handles);
-            return Err(errno);
+        } else {
+            validate_received_handle_outputs(recv_fds_ptr, recv_fd_count_ptr, reply_handles.len())
+                .inspect_err(|_| drop_transfer_descriptors(reply_handles))?;
+            if let Err(errno) =
+                install_received_handles_with_copyout(reply_handles, |fds, count| {
+                    let count_bytes = count.to_ne_bytes();
+                    let mut writes = [
+                        (recv_fds_ptr, received_fd_bytes(fds)),
+                        (recv_fd_count_ptr, count_bytes.as_slice()),
+                        (0, &[]),
+                    ];
+                    let write_count = if response.is_empty() {
+                        2
+                    } else {
+                        writes[2] = (reply_ptr, response);
+                        3
+                    };
+                    usermem::write_current_user_bytes_batch(&writes[..write_count])
+                        .map_err(address_space_error_to_linux_errno)
+                })
+            {
+                drop_transfer_descriptors(reply_handles);
+                return Err(errno);
+            }
         }
     } else if !response.is_empty() {
         write_user_bytes_as(reply_ptr, response)?;
@@ -1513,16 +1508,23 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             cycle_mark = phase_mark();
         }
         let start_ticks = crate::arch::rtc::ticks();
-        let request = copy_request_from_user(request_ptr, request_len)?;
+        let request = copy_payload_from_user(request_ptr, request_len)?;
+        let request_len_bytes = request.len();
         cycle_mark = charge_phase(IpcCallPhase::CopyRequest, cycle_mark);
         // The fast path validates the reply range before the request is
         // published; the queued path must too, or the service executes the request
         // and the caller then fails with EFAULT/EINVAL for a bad output buffer.
-        validate_ipc_call_reply_buffer(reply_ptr, declared_reply_capacity)?;
+        if declared_reply_capacity != 0 {
+            usermem::validate_retained_user_write_buffers(
+                &retained_mm,
+                &[(reply_ptr, declared_reply_capacity)],
+            )
+            .map_err(address_space_error_to_linux_errno)?;
+        }
         ipc_trace!(
             "ipc call copied: endpoint={} request_len={}",
             endpoint.raw(),
-            request.len()
+            request_len_bytes
         );
         let copy_ticks = crate::arch::rtc::ticks();
         // Sample the endpoint binding before enqueue. A provider restart after the
@@ -1537,29 +1539,24 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             return Err(LINUX_ETIMEDOUT);
         }
         cycle_mark = charge_phase(IpcCallPhase::EnqueueDeadline, cycle_mark);
-        let reply = enqueue_call_and_wake_or_wait_queue(
-            enqueue_call_and_wake(endpoint, request.as_slice()),
+        let enqueue_mark = phase_mark();
+        let (response, _) = call_queued_and_wait_payload(
             endpoint,
-            request.as_slice(),
+            request,
             &[],
+            0,
             reply_deadline,
+            timeout_ms,
+            enqueue_mark,
         )?;
-        ipc_trace!(
-            "ipc call enqueued: endpoint={} request_len={} reply_cap={}",
-            endpoint.raw(),
-            request.len(),
-            reply.raw()
-        );
-        let send_ticks = crate::arch::rtc::ticks();
-        let _ = charge_phase(IpcCallPhase::Enqueue, cycle_mark);
-        ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
-        let response =
-            wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms)?;
         let wait_ticks = crate::arch::rtc::ticks();
+        let send_ticks = wait_ticks;
+        let _ = charge_phase(IpcCallPhase::Enqueue, cycle_mark);
+        ipc_trace!("ipc call completed: endpoint={}", endpoint.raw());
         finish_ipc_call_response(
             "call",
             endpoint.raw(),
-            request.len(),
+            request_len_bytes,
             response.as_slice(),
             &[],
             reply_ptr,
@@ -1641,7 +1638,7 @@ fn try_fast_ipc_call(
     Ok(Some(response.len))
 }
 
-struct FastCallResponse<const N: usize> {
+pub(super) struct FastCallResponse<const N: usize> {
     len: usize,
     bytes: [u8; N],
     /// The whole response when it is larger than the inline image.
@@ -1805,7 +1802,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
 }
 
 #[derive(Clone, Copy)]
-enum InlineReplyTransport {
+pub(super) enum InlineReplyTransport {
     Rendezvous,
     Queued,
 }
@@ -1813,7 +1810,8 @@ enum InlineReplyTransport {
 /// Representation-specific take only; both transports share the deadline,
 /// arm/recheck, cancellation and direct-park protocol below. Queued descriptor
 /// rejection and ledger settlement stay with the existing owning transaction.
-fn take_inline_reply<const N: usize>(
+#[inline]
+pub(super) fn take_inline_reply<const N: usize>(
     reply: KernelReplyHandle,
     task_id: u64,
     reply_capacity: usize,
@@ -2394,8 +2392,6 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
     mut deferred_fast_reply: Option<fast_reply::DeferredFastReply>,
     mut destination: ReceiveDestination<'_>,
 ) -> Result<(usize, bool), (i64, bool)> {
-    use kernel_ipc_runtime::api::endpoint::EndpointReceive;
-
     // An unfused `REPLY` left its caller wake for this task's next receive: it rides
     // this receive's block exactly as a fused `REPLY_RECV`'s reply does.
     if deferred_fast_reply.is_none()
@@ -2435,18 +2431,18 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
             continue;
         }
         let may_wait = deadline_tick.is_none_or(|deadline| crate::arch::rtc::ticks() < deadline);
-        let received = kernel_ipc_runtime::api::endpoint::receive_or_wait_inline::<N>(
+        let received = kernel_ipc_runtime::api::endpoint::receive_or_wait_inline_payload::<N>(
             endpoint,
             task_id,
             request_capacity,
             destination.handle_capacity(),
             may_wait,
         );
-        if !matches!(&received, Ok(EndpointReceive::Waiting)) {
+        if !matches!(&received, Ok(kernel_ipc_runtime::api::endpoint::EndpointReceivePayload::Waiting)) {
             let _ = multitask::cancel_block_current_task();
         }
         match received {
-            Ok(EndpointReceive::Fast(received)) => {
+            Ok(kernel_ipc_runtime::api::endpoint::EndpointReceivePayload::Fast(received)) => {
                 note_fast_ipc(IpcFastCounter::ReceiverTaken);
                 let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
                 let result = destination
@@ -2455,7 +2451,12 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
                 let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 return result.map(|received| (received, yielded));
             }
-            Ok(EndpointReceive::Queued((reply, request, handles, caller_task_id))) => {
+            Ok(kernel_ipc_runtime::api::endpoint::EndpointReceivePayload::Queued((
+                reply,
+                request,
+                handles,
+                caller_task_id,
+            ))) => {
                 let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
                 if let Err(errno) = destination.write_queued_handles(reply, &request, &handles, caller_task_id) {
                     drop_transfer_descriptors(handles.as_slice());
@@ -2467,8 +2468,10 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
             }
             // Expiry disables waiter publication, not delivery of a request
             // already queued. The non-waiting branch above withdrew the arm.
-            Ok(EndpointReceive::Empty) => return Err((LINUX_EAGAIN, yielded)),
-            Ok(EndpointReceive::Waiting) => {
+            Ok(kernel_ipc_runtime::api::endpoint::EndpointReceivePayload::Empty) => {
+                return Err((LINUX_EAGAIN, yielded));
+            }
+            Ok(kernel_ipc_runtime::api::endpoint::EndpointReceivePayload::Waiting) => {
                 if let Some(deadline) = deadline_tick {
                     if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline) {
                         // Leaving the receiver waiter published while abandoning
@@ -2725,12 +2728,20 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         if response_len != 0 && inline_len.is_none() && large_response.is_none() {
             large_response = Some(copy_request_from_user(response_ptr, response_len)?);
         }
-        let response: &[u8] = if let Some(len) = inline_len {
-            &inline[..len]
+        let response_len_bytes = if let Some(len) = inline_len {
+            len
         } else if let Some(ref bytes) = large_response {
-            bytes.as_slice()
+            bytes.len()
         } else {
-            &[]
+            0
+        };
+        let response_payload = if let Some(len) = inline_len {
+            kernel_ipc_runtime::api::EndpointPayload::try_from_slice(&inline[..len])
+                .map_err(ipc_error_to_linux_errno)?
+        } else if let Some(bytes) = large_response {
+            kernel_ipc_runtime::api::EndpointPayload::from_vec(bytes)
+        } else {
+            kernel_ipc_runtime::api::EndpointPayload::empty()
         };
         let copy_ticks = crate::arch::rtc::ticks();
         let receiver_process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
@@ -2738,15 +2749,15 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
             "reply",
             reply,
             receiver_process_id,
-            response.len(),
+            response_len_bytes,
             start_ticks,
             copy_ticks,
             publish_mark,
             || {
-                kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
+                kernel_ipc_runtime::api::complete_endpoint_reply_payload_for_process_with_custody(
                     KernelReplyHandle::from_raw(reply),
                     receiver_process_id,
-                    response,
+                    response_payload,
                 )
             },
             |completion| multitask::publish_ipc_reply(reply, completion),
@@ -2774,32 +2785,43 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         if args.reserved0 != 0 {
             return Err(LINUX_EINVAL);
         }
-        let (_retained_mm, authorized_service_id) =
+        let (retained_mm, authorized_service_id) =
             authorize_current_process_ipc_call(args.endpoint)?;
         let (_request_len, declared_reply_capacity) =
             validate_call_shape(args.request_len, args.reply_capacity)?;
+        let recv_fd_capacity = usize::from(args.recv_fd_capacity);
+        if recv_fd_capacity > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES
+            || args.recv_fd_count_ptr == 0
+            || (recv_fd_capacity != 0 && args.recv_fds_ptr == 0)
+        {
+            return Err(LINUX_EINVAL);
+        }
         let call_deadline = service_ipc_deadline_tick_after(timeout_ms);
         let start_ticks = crate::arch::rtc::ticks();
-        let request = copy_request_from_user(args.request_ptr, args.request_len)?;
+        let copy_mark = phase_mark();
+        let request = copy_payload_from_user(args.request_ptr, args.request_len)?;
+        let request_len_bytes = request.len();
         let copy_ticks = crate::arch::rtc::ticks();
         // Reject unusable reply outputs before any descriptor is exported or the
         // request is published; a published request cannot be un-executed.
-        validate_ipc_call_reply_buffer(args.reply_ptr, declared_reply_capacity)?;
-        let recv_fd_capacity = usize::from(args.recv_fd_capacity);
-        validate_received_handle_outputs(
-            args.recv_fds_ptr,
-            args.recv_fd_count_ptr,
-            recv_fd_capacity,
-        )?;
+        let val_mark = charge_phase(IpcCallPhase::CallHandlesCopyRequest, copy_mark);
+        let output_buffers = [
+            (args.reply_ptr, declared_reply_capacity),
+            (args.recv_fd_count_ptr, size_of::<u16>()),
+            (args.recv_fds_ptr, recv_fd_capacity * size_of::<i32>()),
+        ];
+        usermem::validate_retained_user_write_buffers(&retained_mm, &output_buffers)
+            .map_err(address_space_error_to_linux_errno)?;
         // Reject incompatible attachments before exporting descriptors. The
         // runtime enqueue enforces the same immutable bound for kernel producers.
         let endpoint = KernelEndpointHandle::from_raw(args.endpoint);
         kernel_ipc_runtime::api::endpoint::validate_request_shape(
             endpoint,
-            request.len(),
+            request_len_bytes,
             usize::from(args.send_fd_count),
         )
         .map_err(ipc_error_to_linux_errno)?;
+        let export_mark = charge_phase(IpcCallPhase::CallValidateOutputs, val_mark);
         let reply_deadline = service_reply_deadline_tick_for_authorized_service(
             authorized_service_id,
             request.as_slice(),
@@ -2809,34 +2831,36 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         if reply_deadline_expired(reply_deadline) {
             return Err(LINUX_ETIMEDOUT);
         }
-        let send_handles = export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count)?;
+        let send_handles = if args.send_fd_count == 0 {
+            Vec::new()
+        } else {
+            export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count)?
+        };
         let export_ticks = crate::arch::rtc::ticks();
-        let reply = match enqueue_call_and_wake_or_wait_queue(
-            enqueue_call_and_wake_with_handles(endpoint, request.as_slice(), send_handles.as_slice()),
+        let enqueue_mark = charge_phase(IpcCallPhase::CallExportHandles, export_mark);
+        let (response, reply_handles) = match call_queued_and_wait_payload(
             endpoint,
-            request.as_slice(),
+            request,
             send_handles.as_slice(),
+            recv_fd_capacity,
             reply_deadline,
+            timeout_ms,
+            enqueue_mark,
         ) {
-            Ok(reply) => reply,
+            Ok(done) => done,
             Err(errno) => {
                 drop_transfer_descriptors(send_handles.as_slice());
                 return Err(errno);
             }
         };
         let send_ticks = crate::arch::rtc::ticks();
-
-        let (response, reply_handles) = wait_for_service_reply_with_handles_and_deadline_tick(
-            reply,
-            recv_fd_capacity,
-            reply_deadline,
-            timeout_ms,
-        )?;
-        let wait_ticks = crate::arch::rtc::ticks();
-        finish_ipc_call_response(
+        let wait_ticks = send_ticks;
+        let _ = charge_phase(IpcCallPhase::CallHandlesEnqueue, enqueue_mark);
+        let install_mark = phase_mark();
+        let finished = finish_ipc_call_response(
             "call-with-handles",
             args.endpoint,
-            request.len(),
+            request_len_bytes,
             response.as_slice(),
             reply_handles.as_slice(),
             args.reply_ptr,
@@ -2847,7 +2871,9 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
             export_ticks,
             send_ticks,
             wait_ticks,
-        )
+        );
+        let _ = charge_phase(IpcCallPhase::CallInstallHandles, install_mark);
+        finished
     })())
 }
 
@@ -2911,32 +2937,38 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         {
             return Err(LINUX_EINVAL);
         }
-        let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
-        let large: Vec<u8>;
-        let response: &[u8] = if response_len == 0 {
-            &[]
-        } else if response_len <= inline.len() {
+        let response_payload = if response_len == 0 {
+            kernel_ipc_runtime::api::EndpointPayload::empty()
+        } else if response_len <= kernel_ipc_runtime::api::IPC_QUEUED_INLINE_BYTES {
+            let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_QUEUED_INLINE_BYTES];
             read_user_bytes_as(args.response_ptr, &mut inline[..response_len])?;
-            &inline[..response_len]
+            kernel_ipc_runtime::api::EndpointPayload::from_inline(&inline[..response_len])
+                .expect("checked length fits queued inline buffer")
         } else {
-            large = copy_request_from_user(args.response_ptr, args.response_len)?;
-            large.as_slice()
+            kernel_ipc_runtime::api::EndpointPayload::from_vec(
+                copy_request_from_user(args.response_ptr, args.response_len)?,
+            )
         };
-        let send_handles = export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count)?;
+        let response_len_bytes = response_payload.len();
+        let send_handles = if args.send_fd_count == 0 {
+            Vec::new()
+        } else {
+            export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count)?
+        };
         let copy_ticks = crate::arch::rtc::ticks();
         if let Err(errno) = complete_and_publish_queued_reply(
             "reply-with-handles",
             args.reply_cap,
             receiver_process_id,
-            response.len(),
+            response_len_bytes,
             start_ticks,
             copy_ticks,
             publish_mark,
             || {
-                kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_process_with_custody(
+                kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_payload_for_process_with_custody(
                     KernelReplyHandle::from_raw(args.reply_cap),
                     receiver_process_id,
-                    response,
+                    response_payload,
                     send_handles.as_slice(),
                 )
             },
@@ -2987,17 +3019,19 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
     note_syscalld_call_from_vfsd(request);
     let start_ticks = crate::arch::rtc::ticks();
     let reply_deadline = service_ipc_deadline_tick_after(SERVICE_IPC_TIMEOUT_MS);
-    let reply = enqueue_call_and_wake_or_wait_queue(
-        enqueue_call_and_wake(endpoint, request),
+    let payload = kernel_ipc_runtime::api::EndpointPayload::try_from_slice(request)
+        .map_err(ipc_error_to_linux_errno)?;
+    let (response, _) = call_queued_and_wait_payload(
         endpoint,
-        request,
+        payload,
         &[],
+        0,
         reply_deadline,
+        SERVICE_IPC_TIMEOUT_MS,
+        phase_mark(),
     )?;
-    let send_ticks = crate::arch::rtc::ticks();
-    let response =
-        wait_for_service_reply_with_deadline_tick(reply, reply_deadline, SERVICE_IPC_TIMEOUT_MS)?;
     let reply_ticks = crate::arch::rtc::ticks();
+    let send_ticks = reply_ticks;
     log_slow_ipc_call(
         "linux-syscall",
         endpoint.raw(),
@@ -3010,7 +3044,7 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
         request.len(),
         response.len(),
     );
-    Ok(response)
+    Ok(response.into_vec())
 }
 
 pub(super) fn call_linux_syscall_fast_endpoint(
@@ -3400,6 +3434,7 @@ pub(super) fn call_service_endpoint_with_received_entries_until(
     )?;
     let (response, descriptors) =
         wait_for_reply_with_deadline(reply, handle_capacity, reply_deadline)?;
+    let response = response.into_vec();
     let reply_ticks = crate::arch::rtc::ticks();
     let entries = match take_transfer_entries(descriptors.as_slice()) {
         Ok(entries) => entries,
@@ -3461,6 +3496,149 @@ pub(crate) fn enqueue_call_and_wake(
 /// endpoint's pending queue is transiently saturated, sleeping briefly until
 /// either queue space opens or `deadline_tick` expires. Permanent `ENOMEM`
 /// failures (e.g. sender Job quota exhaustion) return `ENOMEM` immediately.
+fn call_queued_and_wait_payload(
+    endpoint: KernelEndpointHandle,
+    request: kernel_ipc_runtime::api::EndpointPayload,
+    attached_handles: &[KernelTransferredHandle],
+    handle_capacity: usize,
+    deadline_tick: u64,
+    timeout_ms: u64,
+    _wake_phase_mark: u64,
+) -> Result<(kernel_ipc_runtime::api::EndpointPayload, Vec<KernelTransferredHandle>), i64> {
+    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    if nucleus_core::util::lockdep::preemption_disabled()
+        || nucleus_core::util::lockdep::held_spin_lock_depth() != 0
+    {
+        return Err(LINUX_ENOSPC);
+    }
+    let mut payload_attempt = Some(request);
+    let mut prior_hits: Option<u64> = None;
+    let mut retries: u64 = 0;
+    let enqueued = loop {
+        let req = payload_attempt.take().unwrap_or_default();
+        let admission = ipc_call_admission::reserve(task_id)?;
+        let enqueue_mark = phase_mark();
+        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_priority_custody_owned(
+            endpoint,
+            task_id,
+            req,
+            attached_handles,
+            admission.priority,
+            admission.scheduling_context,
+            multitask::current_user_job_charge_group(),
+        ) {
+            Ok(enqueued) => {
+                let _ = charge_phase(IpcCallPhase::EnqueueRuntime, enqueue_mark);
+                break enqueued;
+            }
+            Err((error, queue_full, rejected_req)) => {
+                let _ = multitask::cancel_ipc_priority_reservation(task_id);
+                if error != kernel_ipc_runtime::api::IpcError::NoMemory {
+                    return Err(ipc_error_to_linux_errno(error));
+                }
+                let retry_mark = phase_mark();
+                retries = retries.saturating_add(1);
+                nucleus_core::debug::ipc_tail::record_task_tail_event(
+                    nucleus_core::debug::ipc_tail::IpcTailEventKind::QueueFullRetry,
+                    u8::from(queue_full),
+                    0,
+                    endpoint.raw(),
+                    retries,
+                );
+                if (!queue_full && prior_hits.is_none()) || reply_deadline_expired(deadline_tick) {
+                    return Err(if reply_deadline_expired(deadline_tick) {
+                        LINUX_ETIMEDOUT
+                    } else {
+                        LINUX_ENOMEM
+                    });
+                }
+                let Some(current_hits) =
+                    kernel_ipc_runtime::api::endpoint::queue_full_hits(endpoint)
+                else {
+                    return Err(LINUX_EINVAL);
+                };
+                match prior_hits {
+                    None => multitask::yield_now(),
+                    Some(prev) if queue_full || current_hits != prev => {
+                        crate::arch::rtc::sleep_unless(1, || {
+                            reply_deadline_expired(deadline_tick)
+                                || !kernel_ipc_runtime::api::endpoint::pending_queue_full(endpoint)
+                        });
+                    }
+                    Some(_) => return Err(LINUX_ENOMEM),
+                }
+                if reply_deadline_expired(deadline_tick) {
+                    return Err(LINUX_ETIMEDOUT);
+                }
+                prior_hits = kernel_ipc_runtime::api::endpoint::queue_full_hits(endpoint);
+                payload_attempt = Some(rejected_req);
+                let _ = charge_phase(IpcCallPhase::CallQueueFullRetry, retry_mark);
+            }
+        }
+    };
+
+    let wake_mark = phase_mark();
+    let kernel_ipc_runtime::api::EnqueuedCall {
+        reply,
+        receiver_to_wake,
+        receiver_owner_process,
+    } = enqueued;
+
+    // Q3 fast queued handoff: when an idle server task was popped from the endpoint
+    // and we can directly arm + switch to it before any response exists, reuse the
+    // scheduler's direct same-CPU IPC switch (`ipc_lane`) instead of doing a
+    // generic wakeup followed by a separate blocking yield.
+    if let Some(receiver_task_id) = receiver_to_wake
+        && !reply_deadline_expired(deadline_tick)
+        && multitask::arm_block_current_task_on_reply(reply.raw())
+    {
+        if kernel_ipc_runtime::api::endpoint::reply_is_known_pending(reply)
+            && arm_reply_deadline_waiter(task_id, deadline_tick)
+        {
+            let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
+                endpoint.raw(),
+                reply.raw(),
+                receiver_task_id,
+            );
+            disarm_reply_deadline_waiter(task_id);
+            if matches!(
+                handoff,
+                multitask::FastIpcCallHandoffOutcome::CommittedSameCpu
+                    | multitask::FastIpcCallHandoffOutcome::CommittedCrossCpu
+            ) {
+                let _ = charge_phase(IpcCallPhase::EnqueueWake, wake_mark);
+                if let Some(response) =
+                    reply_wait::take_endpoint_response_for_wait(reply, handle_capacity)?
+                {
+                    return Ok(response);
+                }
+                return wait_for_service_reply_with_handles_and_deadline_tick_payload(
+                    reply,
+                    handle_capacity,
+                    deadline_tick,
+                    timeout_ms,
+                );
+            }
+        }
+        let _ = multitask::cancel_block_current_task();
+    }
+
+    let reply = enqueue_wake_after_published(
+        endpoint,
+        task_id,
+        reply,
+        receiver_to_wake,
+        receiver_owner_process,
+        wake_mark,
+    )?;
+    wait_for_service_reply_with_handles_and_deadline_tick_payload(
+        reply,
+        handle_capacity,
+        deadline_tick,
+        timeout_ms,
+    )
+}
+
 pub(super) fn enqueue_call_and_wake_or_wait_queue(
     first_attempt: Result<KernelReplyHandle, i64>,
     endpoint: KernelEndpointHandle,
@@ -3470,10 +3648,20 @@ pub(super) fn enqueue_call_and_wake_or_wait_queue(
 ) -> Result<KernelReplyHandle, i64> {
     let mut result = first_attempt;
     let mut prior_hits: Option<u64> = None;
+    let mut retries: u64 = 0;
     loop {
         match result {
             Ok(reply) => return Ok(reply),
             Err(LINUX_ENOMEM) => {
+                let retry_mark = phase_mark();
+                retries = retries.saturating_add(1);
+                nucleus_core::debug::ipc_tail::record_task_tail_event(
+                    nucleus_core::debug::ipc_tail::IpcTailEventKind::QueueFullRetry,
+                    prior_hits.is_some() as u8,
+                    0,
+                    endpoint.raw(),
+                    retries,
+                );
                 if reply_deadline_expired(deadline_tick) {
                     return Err(LINUX_ETIMEDOUT);
                 }
@@ -3505,6 +3693,7 @@ pub(super) fn enqueue_call_and_wake_or_wait_queue(
                 }
                 prior_hits = kernel_ipc_runtime::api::endpoint::queue_full_hits(endpoint);
                 result = enqueue_call_and_wake_with_handles(endpoint, request, attached_handles);
+                let _ = charge_phase(IpcCallPhase::CallQueueFullRetry, retry_mark);
             }
             Err(errno) => return Err(errno),
         }
@@ -3526,15 +3715,6 @@ fn enqueue_call_and_wake_with_handles_for_task(
     request: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<KernelReplyHandle, i64> {
-    // Queue priority and temporal authority are scheduler-derived, never
-    // request bytes controlled by ring3. The bounded reservation precedes IPC
-    // publication and carries both optional System urgency and mandatory
-    // scheduling-context custody. Ordinary callers do not receive a priority
-    // boost, but every synchronous call must retain exact budget/domain
-    // billing through its reply lifetime.
-    // This producer must own an original masked CPU, never acquire nested
-    // dispatch custody under a raw leaf. Refuse BEFORE reservation or IPC
-    // publication so no receiver is stranded by a bare-ID deferred wake.
     if nucleus_core::util::lockdep::preemption_disabled()
         || nucleus_core::util::lockdep::held_spin_lock_depth() != 0
     {
@@ -3552,7 +3732,6 @@ fn enqueue_call_and_wake_with_handles_for_task(
             attached_handles,
             priority,
             scheduling_context,
-            // The message is billed to the sender's Job (`Class::IpcMessage`).
             multitask::current_user_job_charge_group(),
         ) {
             Ok(enqueued) => enqueued,
@@ -3568,6 +3747,24 @@ fn enqueue_call_and_wake_with_handles_for_task(
         receiver_to_wake
     );
     let receiver_process_id = kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply);
+    enqueue_wake_after_published(
+        endpoint,
+        task_id,
+        reply,
+        receiver_to_wake,
+        receiver_process_id,
+        wake_mark,
+    )
+}
+
+fn enqueue_wake_after_published(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+    reply: KernelReplyHandle,
+    receiver_to_wake: Option<u64>,
+    receiver_process_id: Option<u64>,
+    wake_mark: u64,
+) -> Result<KernelReplyHandle, i64> {
     // Transfer the temporary reservation to the immutable reply identity as
     // soon as publication returns. A process worker can dequeue on another
     // CPU before this sender reaches its wake transaction; reply ownership
@@ -3809,7 +4006,22 @@ fn wait_for_service_reply_with_handles_and_deadline_tick(
     deadline_tick: u64,
     timeout_ms: u64,
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    match wait_for_reply_with_deadline(reply, handle_capacity, deadline_tick) {
+    wait_for_service_reply_with_handles_and_deadline_tick_payload(
+        reply,
+        handle_capacity,
+        deadline_tick,
+        timeout_ms,
+    )
+    .map(|(payload, handles)| (payload.into_vec(), handles))
+}
+
+fn wait_for_service_reply_with_handles_and_deadline_tick_payload(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+    deadline_tick: u64,
+    timeout_ms: u64,
+) -> Result<(kernel_ipc_runtime::api::EndpointPayload, Vec<KernelTransferredHandle>), i64> {
+    match reply_wait::wait_for_reply_with_deadline(reply, handle_capacity, deadline_tick) {
         Ok(response) => Ok(response),
         Err(errno) => {
             // An abandoned reply capability is the start of a failure chain
@@ -4216,6 +4428,30 @@ fn ipc_transfer_error_to_linux_errno(err: multitask::IpcTransferRegistryError) -
         multitask::IpcTransferRegistryError::InvalidState => LINUX_ESTALE,
         multitask::IpcTransferRegistryError::StaleDescriptor => LINUX_ESTALE,
     }
+}
+
+fn copy_payload_from_user(
+    user_ptr: u64,
+    user_len: u64,
+) -> Result<kernel_ipc_runtime::api::EndpointPayload, i64> {
+    let len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+    if len == 0 || len > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    let alloc_mark = phase_mark();
+    let payload = if len <= kernel_ipc_runtime::api::IPC_QUEUED_INLINE_BYTES {
+        let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_QUEUED_INLINE_BYTES];
+        read_user_bytes_as(user_ptr, &mut inline[..len])?;
+        kernel_ipc_runtime::api::EndpointPayload::from_inline(&inline[..len])
+            .expect("checked length fits queued inline buffer")
+    } else {
+        kernel_ipc_runtime::api::EndpointPayload::from_vec(
+            usermem::copy_from_current_user_to_vec(user_ptr, len)
+                .map_err(address_space_error_to_linux_errno)?,
+        )
+    };
+    let _ = charge_phase(IpcCallPhase::CopyAlloc, alloc_mark);
+    Ok(payload)
 }
 
 fn copy_request_from_user(user_ptr: u64, user_len: u64) -> Result<Vec<u8>, i64> {

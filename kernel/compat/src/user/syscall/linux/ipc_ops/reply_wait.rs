@@ -56,7 +56,7 @@ pub(super) fn wait_for_reply_with_deadline(
     reply: KernelReplyHandle,
     handle_capacity: usize,
     deadline_tick: u64,
-) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+) -> Result<(kernel_ipc_runtime::api::EndpointPayload, Vec<KernelTransferredHandle>), i64> {
     let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     let mut cycle_mark = phase_mark();
     loop {
@@ -194,14 +194,35 @@ pub(super) fn wait_for_reply_with_deadline(
             return Err(LINUX_ETIMEDOUT);
         }
         cycle_mark = phase_mark();
+        nucleus_core::debug::ipc_tail::record_task_tail_event(
+            nucleus_core::debug::ipc_tail::IpcTailEventKind::WaitArm,
+            polls as u8,
+            caller_task_id as u32,
+            reply.raw(),
+            deadline_tick,
+        );
         let committed = multitask::commit_block_current_task_and_yield();
         cycle_mark = charge_phase(IpcCallPhase::WaitBlocked, cycle_mark);
         match committed {
             Some(true) => {
+                nucleus_core::debug::ipc_tail::record_task_tail_event(
+                    nucleus_core::debug::ipc_tail::IpcTailEventKind::WaitResume,
+                    1,
+                    caller_task_id as u32,
+                    reply.raw(),
+                    polls as u64,
+                );
                 disarm_reply_deadline_waiter(caller_task_id);
                 cycle_mark = charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
             }
             Some(false) => {
+                nucleus_core::debug::ipc_tail::record_task_tail_event(
+                    nucleus_core::debug::ipc_tail::IpcTailEventKind::CallerWakeRetry,
+                    0,
+                    caller_task_id as u32,
+                    reply.raw(),
+                    polls as u64,
+                );
                 disarm_reply_deadline_waiter(caller_task_id);
                 cycle_mark = charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
                 continue;
@@ -215,19 +236,25 @@ pub(super) fn wait_for_reply_with_deadline(
     }
 }
 
-type EndpointWaitResponse = (Vec<u8>, Vec<KernelTransferredHandle>);
+type EndpointWaitResponse = (
+    kernel_ipc_runtime::api::EndpointPayload,
+    Vec<KernelTransferredHandle>,
+);
 
 pub(super) fn take_endpoint_response_for_wait(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<Option<EndpointWaitResponse>, i64> {
-    match kernel_ipc_runtime::api::take_endpoint_response_detailed(reply, handle_capacity) {
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Pending) => Ok(None),
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Response(response)) => {
+    if kernel_ipc_runtime::api::endpoint::reply_is_known_pending(reply) {
+        return Ok(None);
+    }
+    match kernel_ipc_runtime::api::take_endpoint_response_payload_detailed(reply, handle_capacity) {
+        Ok(kernel_ipc_runtime::api::EndpointPayloadTake::Pending) => Ok(None),
+        Ok(kernel_ipc_runtime::api::EndpointPayloadTake::Response(response)) => {
             let _ = multitask::release_ipc_priority(reply.raw());
             Ok(Some(response))
         }
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Error {
+        Ok(kernel_ipc_runtime::api::EndpointPayloadTake::Error {
             error,
             discarded_request_handles,
         }) => {

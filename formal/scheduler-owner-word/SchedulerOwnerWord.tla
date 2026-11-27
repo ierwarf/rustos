@@ -51,8 +51,9 @@ Blocked == "blocked"
 Retiring == "retiring"
 Retired == "retired"
 DirectHandoff == "direct-handoff"
+Paired == "paired"
 
-States == {Dormant, Local, RemoteQueued, Running, Migrating, Blocked, Retiring, Retired, DirectHandoff}
+States == {Dormant, Local, RemoteQueued, Running, Migrating, Blocked, Retiring, Retired, DirectHandoff, Paired}
 Terminal == {Retiring, Retired}
 \* States whose word carries run intent when first entered.
 RunnableStates == {Local, RemoteQueued, Running, Migrating, DirectHandoff}
@@ -312,8 +313,30 @@ CommitWait ==
     /\ MetaUnchanged
 
 WakeWait ==
-    /\ Editable
+    /\ Editable /\ w.st /= Paired
     /\ w' = [w EXCEPT !.run = (w.run \/ w.st \in RunnableStates), !.arm = FALSE, !.rsn = 0]
+    /\ MetaUnchanged
+
+(* ---- paired execution custody transitions ---- *)
+
+PairPark ==
+    /\ w.st = Running /\ (~w.run \/ w.arm) /\ CanAdvance
+    /\ w' = Preserve(Paired, w.cpu)
+    /\ MetaUnchanged
+
+PairResume ==
+    /\ w.st = Paired /\ CanAdvance
+    /\ w' = Fresh(Running, w.cpu)
+    /\ MetaUnchanged
+
+PairBreakBlocked ==
+    /\ w.st = Paired /\ CanAdvance
+    /\ w' = Fresh(Blocked, NoCpu)
+    /\ MetaUnchanged
+
+PairBreakLocal(c) ==
+    /\ w.st = Paired /\ CanAdvance
+    /\ w' = Fresh(Local, c)
     /\ MetaUnchanged
 
 Next ==
@@ -331,6 +354,10 @@ Next ==
     \/ Step(AdoptCas)
     \/ Step(LaneObserve)
     \/ \E c \in Cpus : Step(LaneCas(c))
+    \/ Step(PairPark)
+    \/ Step(PairResume)
+    \/ Step(PairBreakBlocked)
+    \/ \E c \in Cpus : Step(PairBreakLocal(c))
     \/ Step(RetireStart)
     \/ Step(RetireFinish)
     \/ Step(ReleaseRead)

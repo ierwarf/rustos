@@ -25,7 +25,7 @@ use nucleus_core::debug::LogCategory;
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
 #[cfg(any(test, rustos_ipc_phase_profile))]
-pub(super) const IPC_SERVER_PHASE_COUNT: usize = 4;
+pub(super) const IPC_SERVER_PHASE_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IpcServerPhase {
@@ -40,6 +40,14 @@ pub(super) enum IpcServerPhase {
     ReplyPublish = 2,
     /// The donation bind and direct hand-back to the woken caller.
     ReplyWake = 3,
+    /// Register-mode fused reply publish + settlement custody arm (B0.f).
+    RegisterReplyPublish = 4,
+    /// Register-mode parked receive take + frame write (B0.f).
+    RegisterRecvTake = 5,
+    /// Queued server copy_from_user response staging (Q0).
+    ReplyCopy = 6,
+    /// Queued server handle export (Q0).
+    ReplyExportHandles = 7,
 }
 
 #[cfg(rustos_ipc_phase_profile)]
@@ -50,6 +58,10 @@ static PROFILE: PhaseProfile<IPC_SERVER_PHASE_COUNT> = PhaseProfile::new(
         "ipc-server-phase-recv-write",
         "ipc-server-phase-reply-publish",
         "ipc-server-phase-reply-wake",
+        "ipc-server-phase-register-reply-publish",
+        "ipc-server-phase-register-recv-take",
+        "ipc-server-phase-reply-copy",
+        "ipc-server-phase-reply-export-handles",
     ],
     "ipc-server-phase-discarded",
 );
@@ -123,6 +135,10 @@ mod tests {
             (IpcServerPhase::RecvWrite, 1),
             (IpcServerPhase::ReplyPublish, 2),
             (IpcServerPhase::ReplyWake, 3),
+            (IpcServerPhase::RegisterReplyPublish, 4),
+            (IpcServerPhase::RegisterRecvTake, 5),
+            (IpcServerPhase::ReplyCopy, 6),
+            (IpcServerPhase::ReplyExportHandles, 7),
         ];
         for (phase, index) in phases {
             assert_eq!(phase as usize, index, "phase {phase:?} moved slot");

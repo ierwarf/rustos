@@ -40,6 +40,11 @@ fn lane_rows_batch_per_cpu_and_fold_exactly_once_into_the_diagnostic_leaf() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
     let cpu = 1;
     lane_flush(cpu);
+    CELLS[cpu].with(|row| {
+        if row.runtime_profile_ns.len() < 64 {
+            row.size(64);
+        }
+    });
     let _ = CELLS[cpu].with(Counters::take);
     for _ in 0..3 {
         lane_account(cpu, 7, 10);
@@ -77,7 +82,10 @@ fn lane_rows_batch_per_cpu_and_fold_exactly_once_into_the_diagnostic_leaf() {
         u64::from(LANE_FLUSH_EVERY)
     );
     // Other CPUs' rows are untouched.
-    assert_eq!(CELLS[0].with(|row| row.runtime_profile_dispatches[20]), 0);
+    assert_eq!(
+        CELLS[0].with(|row| row.runtime_profile_dispatches.get(20).copied().unwrap_or(0)),
+        0
+    );
 }
 #[test]
 fn remote_window_drain_preserves_open_turn_phase_baseline_and_new_window_segments() {
@@ -174,7 +182,11 @@ fn report_epoch_admits_one_due_consumer_and_preserves_partial_period_on_every_cp
         cell.with(Counters::clear_all);
         // Production sizes a row on its first account; size it explicitly so the
         // witness does not depend on another test having grown the shared cells.
-        cell.with(|row| row.size(64));
+        cell.with(|row| {
+            if row.runtime_profile_ns.len() < 64 {
+                row.size(64);
+            }
+        });
     }
     assert!(take(1, 100).is_none());
     CELLS[0].with(|row| row.account(7, 10));

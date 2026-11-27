@@ -198,10 +198,15 @@ pub unsafe fn adopt_ipc_register_simd() -> IpcRegisterSimdGuard {
     })
 }
 
+#[inline]
 fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(not(test))]
     {
-        x86_64::instructions::interrupts::without_interrupts(f)
+        if x86_64::instructions::interrupts::are_enabled() {
+            x86_64::instructions::interrupts::without_interrupts(f)
+        } else {
+            f()
+        }
     }
     #[cfg(test)]
     {

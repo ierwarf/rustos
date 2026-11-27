@@ -74,8 +74,26 @@ const _: [(); 0x1a0] = [(); mem::size_of::<SavedContext>()];
 pub const SAVED_CONTEXT_XMM_OFFSET: usize = mem::offset_of!(SavedContext, xmm);
 /// Private software-trap discriminator for a register-carried fast IPC call.
 pub const FAST_IPC_CALL_SCHEDULE_TAG: u64 = 0x5255_5354_4f53_4950;
+/// Generic-committed fallback tag after a direct register call could not switch.
+pub const FAST_IPC_CALL_GENERIC_TAG: u64 = 0x5255_5354_4f53_4951;
 /// Private software-trap discriminator for a deferred fast reply settlement.
 pub const FAST_IPC_REPLY_SCHEDULE_TAG: u64 = 0x5255_5354_4f53_5250;
+/// Generic-committed fallback tag after a direct register reply could not switch.
+pub const FAST_IPC_REPLY_GENERIC_TAG: u64 = 0x5255_5354_4f53_5251;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirectSwitchResult {
+    pub value: u64,
+    pub switched: u64,
+}
+
+const _: [(); 16] = [(); mem::size_of::<DirectSwitchResult>()];
+const _: [(); 0] = [(); mem::offset_of!(DirectSwitchResult, value)];
+const _: [(); 8] = [(); mem::offset_of!(DirectSwitchResult, switched)];
+
+pub type DirectCallDispatch = extern "C" fn(u64, u64, u64, usize) -> DirectSwitchResult;
+pub type DirectReplyDispatch = extern "C" fn(u64, u64, u64, u64, u64, usize) -> DirectSwitchResult;
 
 pub type InterruptDispatch = extern "C" fn(*mut SavedContext) -> *mut SavedContext;
 /// Scheduler result for a syscall-owned user frame.
@@ -105,6 +123,8 @@ static SOFTWARE_SCHEDULE_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static SAVED_USER_CONTEXT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static RESCHEDULE_IPI_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static CONTEXT_SWITCH_COMMIT: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_IPC_CALL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_IPC_REPLY_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn timer_interrupt_handler();
@@ -203,6 +223,11 @@ pub fn register_reschedule_ipi_interrupt_dispatch(callback: InterruptDispatch) {
     // ORDERING: Release publishes the complete scheduler callback before any
     // CPU can receive the private reschedule vector.
     RESCHEDULE_IPI_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
+}
+
+pub fn register_direct_ipc_dispatch(call: DirectCallDispatch, reply: DirectReplyDispatch) {
+    DIRECT_IPC_CALL_DISPATCH.store(call as usize, Ordering::Release);
+    DIRECT_IPC_REPLY_DISPATCH.store(reply as usize, Ordering::Release);
 }
 
 pub fn register_context_switch_commit(callback: ContextSwitchCommit) {
@@ -386,6 +411,47 @@ extern "C" fn scheduler_context_switch_commit_dispatch() {
     // and it accepts the exact `extern "C" fn()` type.
     let callback = unsafe { mem::transmute::<usize, ContextSwitchCommit>(callback_addr) };
     callback();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn direct_ipc_call_dispatch(
+    endpoint: u64,
+    reply: u64,
+    receiver_task_id: u64,
+    current_rsp: usize,
+) -> DirectSwitchResult {
+    let addr = DIRECT_IPC_CALL_DISPATCH.load(Ordering::Acquire);
+    if addr == 0 {
+        return DirectSwitchResult { value: 0, switched: 0 };
+    }
+    // SAFETY: published exclusively by `register_direct_ipc_dispatch`.
+    let callback = unsafe { mem::transmute::<usize, DirectCallDispatch>(addr) };
+    callback(endpoint, reply, receiver_task_id, current_rsp)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn direct_ipc_reply_dispatch(
+    reply: u64,
+    caller_task_id: u64,
+    context_owner_task_id: u64,
+    context_slot: u64,
+    context_generation: u64,
+    current_rsp: usize,
+) -> DirectSwitchResult {
+    let addr = DIRECT_IPC_REPLY_DISPATCH.load(Ordering::Acquire);
+    if addr == 0 {
+        return DirectSwitchResult { value: 0, switched: 0 };
+    }
+    // SAFETY: published exclusively by `register_direct_ipc_dispatch`.
+    let callback = unsafe { mem::transmute::<usize, DirectReplyDispatch>(addr) };
+    callback(
+        reply,
+        caller_task_id,
+        context_owner_task_id,
+        context_slot,
+        context_generation,
+        current_rsp,
+    )
 }
 
 fn dispatch(slot: &AtomicUsize, context_ptr: *mut SavedContext) -> *mut SavedContext {

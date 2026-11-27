@@ -211,6 +211,30 @@ pub(super) fn bind_lane_current(
         })
 }
 
+/// [`bind_lane_current`] for a paired switch whose partner's physical
+/// `ExecutionPermit`, `StackPin`, and `RunOwnerState::Paired` custody are
+/// already held exclusively by `scope`'s CPU. Only the lock-free publication
+/// check (`qualified`) is needed instead of acquiring/dropping a second `BindingPin`.
+pub(super) fn bind_lane_current_paired(
+    scope: &DispatchPreemption<'_>,
+    reply: u64,
+    donor: (usize, u64),
+    partner_slot: usize,
+    partner_id: u64,
+) -> Option<bool> {
+    if !scope_valid(scope)
+        || reply == 0
+        || donor.1 == partner_id
+        || !identity::execution::qualified(partner_slot, partner_id)
+    {
+        return Some(false);
+    }
+    donation_ledger::bind_own_lazy(donor.0, donor.1, reply, partner_slot, partner_id)
+        .or_else(|| {
+            donation_ledger::bind_own_funding(reply, donor.0, donor.1, partner_slot, partner_id)
+        })
+}
+
 /// Transfer the original participants to the producer, which retains donor,
 /// root and receiver through queue/FIFO publication and Current wait commit.
 pub(super) fn bind_original(

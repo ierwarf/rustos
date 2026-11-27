@@ -9,11 +9,15 @@ use std::collections::BTreeMap;
 
 pub(super) const PREFIX: &str = "ipcbench: tail ";
 pub(super) const SAMPLE_PREFIX: &str = "ipcbench: tail-sample ";
+pub(super) const SEQ_SUMMARY_PREFIX: &str = "ipcbench: tail-seq-summary ";
+pub(super) const SEQ_PREFIX: &str = "ipcbench: tail-seq ";
 
 #[derive(Default)]
 pub(super) struct Data {
     summaries: Vec<Summary>,
     samples: Vec<Sample>,
+    seq_summaries: Vec<SeqSummary>,
+    seq_samples: Vec<SeqSample>,
 }
 struct Summary {
     name: String,
@@ -32,6 +36,25 @@ struct Sample {
     cycles: u64,
     paired: bool,
     parts: [u64; 3],
+    start: u64,
+    end: u64,
+}
+struct SeqSummary {
+    name: String,
+    recorded: u64,
+    paired: u64,
+    unpaired: u64,
+    overflow: u64,
+    cpu_switches: u64,
+}
+struct SeqSample {
+    name: String,
+    rank: u64,
+    seq: u64,
+    cycles: u64,
+    paired: bool,
+    parts: [u64; 3],
+    cpu: u64,
     start: u64,
     end: u64,
 }
@@ -82,10 +105,7 @@ impl Data {
                 "duplicate tail summary"
             );
             self.summaries.push(summary);
-        } else {
-            let text = line
-                .strip_prefix(SAMPLE_PREFIX)
-                .context("unknown tail record")?;
+        } else if let Some(text) = line.strip_prefix(SAMPLE_PREFIX) {
             let f = fields(text, 11)?;
             let paired = number(&f, "paired")?;
             ensure!(paired <= 1, "invalid paired tail flag");
@@ -100,6 +120,46 @@ impl Data {
                     number(&f, "server_body")?,
                     number(&f, "reply_to_return")?,
                 ],
+                start: number(&f, "start_tsc")?,
+                end: number(&f, "end_tsc")?,
+            });
+        } else if let Some(text) = line.strip_prefix(SEQ_SUMMARY_PREFIX) {
+            let f = fields(text, 7)?;
+            let summary = SeqSummary {
+                name: name(&f)?,
+                recorded: number(&f, "recorded")?,
+                paired: number(&f, "paired")?,
+                unpaired: number(&f, "unpaired")?,
+                overflow: number(&f, "overflow")?,
+                cpu_switches: number(&f, "cpu_switches")?,
+            };
+            ensure!(
+                !self
+                    .seq_summaries
+                    .iter()
+                    .any(|old| old.name == summary.name),
+                "duplicate seq tail summary"
+            );
+            self.seq_summaries.push(summary);
+        } else {
+            let text = line
+                .strip_prefix(SEQ_PREFIX)
+                .context("unknown tail record")?;
+            let f = fields(text, 12)?;
+            let paired = number(&f, "paired")?;
+            ensure!(paired <= 1, "invalid paired seq tail flag");
+            self.seq_samples.push(SeqSample {
+                name: name(&f)?,
+                rank: number(&f, "rank")?,
+                seq: number(&f, "seq")?,
+                cycles: number(&f, "cycles")?,
+                paired: paired == 1,
+                parts: [
+                    number(&f, "call_to_recv")?,
+                    number(&f, "server_body")?,
+                    number(&f, "reply_to_return")?,
+                ],
+                cpu: number(&f, "cpu")?,
                 start: number(&f, "start_tsc")?,
                 end: number(&f, "end_tsc")?,
             });
@@ -198,30 +258,68 @@ impl Data {
                 .all(|sample| self.summaries.iter().any(|tail| tail.name == sample.name)),
             "tail witness without summary"
         );
+        for summary in &self.seq_summaries {
+            ensure!(
+                results.iter().any(|result| result.name == summary.name),
+                "seq tail without primary result"
+            );
+        }
+        for sample in &self.seq_samples {
+            ensure!(
+                results.iter().any(|result| result.name == sample.name),
+                "seq tail sample without primary result"
+            );
+            ensure!(
+                sample.end.wrapping_sub(sample.start) == sample.cycles,
+                "invalid seq tail timestamp span"
+            );
+            if sample.paired {
+                let sum = sample
+                    .parts
+                    .iter()
+                    .try_fold(0_u64, |sum, value| sum.checked_add(*value));
+                ensure!(
+                    sum == Some(sample.cycles),
+                    "paired seq tail parts do not sum to exact sample"
+                );
+            } else {
+                ensure!(
+                    sample.parts == [0; 3],
+                    "unpaired seq tail cannot claim leg attribution"
+                );
+            }
+        }
         Ok(())
     }
     pub(super) fn render(&self) -> String {
-        if self.summaries.is_empty() {
+        if self.summaries.is_empty()
+            && self.samples.is_empty()
+            && self.seq_summaries.is_empty()
+            && self.seq_samples.is_empty()
+        {
             return String::new();
         }
-        let mut out = String::from(
-            "\nraw tail evidence (cycles; all samples retained; top1%=share of total time):\n",
-        );
-        out.push_str(&format!(
-            "{:<40} {:>10} {:>10} {:>8} {:>8} {:>8} {:>9}\n",
-            "probe", "p99.9", "p99.99", ">80k", ">1M", ">10M", "top1%"
-        ));
-        for tail in &self.summaries {
+        let mut out = String::new();
+        if !self.summaries.is_empty() {
+            out.push_str(
+                "\nraw tail evidence (cycles; all samples retained; top1%=share of total time):\n",
+            );
             out.push_str(&format!(
-                "{:<40} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8.2}%\n",
-                format!("tail/{}", tail.name),
-                tail.p999,
-                tail.p9999,
-                tail.over80k,
-                tail.over1m,
-                tail.over10m,
-                tail.top1pct_ppm as f64 / 10_000.0
+                "{:<40} {:>10} {:>10} {:>8} {:>8} {:>8} {:>9}\n",
+                "probe", "p99.9", "p99.99", ">80k", ">1M", ">10M", "top1%"
             ));
+            for tail in &self.summaries {
+                out.push_str(&format!(
+                    "{:<40} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8.2}%\n",
+                    format!("tail/{}", tail.name),
+                    tail.p999,
+                    tail.p9999,
+                    tail.over80k,
+                    tail.over1m,
+                    tail.over10m,
+                    tail.top1pct_ppm as f64 / 10_000.0
+                ));
+            }
         }
         if !self.samples.is_empty() {
             out.push_str(
@@ -246,6 +344,45 @@ impl Data {
                     } else {
                         " UNPAIRED (total retained)"
                     }
+                ));
+            }
+        }
+        if !self.seq_summaries.is_empty() {
+            out.push_str("\nsequential tail summary:\n");
+            out.push_str(&format!(
+                "{:<40} {:>8} {:>8} {:>8} {:>8} {:>12}\n",
+                "probe", "recorded", "paired", "unpaired", "overflow", "cpu_switches"
+            ));
+            for summary in &self.seq_summaries {
+                out.push_str(&format!(
+                    "{:<40} {:>8} {:>8} {:>8} {:>8} {:>12}\n",
+                    format!("seq-summary/{}", summary.name),
+                    summary.recorded,
+                    summary.paired,
+                    summary.unpaired,
+                    summary.overflow,
+                    summary.cpu_switches,
+                ));
+            }
+        }
+        if !self.seq_samples.is_empty() {
+            out.push_str("\nsequential tail samples (cycles):\n");
+            out.push_str(&format!(
+                "{:<40} {:>4} {:>8} {:>3} {:>10} {:>10} {:>10} {:>10}\n",
+                "probe", "rank", "seq", "cpu", "total", "to_recv", "body", "to_return"
+            ));
+            for sample in &self.seq_samples {
+                out.push_str(&format!(
+                    "{:<40} {:>4} {:>8} {:>3} {:>10} {:>10} {:>10} {:>10}{}\n",
+                    format!("seq/{}", sample.name),
+                    sample.rank,
+                    sample.seq,
+                    sample.cpu,
+                    sample.cycles,
+                    sample.parts[0],
+                    sample.parts[1],
+                    sample.parts[2],
+                    if sample.paired { "" } else { " UNPAIRED" }
                 ));
             }
         }
@@ -348,5 +485,74 @@ mod tests {
         data.record(SAMPLE).unwrap();
         data.record(&SAMPLE.replace("rank=1", "rank=2")).unwrap();
         assert!(data.validate(&[primary()]).is_err());
+    }
+
+    const SEQ_SUMMARY: &str = "ipcbench: tail-seq-summary v=1 name=ipc_rt_test recorded=2 paired=1 unpaired=1 overflow=0 cpu_switches=1";
+    const SEQ_PAIRED: &str = "ipcbench: tail-seq v=1 name=ipc_rt_test rank=1 seq=42 cycles=15000 paired=1 call_to_recv=8000 server_body=100 reply_to_return=6900 cpu=0 start_tsc=100 end_tsc=15100";
+    const SEQ_UNPAIRED: &str = "ipcbench: tail-seq v=1 name=ipc_rt_test rank=2 seq=43 cycles=12000 paired=0 call_to_recv=0 server_body=0 reply_to_return=0 cpu=2 start_tsc=20000 end_tsc=32000";
+
+    #[test]
+    fn sequential_tail_summary_and_samples_parse_validate_and_render() {
+        let mut data = Data::default();
+        assert!(data.render().is_empty());
+        data.record(SEQ_SUMMARY).unwrap();
+        data.record(SEQ_PAIRED).unwrap();
+        data.record(SEQ_UNPAIRED).unwrap();
+        data.validate(&[primary()]).unwrap();
+        let rendered = data.render();
+        assert!(rendered.contains("sequential tail summary:"), "{rendered}");
+        assert!(rendered.contains("seq-summary/ipc_rt_test"), "{rendered}");
+        assert!(rendered.contains("cpu_switches"), "{rendered}");
+        assert!(rendered.contains("sequential tail samples"), "{rendered}");
+        assert!(rendered.contains("seq/ipc_rt_test"), "{rendered}");
+        assert!(rendered.contains("UNPAIRED"), "{rendered}");
+
+        let baseline = format!(
+            "{}{}",
+            super::super::render(4_000_000, &[primary()], &[]),
+            rendered
+        );
+        assert_eq!(
+            super::super::parse_baseline_minimums(&baseline),
+            vec![("ipc_rt_test".into(), 100)]
+        );
+    }
+
+    #[test]
+    fn sequential_tail_records_follow_run_window_and_reject_invalid_fields() {
+        let start = "ipcbench: begin\nipcbench: tsc_khz=4000000\n";
+        let result = "ipcbench: result name=ipc_rt_test iters=20000 min=100 p50=1000 p99=12000 max=15000 mean=2000 min_ns=25 p50_ns=250\n";
+        let log = format!("{start}{result}{SEQ_SUMMARY}\n{SEQ_PAIRED}\nipcbench: end\n");
+        assert!(super::super::parse_log(&log).is_ok());
+        assert!(
+            super::super::parse_log(&format!("{SEQ_SUMMARY}\n{start}{result}ipcbench: end\n"))
+                .is_err()
+        );
+        assert!(
+            super::super::parse_log(&format!("{start}{result}ipcbench: end\n{SEQ_PAIRED}\n"))
+                .is_err()
+        );
+
+        for (from, to) in [
+            ("v=1", "v=2"),
+            ("name=ipc_rt_test", "name=foreign"),
+            ("cycles=15000", "cycles=14999"),
+            ("server_body=100", "server_body=99"),
+            ("end_tsc=15100", "end_tsc=15101"),
+            ("paired=1", "paired=0"),
+        ] {
+            let mut data = Data::default();
+            data.record(SEQ_SUMMARY).unwrap();
+            assert!(
+                data.record(&SEQ_PAIRED.replace(from, to))
+                    .and_then(|_| data.validate(&[primary()]))
+                    .is_err(),
+                "{from} -> {to}"
+            );
+        }
+        let mut dup = Data::default();
+        dup.record(SEQ_SUMMARY).unwrap();
+        assert!(dup.record(SEQ_SUMMARY).is_err());
+        assert!(dup.record(&SEQ_PAIRED.replace("paired=1", "paired=2")).is_err());
     }
 }

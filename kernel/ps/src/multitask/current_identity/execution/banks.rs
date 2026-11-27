@@ -103,6 +103,27 @@ pub(in crate::multitask) fn take_outgoing(cpu: usize) -> Option<ExecutionPermit>
     Banks::take(&BANKS[cpu].outgoing)
 }
 
+/// Paired execution swap: exchanges the owning CPU's active `current` execution permit
+/// with the inactive paired partner's retained permit under IRQ exclusion.
+pub(in crate::multitask) fn swap_paired(
+    cpu: usize,
+    from: usize,
+    incoming: ExecutionPermit,
+) -> ExecutionPermit {
+    let bank = &BANKS[cpu];
+    assert_eq!(
+        bank.current.load(Ordering::Acquire),
+        from + 1,
+        "paired CPU execution swap lost current permit"
+    );
+    assert_eq!(
+        bank.outgoing.load(Ordering::Acquire),
+        0,
+        "paired CPU execution swap overlapped an uncommitted switch"
+    );
+    Banks::put(&bank.current, incoming).expect("paired CPU execution swap vanished")
+}
+
 pub(in crate::multitask) fn owns_execution(cpu: usize, slot: usize) -> bool {
     BANKS.get(cpu).is_some_and(|bank| {
         bank.current.load(Ordering::Acquire) == slot + 1

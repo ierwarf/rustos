@@ -159,3 +159,4 @@ scheduler-resident-cell/SchedulerResidentCell	safety	check	explicit stutter step
 scheduler-terminal-producer/SchedulerTerminalProducer	safety	check	explicit stutter step is always enabled	30	120	exhaustive	no	no	no
 mm-request-lease/MmRequestLease	safety	check	explicit stutter preserves bounded one-slot lease with two processes two incarnations and two appliers	30	120	exhaustive	no	no	no
 app-buffer-custody/AppBufferCustody	safety	check	explicit stutter preserves bounded one-range export custody with two provider epochs and process incarnations	30	120	exhaustive	no	no	no
+ipc-register-rendezvous/IpcRegisterRendezvous	safety	check	explicit stutter preserves deadlock checking after permanent slot retirement or owner failure while virtual token low-16-zero namespace, custody exclusivity, and non-reusing generations remain explicit	30	120	exhaustive	no	no	no

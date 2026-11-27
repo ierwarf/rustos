@@ -137,7 +137,9 @@ impl CpuSwitchPublication {
         // ORDERING: the bank moves above are plain stores of the owning CPU; one full
         // fence orders them before the scalar publication remote paths act on, where
         // each move used to be its own locked exchange.
-        core::sync::atomic::fence(Ordering::SeqCst);
+        // ORDERING: SeqCst separates the prior `swap_paired` bank moves from the
+    // `PAIR_ACK_ACTIVE` publication consumed at the incoming RSP commit.
+    core::sync::atomic::fence(Ordering::SeqCst);
         self.publish_scalars();
     }
 
@@ -414,6 +416,7 @@ static LANE_ACK_FROM: [CpuSlot; MAX_TRACKED_CPUS] =
 /// wrote one step earlier; `resident::park` still re-validates the owner after publishing.
 static LANE_ACK_RSP: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
 static LANE_ACK_GENERATION: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
+static PAIR_ACK_ACTIVE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
 
 /// No dispatch turn, uncommitted RSP handoff or missing Current on this CPU:
 /// the preconditions for a lane switch, which never opens a `CpuDispatchTurn`.
@@ -425,6 +428,21 @@ pub(in crate::multitask) fn lane_idle(cpu: usize) -> bool {
         && CURRENT_TASK_ACTIVE[cpu].load(Ordering::Acquire)
         // ORDERING: Relaxed; only this CPU's masked trap and commit callback touch it.
         && LANE_ACK_FROM[cpu].load(Ordering::Relaxed) == usize::MAX
+        && !PAIR_ACK_ACTIVE[cpu].load(Ordering::Relaxed)
+}
+
+/// Publish a paired execution switch (no `ResidentCell` or outgoing pin tear-down).
+/// Both `cpu_leases::swap_paired` and `banks::swap_paired` already exchanged the
+/// active `current` loans before this call, so fence them before scalar publication
+/// and arm `PAIR_ACK_ACTIVE[cpu]` so `commit_context_switch_at_rsp` clears
+/// `TRANSITION_ACTIVE[cpu]` directly after `mov rsp, next_rsp`.
+pub(in crate::multitask) fn pair_publish(cpu: usize, from: usize, to: usize) {
+    // ORDERING: SeqCst separates the prior `swap_paired` bank moves from the
+    // `PAIR_ACK_ACTIVE` publication consumed at the incoming RSP commit.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    CpuSwitchPublication::new(cpu, from, to, false).publish_scalars();
+    // ORDERING: Relaxed; only this CPU's masked trap and its commit callback touch it.
+    PAIR_ACK_ACTIVE[cpu].store(true, Ordering::Relaxed);
 }
 
 /// Publish a lane switch exactly as a dispatch turn does (banks, Transition,
@@ -470,6 +488,12 @@ pub(super) fn commit_context_switch_at_rsp(logical_index: usize, observed_rsp: O
     // ORDERING: Relaxed; see `lane_idle`.
     // ORDERING: Relaxed; only this CPU's masked trap and this callback touch the word:
     // a load and a store, not a locked exchange.
+    if PAIR_ACK_ACTIVE[logical_index].load(Ordering::Relaxed) {
+        PAIR_ACK_ACTIVE[logical_index].store(false, Ordering::Relaxed);
+        // ORDERING: Release makes the stack switch precede the transition clear.
+        TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
+        return;
+    }
     let lane_from = LANE_ACK_FROM[logical_index].load(Ordering::Relaxed);
     if lane_from != usize::MAX {
         // ORDERING: Relaxed; see above.

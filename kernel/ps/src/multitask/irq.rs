@@ -159,7 +159,8 @@ fn retain_periodic_continuation(logical_index: usize, context_ptr: *const SavedC
     // tick enters the scheduler, whose entry settles the waiting caller's wake.
     // (Deferred wakes need no term: every deferral publishes the request bit.)
     let deferred_reschedule_pending = super::reschedule_observation::request_pending(logical_index)
-        || super::scheduler::pending_reply::present();
+        || super::scheduler::pending_reply::present()
+        || (interrupted_user_frame && super::scheduler::pair::break_requested(logical_index));
     let user_return_reschedule_pending =
         user_return_reschedule_flag(logical_index).load(Ordering::Acquire) != 0;
     // An IRQ-off anonymous fault only raises this lock-free low-water bit.  A
@@ -246,6 +247,96 @@ pub(crate) fn install_interrupt_dispatch_callbacks() {
     crate::lowlevel::interrupts::register_reschedule_ipi_interrupt_dispatch(
         reschedule_ipi_interrupt_dispatch,
     );
+    crate::lowlevel::interrupts::register_direct_ipc_dispatch(
+        direct_ipc_call_dispatch,
+        direct_ipc_reply_dispatch,
+    );
+}
+
+extern "C" fn direct_ipc_call_dispatch(
+    endpoint: u64,
+    reply: u64,
+    receiver_task_id: u64,
+    current_rsp: usize,
+) -> crate::lowlevel::interrupts::DirectSwitchResult {
+    if !scheduler_initialized() {
+        return crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 0,
+        };
+    }
+    let mut lane_scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+    lane_scope.mask_irqs();
+    match super::scheduler::ipc_lane::call(&lane_scope, endpoint, reply, receiver_task_id, current_rsp)
+    {
+        super::scheduler::ipc_lane::Outcome::Switched(next_rsp) => {
+            // SAFETY: IRQs stay masked across `fast_ipc_dispatch_tail` -> `COMMIT_CONTEXT_SWITCH`.
+            lane_scope.retain_irq_mask();
+            drop(lane_scope);
+            crate::lowlevel::interrupts::DirectSwitchResult {
+                value: next_rsp as u64,
+                switched: 1,
+            }
+        }
+        super::scheduler::ipc_lane::Outcome::Generic => crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 2,
+        },
+        super::scheduler::ipc_lane::Outcome::Declined => crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 0,
+        },
+    }
+}
+
+extern "C" fn direct_ipc_reply_dispatch(
+    reply: u64,
+    caller_task_id: u64,
+    context_owner_task_id: u64,
+    context_slot: u64,
+    context_generation: u64,
+    current_rsp: usize,
+) -> crate::lowlevel::interrupts::DirectSwitchResult {
+    if !scheduler_initialized() {
+        return crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 0,
+        };
+    }
+    let scheduling_context = kernel_object::api::identity::ObjectIdentity::new(
+        kernel_object::api::identity::ObjectOwner::Ps,
+        kernel_object::api::identity::ObjectKind::SchedulingContext,
+        context_slot,
+        context_generation,
+    )
+    .expect("fast IPC direct reply carried an invalid scheduling-context identity");
+    let mut lane_scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+    lane_scope.mask_irqs();
+    match super::scheduler::ipc_lane::reply(
+        &lane_scope,
+        reply,
+        caller_task_id,
+        context_owner_task_id,
+        scheduling_context,
+        current_rsp,
+    ) {
+        super::scheduler::ipc_lane::Outcome::Switched(next_rsp) => {
+            lane_scope.retain_irq_mask();
+            drop(lane_scope);
+            crate::lowlevel::interrupts::DirectSwitchResult {
+                value: next_rsp as u64,
+                switched: 1,
+            }
+        }
+        super::scheduler::ipc_lane::Outcome::Generic => crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 2,
+        },
+        super::scheduler::ipc_lane::Outcome::Declined => crate::lowlevel::interrupts::DirectSwitchResult {
+            value: 0,
+            switched: 0,
+        },
+    }
 }
 
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
@@ -254,6 +345,13 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // clockevent, scheduler, PIT, and EOI transaction.
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let logical_index = current_cpu_index();
+    nucleus_core::debug::ipc_tail::record_irq_tail_event(
+        nucleus_core::debug::ipc_tail::IpcTailEventKind::IrqEntry,
+        0,
+        0,
+        logical_index as u64,
+        0,
+    );
     // Test the preemption gate before sleeper callbacks, debug decoration, or
     // even the lock-backed scheduler-initialized snapshot. An interrupt may
     // land in the small interval after a raw lock raised preemption depth but
@@ -688,6 +786,13 @@ extern "C" fn reschedule_ipi_interrupt_dispatch(
 ) -> *mut SavedContext {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let logical_index = current_cpu_index();
+    nucleus_core::debug::ipc_tail::record_irq_tail_event(
+        nucleus_core::debug::ipc_tail::IpcTailEventKind::RescheduleIpi,
+        0,
+        0,
+        logical_index as u64,
+        0,
+    );
     // ORDERING: Acquire observes the target CPU's durable request publication
     // before choosing whether the notification may consume it.
     let request_present = super::reschedule_observation::request_pending(logical_index);
@@ -765,11 +870,17 @@ extern "C" fn software_schedule_interrupt_dispatch(
     // callback returns its selected continuation. Reading caller-saved words
     // does not transfer or mutate stack custody.
     let software_frame = unsafe { &*context_ptr };
+    let fast_call_fallback_generic =
+        software_frame.rax == crate::lowlevel::interrupts::FAST_IPC_CALL_GENERIC_TAG;
+    let fast_reply_fallback_generic =
+        software_frame.rax == crate::lowlevel::interrupts::FAST_IPC_REPLY_GENERIC_TAG;
     let fast_ipc_call = (software_frame.rax
-        == crate::lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG)
+        == crate::lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG
+        || fast_call_fallback_generic)
         .then_some((software_frame.rdi, software_frame.rsi, software_frame.rdx));
     let fast_ipc_reply = (software_frame.rax
-        == crate::lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG)
+        == crate::lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG
+        || fast_reply_fallback_generic)
         .then_some((
             software_frame.rdi,
             software_frame.rsi,
@@ -783,7 +894,9 @@ extern "C" fn software_schedule_interrupt_dispatch(
     // dispatch turn. Declining changes nothing; `Generic` has already committed
     // the caller and woken the receiver, so only the ordinary pick remains.
     let mut lane_generic = false;
-    if let Some((endpoint, reply, receiver_task_id)) = fast_ipc_call {
+    if fast_call_fallback_generic {
+        lane_generic = true;
+    } else if let Some((endpoint, reply, receiver_task_id)) = fast_ipc_call {
         let mut lane_scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
         lane_scope.mask_irqs();
         match super::scheduler::ipc_lane::call(&lane_scope, endpoint, reply, receiver_task_id, current_rsp) {
@@ -799,8 +912,9 @@ extern "C" fn software_schedule_interrupt_dispatch(
             super::scheduler::ipc_lane::Outcome::Declined => {}
         }
     }
-    let mut lane_reply_woke = false;
-    if let Some((reply, caller_task_id, context_owner_task_id, context_slot, context_generation)) =
+    let mut lane_reply_woke = fast_reply_fallback_generic;
+    if !lane_reply_woke
+        && let Some((reply, caller_task_id, context_owner_task_id, context_slot, context_generation)) =
         fast_ipc_reply
     {
         let scheduling_context = kernel_object::api::identity::ObjectIdentity::new(
@@ -1444,4 +1558,183 @@ mod tests {
             RescheduleIpiGate::Dispatch
         );
     }
+}
+
+#[cfg(rustos_ipc_phase_profile)]
+mod diag_switch {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use x86_64::instructions::interrupts;
+
+    const DIAG_SWITCH_ENDPOINT: u64 = 0xB05E_0001_0000_0001;
+    const DIAG_SWITCH_REPLY: u64 = 0xB05E_0002_0000_0001;
+
+    static SERVER_PID: AtomicU64 = AtomicU64::new(0);
+    static SERVER_TID: AtomicU64 = AtomicU64::new(0);
+    static CALLER_TID: AtomicU64 = AtomicU64::new(0);
+    static CALLER_CTX_SLOT: AtomicU64 = AtomicU64::new(0);
+    static CALLER_CTX_GEN: AtomicU64 = AtomicU64::new(1);
+    static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+    // 0 = idle, 1 = pending, 2 = replied
+    static REQ_STATE: AtomicU64 = AtomicU64::new(0);
+    static WORD0: AtomicU64 = AtomicU64::new(0);
+    static WORD1: AtomicU64 = AtomicU64::new(0);
+
+    pub fn server_loop() -> i64 {
+        let Some((pid, tid)) = super::super::current::current_user_log_ids() else {
+            return -22;
+        };
+        if pid == 0 || tid == 0 {
+            return -22;
+        }
+        REQ_STATE.store(0, Ordering::Release);
+        CALLER_TID.store(0, Ordering::Release);
+        STOP_FLAG.store(false, Ordering::Release);
+        SERVER_TID.store(tid, Ordering::Release);
+        SERVER_PID.store(pid, Ordering::Release);
+
+        loop {
+            if STOP_FLAG.load(Ordering::Acquire) {
+                break;
+            }
+            if REQ_STATE.load(Ordering::Acquire) == 1 {
+                let cid = CALLER_TID.load(Ordering::Acquire);
+                let w0 = WORD0.load(Ordering::Relaxed);
+                let w1 = WORD1.load(Ordering::Relaxed);
+                WORD0.store(w0, Ordering::Relaxed);
+                WORD1.store(w1, Ordering::Relaxed);
+                REQ_STATE.store(2, Ordering::Release);
+
+                if cid != 0 && super::super::arm_block_current_task_on_endpoint(DIAG_SWITCH_ENDPOINT) {
+                    let ctx_slot = CALLER_CTX_SLOT.load(Ordering::Acquire);
+                    let ctx_gen = CALLER_CTX_GEN.load(Ordering::Acquire);
+                    interrupts::without_interrupts(|| {
+                        // SAFETY: masked CurrentWait on current CPU; fallback wakes caller before schedule.
+                        let committed = unsafe { super::super::scheduler::commit_current_wait() };
+                        if committed == Some(true) {
+                            crate::lowlevel::interrupts::trigger_fast_ipc_reply_schedule(
+                                DIAG_SWITCH_REPLY,
+                                cid,
+                                cid,
+                                ctx_slot,
+                                ctx_gen,
+                            );
+                            if !STOP_FLAG.load(Ordering::Acquire)
+                                && REQ_STATE.load(Ordering::Acquire) == 2
+                            {
+                                let _ = super::super::scheduler::wake_publication::wake_task(cid);
+                                crate::lowlevel::interrupts::trigger_software_schedule();
+                            }
+                        }
+                    });
+                    continue;
+                }
+            }
+
+            if !super::super::arm_block_current_task_on_endpoint(DIAG_SWITCH_ENDPOINT) {
+                break;
+            }
+            let _ = super::commit_block_current_task_and_yield();
+        }
+
+        let cid = CALLER_TID.swap(0, Ordering::AcqRel);
+        if cid != 0 {
+            let _ = super::super::scheduler::wake_publication::wake_task(cid);
+        }
+        SERVER_PID.store(0, Ordering::Release);
+        SERVER_TID.store(0, Ordering::Release);
+        STOP_FLAG.store(false, Ordering::Release);
+        REQ_STATE.store(0, Ordering::Release);
+        0
+    }
+
+    pub fn call_once(w0: u64, w1: u64) -> (i64, u64, u64) {
+        let Some((pid, tid)) = super::super::current::current_user_log_ids() else {
+            return (-1, 0, 0);
+        };
+        let s_pid = SERVER_PID.load(Ordering::Acquire);
+        let s_tid = SERVER_TID.load(Ordering::Acquire);
+        if pid == 0 || s_pid == 0 || s_tid == 0 || pid != s_pid || tid == s_tid {
+            return (-1, 0, 0);
+        }
+        let Some(c_ident) = interrupts::without_interrupts(|| {
+            let slot = super::super::cpu_local::current_cpu_task_slot()?;
+            super::super::scheduler::diag_scheduling_context_identity(slot, tid)
+        }) else {
+            return (-22, 0, 0);
+        };
+
+        CALLER_CTX_SLOT.store(c_ident.slot(), Ordering::Release);
+        CALLER_CTX_GEN.store(c_ident.generation(), Ordering::Release);
+        CALLER_TID.store(tid, Ordering::Release);
+        WORD0.store(w0, Ordering::Relaxed);
+        WORD1.store(w1, Ordering::Relaxed);
+        REQ_STATE.store(1, Ordering::Release);
+
+        if !super::super::arm_block_current_task_on_reply(DIAG_SWITCH_REPLY) {
+            REQ_STATE.store(0, Ordering::Release);
+            return (-22, 0, 0);
+        }
+        let handoff = super::commit_fast_ipc_call_handoff_and_yield(
+            DIAG_SWITCH_ENDPOINT,
+            DIAG_SWITCH_REPLY,
+            s_tid,
+        );
+        if !matches!(
+            handoff,
+            super::super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
+                | super::super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu
+        ) {
+            let _ = super::super::cancel_block_current_task();
+            let _ = super::super::scheduler::wake_publication::wake_task(s_tid);
+            while REQ_STATE.load(Ordering::Acquire) == 1 && !STOP_FLAG.load(Ordering::Acquire) {
+                if !super::super::arm_block_current_task_on_reply(DIAG_SWITCH_REPLY) {
+                    break;
+                }
+                if REQ_STATE.load(Ordering::Acquire) != 1 || STOP_FLAG.load(Ordering::Acquire) {
+                    let _ = super::super::cancel_block_current_task();
+                    break;
+                }
+                let _ = super::commit_block_current_task_and_yield();
+            }
+        }
+
+        if REQ_STATE.load(Ordering::Acquire) != 2 {
+            REQ_STATE.store(0, Ordering::Release);
+            return (-4, 0, 0);
+        }
+        let out0 = WORD0.load(Ordering::Relaxed);
+        let out1 = WORD1.load(Ordering::Relaxed);
+        REQ_STATE.store(0, Ordering::Release);
+        (16, out0, out1)
+    }
+
+    pub fn stop() -> i64 {
+        let Some((pid, _)) = super::super::current::current_user_log_ids() else {
+            return -1;
+        };
+        if pid == 0 || pid != SERVER_PID.load(Ordering::Acquire) {
+            return -1;
+        }
+        STOP_FLAG.store(true, Ordering::Release);
+        let s_tid = SERVER_TID.load(Ordering::Acquire);
+        if s_tid != 0 {
+            let _ = super::super::scheduler::wake_publication::wake_task(s_tid);
+        }
+        0
+    }
+}
+
+#[cfg(rustos_ipc_phase_profile)]
+pub fn diag_switch_server_loop() -> i64 {
+    diag_switch::server_loop()
+}
+
+#[cfg(rustos_ipc_phase_profile)]
+pub fn diag_switch_call_once(w0: u64, w1: u64) -> (i64, u64, u64) {
+    diag_switch::call_once(w0, w1)
+}
+
+#[cfg(rustos_ipc_phase_profile)]
+pub fn diag_switch_stop() -> i64 {
+    diag_switch::stop()
 }

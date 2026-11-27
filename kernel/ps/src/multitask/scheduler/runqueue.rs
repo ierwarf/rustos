@@ -762,6 +762,7 @@ pub(super) fn reset_before_publication() {
     affinity_payload::reset_before_publication();
     wait::reset_before_publication();
     weight::reset_before_publication();
+    super::pair::reset_before_publication();
     RUNNING_IDLE_CPU_MASK.store(0, Ordering::Release);
     NONEMPTY_RQ_CPU_MASK.store(0, Ordering::Release);
     MAILBOX_PENDING_CPU_MASK.store(0, Ordering::Release);
@@ -1010,6 +1011,73 @@ pub(super) fn wake_wait(slot: usize) {
 
 pub(super) fn wait_blocked(owner: RunOwnerSnapshot) -> bool {
     owner.state == RunOwnerState::Blocked || (!owner.runnable && owner.state.holds_run_custody())
+}
+
+#[cfg(test)]
+pub(in crate::multitask::scheduler) fn pair_claim(
+    slot: usize,
+    expected: RunOwnerSnapshot,
+    cpu: usize,
+) -> Result<RunOwnerSnapshot, RunOwnerSnapshot> {
+    validate_cpu(cpu);
+    let committed = transition(slot, expected, OwnerEvent::PairClaim, Some(cpu))?;
+    Ok(committed.settled())
+}
+
+pub(in crate::multitask::scheduler) fn pair_park(
+    slot: usize,
+    expected: RunOwnerSnapshot,
+    cpu: usize,
+) -> Result<RunOwnerSnapshot, RunOwnerSnapshot> {
+    validate_cpu(cpu);
+    let committed = transition(slot, expected, OwnerEvent::PairPark, Some(cpu))?;
+    Ok(committed.settled())
+}
+
+pub(in crate::multitask::scheduler) fn pair_resume(
+    slot: usize,
+    expected: RunOwnerSnapshot,
+    cpu: usize,
+) -> Result<RunOwnerSnapshot, RunOwnerSnapshot> {
+    validate_cpu(cpu);
+    let committed = transition(slot, expected, OwnerEvent::PairResume, Some(cpu))?;
+    Ok(committed.settled())
+}
+
+pub(in crate::multitask::scheduler) fn pair_break_blocked(
+    slot: usize,
+    expected: RunOwnerSnapshot,
+) -> Result<RunOwnerSnapshot, RunOwnerSnapshot> {
+    let committed = transition(slot, expected, OwnerEvent::PairBreakBlocked, None)?;
+    Ok(committed.settled())
+}
+
+pub(in crate::multitask::scheduler) fn pair_break_local(
+    slot: usize,
+    cpu: usize,
+    weight: u32,
+) -> Option<RunOwnerSnapshot> {
+    validate_cpu(cpu);
+    let mut rq = RUN_QUEUES[cpu].inner.lock();
+    loop {
+        let expected = owner(slot);
+        if expected.state != RunOwnerState::Paired || expected.cpu != Some(cpu) {
+            return None;
+        }
+        rq.insert(slot, weight);
+        match transition(slot, expected, OwnerEvent::PairBreakLocal, Some(cpu)) {
+            Ok(committed) => {
+                let next = committed.next;
+                committed.into_duty().run_queue_inserted(&rq);
+                frame_publication::bind_local_owner_generation(slot, next.generation);
+                RUN_QUEUES[cpu].publish_load(&mut rq);
+                return Some(next);
+            }
+            Err(_) => {
+                rq.remove(slot, weight);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1294,7 +1362,7 @@ pub(super) fn retire(slot: usize, weight: u32) {
 
 /// Result of a withdrawal that may have to wait for a dispatch claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RetireOutcome {
+pub(in crate::multitask::scheduler) enum RetireOutcome {
     /// The owner word is `Retired` (it already was, or this call retired it).
     Retired,
     /// Another CPU has claimed the slot (`Running`) but has not yet published
@@ -1309,7 +1377,10 @@ pub(super) enum RetireOutcome {
 /// owner word and the CAS is against that exact value, so a claim that wins the
 /// race changes the word, fails this CAS, and is seen as in flight on the next
 /// iteration. A check made before calling could not give that guarantee.
-pub(super) fn retire_unless_claim_in_flight(slot: usize, weight: u32) -> RetireOutcome {
+pub(in crate::multitask::scheduler) fn retire_unless_claim_in_flight(
+    slot: usize,
+    weight: u32,
+) -> RetireOutcome {
     retire_slot(slot, weight, true)
 }
 
@@ -1372,6 +1443,14 @@ fn retire_slot(slot: usize, weight: u32, wait_for_claim: bool) -> RetireOutcome 
                 crate::multitask::cpu_local::task_execution_owner(slot).is_some(),
             )
         {
+            return RetireOutcome::ClaimInFlight;
+        }
+        if wait_for_claim && owner.state == RunOwnerState::Paired {
+            if let Some(cpu) = owner.cpu {
+                super::pair::request_break_for_retire(cpu, slot, owner.generation);
+                #[cfg(not(test))]
+                crate::multitask::irq::request_target_reschedule(cpu);
+            }
             return RetireOutcome::ClaimInFlight;
         }
         let Ok(withdrawn) = transition(slot, owner, OwnerEvent::Withdraw, None) else {

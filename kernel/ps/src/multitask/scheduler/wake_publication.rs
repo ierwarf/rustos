@@ -62,6 +62,13 @@ pub(in crate::multitask) fn wake_task(task_id: u64) -> bool {
     let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
     preemption.mask_irqs();
     let result = wake(&preemption, task_id, &runqueue_policy::online_affinity_mask);
+    nucleus_core::debug::ipc_tail::record_task_tail_event(
+        nucleus_core::debug::ipc_tail::IpcTailEventKind::WakeTarget,
+        u8::from(result),
+        task_id as u32,
+        task_id,
+        u64::from(result),
+    );
     if !result {
         // Refused while the target still waits: keep that exact wait for a
         // retry at this CPU's next scheduler entry instead of losing it.
@@ -540,6 +547,14 @@ unsafe fn retained_wake_admitted(
             return Ok(binding);
         }
         None => {}
+    }
+    if owner.state == runqueue::RunOwnerState::Paired {
+        if let Some(pair_cpu) = owner.cpu {
+            super::pair::request_break_with_wake(pair_cpu, slot, owner.generation);
+            #[cfg(not(test))]
+            crate::multitask::irq::request_target_reschedule(pair_cpu);
+        }
+        return Err(false);
     }
     let Some(token) = frame_publication::observed_frame_token(slot, cpu, false) else {
         return Err(false);

@@ -781,7 +781,7 @@ for witness in \
     'ipc_reply_recv_shape_valid(&args)' \
     'authorize_endpoint_receiver_for_process(' \
     'with_retained_user_access(' \
-    'complete_endpoint_reply_for_process_with_custody(' \
+    'complete_endpoint_reply_payload_for_process_with_custody(' \
     'recv_with_sender_blocking_prepared_after_fast_reply(' \
     'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
     rg -Fq "$witness" "$reply_recv_kernel" || {
@@ -789,7 +789,7 @@ for witness in \
         exit 1
     }
 done
-rg -Uq 'authorize_endpoint_receiver_for_process\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,3600}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
+rg -Uq 'authorize_endpoint_receiver_for_process\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,3600}complete_endpoint_reply_payload_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
     "$reply_recv_kernel" \
     && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared_after_fast_reply\(' \
     "$reply_recv_kernel" || {

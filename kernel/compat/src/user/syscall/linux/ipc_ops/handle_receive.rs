@@ -219,7 +219,7 @@ mod tests {
         assert!(fused.find("user.validate_write(handles.count_ptr").unwrap()
             < fused.find("complete_fast_reply_for_task(").unwrap());
         assert!(fused.find("user.validate_write(handles.fds_ptr").unwrap()
-            < fused.find("complete_endpoint_reply_for_process_with_custody(").unwrap());
+            < fused.find("complete_endpoint_reply_payload_for_process_with_custody(").unwrap());
         assert!(fused.contains("ReceiveDestination::UserWithHandles"));
         assert!(fused.contains("fast_reply::DeferredFastReply::new(completed_reply, completion)"));
     }

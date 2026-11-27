@@ -3,6 +3,7 @@ mod compact_return_tests;
 mod receiver_waiter_tests;
 mod receive_transaction_tests;
 mod reply_publication_tests;
+mod virtual_rendezvous_tests;
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -24,6 +25,7 @@ fn with_isolated_ipc_test(f: impl FnOnce()) {
     super::ENDPOINT_QUOTAS.lock().clear();
     super::ENDPOINT_MESSAGES.clear();
     super::REPLIES.clear();
+    super::virtual_rendezvous::clear_all();
     super::SHARED_REGIONS.clear();
     super::SHARED_REGION_RECLAIMS.lock().clear();
     super::SHARED_REGION_ADMITTED.store(0, Ordering::Release);
@@ -37,6 +39,7 @@ fn with_isolated_ipc_test(f: impl FnOnce()) {
     super::ENDPOINT_QUOTAS.lock().clear();
     super::ENDPOINT_MESSAGES.clear();
     super::REPLIES.clear();
+    super::virtual_rendezvous::clear_all();
     super::SHARED_REGIONS.clear();
     super::SHARED_REGION_RECLAIMS.lock().clear();
     super::SHARED_REGION_ADMITTED.store(0, Ordering::Release);

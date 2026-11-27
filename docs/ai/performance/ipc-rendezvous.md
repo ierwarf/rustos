@@ -10,7 +10,120 @@ convergence are implemented separately in [IPC lane](ipc-lane.md). This draft's
 **objectless virtual reply and paired-custody mechanisms remain unimplemented**;
 its cost estimates are historical projections, not current measured latency.
 
-## What the measurements say
+## Implementation plan and cycle budget — 2026-11-27
+
+**Planned, not implemented.** The [L1–L3 implementation and acceptance
+plan](ipc-l1-l3-plan.md) specifies the implementation order, disassembly
+anchors and recovery boundaries. The companion [queued and tail plan](ipc-queued-tail-plan.md)
+covers the general transport and worst-latency work. There is no fixed tick gate. This section
+supersedes the historical draft below where its admission, reply identity,
+or cycle budget differs. Start
+from the `f9a70967` isolated 16-byte
+register IPC echo on 1-vCPU KVM: host idle, 2,000 warmups, 20,000 round
+trips, p50 **5,600 guest invariant-TSC ticks**, p99 **8,640**; CPUID p50
+**3,760** (not subtracted). The call-to-receive and reply-to-return p50s
+are 2,920 and 2,600, respectively. They are separate distributions.
+The evidence is `build/ipc-slowpath-baseline/register-kvm-0-samples.log`.
+
+### L1 — objectless register rendezvous, existing scheduler ownership
+
+1. **Define admission and one source of truth.** Start with a 1–16 byte
+   register CALL and matching `REGISTER_REPLY_RECV`, exact endpoint
+   incarnation, same CPU/address space, no older eligible queued sender,
+   an already parked receiver, and ordinary own-funded execution. Retain
+   the current scheduler's priority, affinity, placement, timing and
+   revocation policy. Keep one sequence-bound receipt in the parked call
+   record. The virtual reply must identify the exact call and receiving
+   task, not just the caller's slot or task generation (which can survive
+   multiple requests). Keep a sealed discriminator disjoint from ordinary
+   reply handles. The scheduler owns the cell; IPC runtime arbitrates
+   endpoint order; compat marshals register results. Keep the user ABI.
+2. **Use one claim for both paths.** In `ipc_lane.rs` / `resident.rs`,
+   integrate a shared fast/ordinary claim for the parked receiver. Validate
+   authorization, queue order and both participants' current generations
+   before delivering. Publish the two words and the virtual reply in the
+   server's saved register frame and use the existing lane switch. Fused
+   reply atomically consumes the exact outstanding call, writes the reply
+   words to the caller, and arms receive. Do not enqueue or allocate a reply
+   object on the normal case; keep the existing lazy funding semantics and
+   put the required accounting custody in the call record, not in an
+   unaccounted caller/server interval.
+3. **Specify escape before admitting work.** Before claim, fall back without
+   IPC side effects. After claim, normal dispatch must complete the *same*
+   request, never replay it. Exit/revoke/timeout must be able to terminate
+   the virtual call without allocating. For operations that need a real
+   reply object (mixed ABI, remote or nested use), publish it at most once
+   from the recorded custody. Provide reserved capacity where completion
+   is mandatory, or decline entry if that recovery cannot be guaranteed.
+   Test late/duplicate replies, same-task new-call reuse, FIFO vs fast claim,
+   fallback once-only, OOM/timeout/exit/revoke, and donation accounting.
+
+### L2 — one CPU-owned pair for both handoffs
+
+1. **Model ownership before changing dispatch.** Add a `Paired` custody
+   representation to `RunOwnerWord`, with both task generations referring
+   to one bounded per-CPU pair record. Only that CPU selects and publishes
+   the active member. Other CPUs either see an ordinary owner or the pair
+   record, not two independent runnable owners. Define entry, paired
+   switch, break request and dissolution; model the intermediate claims of
+   both owner words, stale notifications, rollback before publication and
+   ABA on slot/pair reuse. Initially bound pairing to a single RPC (at most
+   two handoffs), same address space and no nesting.
+2. **Move repeated work out of the pair.** On admission, pin both exact
+   frame/architecture images and reserve execution and placement custody.
+   During each handoff, publish the departing frame and active member in
+   one ordered switch transaction. Retain the actual RSP, TSS/syscall
+   stack, FS/GS, SIMD/return-sanitization and accounting work that the
+   architecture requires. Do not re-pin or repeat the generic
+   resident-park/take/bank handoff when the pair already owns those
+   resources. Account for *both* pair setup and teardown in the measured
+   round trip; don't claim steady-state savings by timing only its middle.
+3. **Break through a single owner.** Wake/cancel, revoke, signal, preemption,
+   priority/affinity change, migration and retirement request a break via
+   the exact pair generation. The owner CPU publishes each task's ordinary
+   custody once, transfers pending work once and retains its resources
+   until the switch acknowledgement. No remote task operation may mutate
+   the old owner word behind the pair. Higher-priority execution, expired
+   budget/deadline, or outstanding migration wins over the shortcut. Audit
+   every owner-word reader and writer (including async return/IRQ paths)
+   before enabling; start opt-in on 1 vCPU, then exercise remote-event races
+   on SMP. Cross-address-space admission and any reuse across multiple RPCs
+   are follow-ups, not requirements for the first pair implementation.
+
+### Projected p50 (same workload, idle host; not acceptance evidence)
+
+| Scenario | Net L1 saving from 5,600 | Additional net L2 saving after L1 | L1 result | L1 + L2 result |
+|---|---:|---:|---:|---:|
+| Conservative | 200 | 900 | 5,400 | 4,500 |
+| Planning estimate | 400 | 1,300 | 5,200 | 3,900 |
+| Favorable | 600 | 1,500 | 5,000 | 3,500 |
+
+L1 is based on the later ~240-tick reply-slot removal sensitivity check plus
+possible queue/fixed-work savings, minus new receipt checks. Do **not** reuse
+all of the original 800–1,000 tick L1 projection: the shipped P8 path already
+removed the common ledger-lock cost. L2 uses the older ~2,900-tick stamped
+budget for both lane switches only as an upper bound for budgeting: count
+roughly 35–60% as removable repeated custody work, then budget roughly
+100–250 ticks for pair setup, teardown and guards. Architecture work stays,
+and any cost already counted in L1 is excluded. The ranges are scenarios,
+not confidence intervals or guarantees. In particular, no p99 or seL4
+parity is predicted.
+
+Gate L1 and L2 independently: freeze same-host A/B/A/B images, keep the
+existing verified echo/STOP/join workload and CPUID anchor within 3%, retain
+all samples, and publish p50/p99/mean/max plus fast-path admission/refusals.
+Use separate diagnostic builds for leg/custody attribution. Require a
+repeatable win beyond measurement noise with no reproducible p99 or
+fallback regression before enabling. These estimates do not set thresholds.
+Run 1 and 8 vCPU cohorts independently, at idle and under host pressure;
+include mixed queued traffic and correctness scenarios as separate tests,
+not as filtered-away samples. Validate L1 against the existing IPC
+abstraction and L2 against scheduler ownership and asynchronous return;
+add registered models, native and mutation witnesses, and KVM validation
+before the affected path ships. Compare with seL4 only for matched round-trip
+workloads on the same hardware, separating shared and separate address spaces.
+
+## What the measurements say (historical draft)
 
 Same-session A/B, 1 vCPU `ipc_rt_intra_process_register_reply_recv`, p50, anchor 3.5-3.7k.
 Start of the series 7.38k; stage 1 package 6.27k.

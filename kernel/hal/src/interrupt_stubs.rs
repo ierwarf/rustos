@@ -440,14 +440,13 @@ global_asm!(
     .size fast_ipc_dispatch_tail, . - fast_ipc_dispatch_tail
 
     // Direct form of `fast_ipc_call_schedule_trap`: the register-IPC syscall
-    // body asks the lane to switch without `int`-style register saving. A
-    // minimal kernel SavedContext is built on the current stack ONLY to give
-    // the unchanged handler its argument words and to be published as this
-    // task's continuation; that continuation resumes at `resume` with
-    // RSP = `frame` (the syscall frame at the top of this kernel stack), so the
-    // Rust frames below it are abandoned by design. If the handler declines
-    // (returns the same context) this returns to the caller with the stamped
-    // outcome, exactly like the trap form.
+    // body asks the lane to switch without `int`-style register saving or
+    // zeroing the generic 54-word SavedContext prefix on the direct fast path.
+    // Only the 7-qword resume/IRET suffix `[r12 + 0x178..0x1b0]` is initialized
+    // before invoking the typed `direct_ipc_call_dispatch` boundary. If the lane
+    // switches, `rax` holds `next_rsp` (`rdx == 1`) and transfers straight to
+    // `fast_ipc_dispatch_tail`; only rare declines/generic fallbacks clear the
+    // remaining 47 prefix qwords and enter `software_schedule_interrupt_dispatch`.
     //
     // rdi = endpoint, rsi = reply, rdx = receiver task id,
     // rcx = &DirectResume (resume_rip, frame).
@@ -469,21 +468,6 @@ global_asm!(
         sub rsp, 0x1b0
         and rsp, -16
         mov r12, rsp
-        // The Rust dispatcher forms &SavedContext and eagerly reads both IPC
-        // argument tuples. Every field must be initialized, even on decline.
-        cld
-        xor eax, eax
-        mov ecx, 0x36
-        mov rdi, r12
-        rep stosq
-        mov rdi, [rbp - 24]
-        mov rsi, [rbp - 32]
-        mov rdx, [rbp - 40]
-        movabs rax, {fast_ipc_call_schedule_tag}
-        mov [r12 + 0x00], rax
-        mov [r12 + 0x18], rdx
-        mov [r12 + 0x20], rsi
-        mov [r12 + 0x28], rdi
         mov qword ptr [r12 + 0x178], 1
         mov qword ptr [r12 + 0x180], 0
         mov [r12 + 0x188], r10
@@ -495,10 +479,32 @@ global_asm!(
         mov [r12 + 0x1a8], rax
         cli
         cld
+        mov rcx, r12
+        call direct_ipc_call_dispatch
+        cmp rdx, 1
+        jne 23f
+        jmp fast_ipc_dispatch_tail
+23:
+        mov r13, rdx
+        xor eax, eax
+        mov ecx, 0x2f
+        mov rdi, r12
+        rep stosq
+        mov rdi, [rbp - 24]
+        mov rsi, [rbp - 32]
+        mov rdx, [rbp - 40]
+        movabs rax, {fast_ipc_call_schedule_tag}
+        movabs rcx, {fast_ipc_call_generic_tag}
+        cmp r13, 2
+        cmove rax, rcx
+        mov [r12 + 0x00], rax
+        mov [r12 + 0x18], rdx
+        mov [r12 + 0x20], rsi
+        mov [r12 + 0x28], rdi
         mov rdi, r12
         call software_schedule_interrupt_dispatch
         cmp rax, r12
-        jne 23f
+        jne 25f
         mov rsp, rax
         COMMIT_CONTEXT_SWITCH
         mov rax, [rsp + 0x00]
@@ -507,7 +513,7 @@ global_asm!(
         pop r12
         pop rbp
         ret
-23:
+25:
         jmp fast_ipc_dispatch_tail
     .size fast_ipc_call_direct_schedule, . - fast_ipc_call_direct_schedule
 
@@ -570,23 +576,6 @@ global_asm!(
         sub rsp, 0x1b0
         and rsp, -16
         mov r12, rsp
-        cld
-        xor eax, eax
-        mov ecx, 0x36
-        mov rdi, r12
-        rep stosq
-        mov rdi, [rbp - 24]
-        mov rsi, [rbp - 32]
-        mov rdx, [rbp - 40]
-        mov rcx, [rbp - 48]
-        mov r8, [rbp - 56]
-        movabs rax, {fast_ipc_reply_schedule_tag}
-        mov [r12 + 0x00], rax
-        mov [r12 + 0x10], rcx
-        mov [r12 + 0x18], rdx
-        mov [r12 + 0x20], rsi
-        mov [r12 + 0x28], rdi
-        mov [r12 + 0x38], r8
         mov qword ptr [r12 + 0x178], 1
         mov qword ptr [r12 + 0x180], 0
         mov [r12 + 0x188], r10
@@ -598,10 +587,36 @@ global_asm!(
         mov [r12 + 0x1a8], rax
         cli
         cld
+        mov r9, r12
+        call direct_ipc_reply_dispatch
+        cmp rdx, 1
+        jne 24f
+        jmp fast_ipc_dispatch_tail
+24:
+        mov r13, rdx
+        xor eax, eax
+        mov ecx, 0x2f
+        mov rdi, r12
+        rep stosq
+        mov rdi, [rbp - 24]
+        mov rsi, [rbp - 32]
+        mov rdx, [rbp - 40]
+        mov rcx, [rbp - 48]
+        mov r8, [rbp - 56]
+        movabs rax, {fast_ipc_reply_schedule_tag}
+        movabs r9, {fast_ipc_reply_generic_tag}
+        cmp r13, 2
+        cmove rax, r9
+        mov [r12 + 0x00], rax
+        mov [r12 + 0x10], rcx
+        mov [r12 + 0x18], rdx
+        mov [r12 + 0x20], rsi
+        mov [r12 + 0x28], rdi
+        mov [r12 + 0x38], r8
         mov rdi, r12
         call software_schedule_interrupt_dispatch
         cmp rax, r12
-        jne 24f
+        jne 26f
         mov rsp, rax
         COMMIT_CONTEXT_SWITCH
         lea rsp, [rbp - 16]
@@ -609,12 +624,14 @@ global_asm!(
         pop r12
         pop rbp
         ret
-24:
+26:
         jmp fast_ipc_dispatch_tail
     .size fast_ipc_reply_direct_schedule, . - fast_ipc_reply_direct_schedule
 "#,
     fast_ipc_call_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG,
+    fast_ipc_call_generic_tag = const kernel_lowlevel::interrupts::FAST_IPC_CALL_GENERIC_TAG,
     fast_ipc_reply_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG,
+    fast_ipc_reply_generic_tag = const kernel_lowlevel::interrupts::FAST_IPC_REPLY_GENERIC_TAG,
 );
 
 #[cfg(test)]
@@ -643,24 +660,32 @@ mod tests {
     }
 
     #[test]
-    fn direct_fast_ipc_schedule_initializes_the_complete_context_before_dispatch() {
+    fn direct_fast_ipc_schedule_uses_typed_dispatch_and_skips_full_zero_on_hit() {
         let source = include_str!("interrupt_stubs.rs");
-        for leaf in ["fast_ipc_call_direct_schedule", "fast_ipc_reply_direct_schedule"] {
+        for (leaf, disp) in [
+            ("fast_ipc_call_direct_schedule", "call direct_ipc_call_dispatch"),
+            ("fast_ipc_reply_direct_schedule", "call direct_ipc_reply_dispatch"),
+        ] {
             let body = source
                 .split(alloc::format!("{leaf}:").as_str())
                 .nth(1)
                 .and_then(|rest| rest.split(alloc::format!(".size {leaf}").as_str()).next())
                 .expect("direct schedule leaf");
             assert!(!body.contains("SAVE_CONTEXT"), "{leaf} must not save a full interrupt image");
-            assert!(body.contains("call software_schedule_interrupt_dispatch"));
-            assert!(body.contains("mov ecx, 0x36"));
-            assert!(body.find("rep stosq").unwrap() < body.find("call software_schedule_interrupt_dispatch").unwrap());
-            // Kernel-origin marker words, the resume RIP and the frame as RSP.
-            assert!(body.contains("mov qword ptr [r12 + 0x178], 1"));
-            assert!(body.contains("mov qword ptr [r12 + 0x180], 0"));
-            assert!(body.contains("mov [r12 + 0x188], r10"));
-            assert!(body.contains("mov [r12 + 0x1a0], r11"));
-            // A declined handoff returns to the Rust caller on its own stack.
+            let typed = body.find(disp).expect("typed direct dispatch");
+            let fallback_zero = body.find("rep stosq").expect("fallback zero");
+            let fallback_sw = body
+                .find("call software_schedule_interrupt_dispatch")
+                .expect("fallback scheduler dispatch");
+            assert!(typed < fallback_zero && fallback_zero < fallback_sw);
+            assert!(!body.contains("mov ecx, 0x36"));
+            // Kernel-origin marker words, the resume RIP and the frame as RSP precede dispatch.
+            let m0 = body.find("mov qword ptr [r12 + 0x178], 1").unwrap();
+            let m1 = body.find("mov qword ptr [r12 + 0x180], 0").unwrap();
+            let m2 = body.find("mov [r12 + 0x188], r10").unwrap();
+            let m3 = body.find("mov [r12 + 0x1a0], r11").unwrap();
+            assert!(m0 < typed && m1 < typed && m2 < typed && m3 < typed);
+            // Fast hit jumps straight to fast_ipc_dispatch_tail; decline returns on stack.
             assert!(body.contains("pop rbp\n        ret"));
             assert!(body.contains("jmp fast_ipc_dispatch_tail"));
         }

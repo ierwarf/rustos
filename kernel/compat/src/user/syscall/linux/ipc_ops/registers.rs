@@ -181,12 +181,14 @@ pub(super) fn dispatch_with(frame: &mut SyscallFrame, entry: Option<EntryIdentit
 fn call(
     frame: &mut SyscallFrame, raw: u64, request: &[u8], entry: Option<EntryIdentity>,
 ) -> Result<u64, i64> {
+    let auth_mark = phase_mark();
     let (task_id, identity) = entry_or_current(entry)?;
     let service = authorize_ipc_call_for_process(raw, identity.process_id())?;
     let endpoint = KernelEndpointHandle::from_raw(raw);
     let deadline = service_reply_deadline_tick_for_authorized_service(
         service, request, SERVICE_IPC_TIMEOUT_MS,
     );
+    let _ = charge_phase(IpcCallPhase::FastAuthority, auth_mark);
     if let Some(response) = try_fast_ipc_call_bytes::<IPC_REGISTER_BYTES>(
         endpoint,
         identity.process_id(),
@@ -243,31 +245,52 @@ pub(in crate::user::syscall) fn complete_parked_register_ipc(
 }
 
 fn complete_parked_call(frame: &mut SyscallFrame, record: &crate::user::syscall::ParkRecord) -> u64 {
+    let resume_mark = phase_mark();
     let task_id = multitask::current_task_id().expect("parked register call lost its task");
     let reply = KernelReplyHandle::from_raw(record.reply);
     disarm_reply_deadline_waiter(task_id);
+    nucleus_core::debug::ipc_tail::record_task_tail_event(
+        nucleus_core::debug::ipc_tail::IpcTailEventKind::WaitResume,
+        record.kind as u8,
+        task_id as u32,
+        record.endpoint,
+        record.reply,
+    );
     let transport = if record.kind == crate::user::syscall::park_kind::CALL_QUEUED {
         InlineReplyTransport::Queued
     } else {
         note_fast_ipc(IpcFastCounter::HandoffCommitted);
         InlineReplyTransport::Rendezvous
     };
-    collect_inline_reply::<IPC_REGISTER_BYTES>(
-        reply,
-        task_id,
-        record.deadline_tick,
-        IPC_REGISTER_BYTES,
-        phase_mark(),
-        transport,
-        Some(core::ptr::from_mut(frame)),
-    )
-    .and_then(|response| {
-        write_register_result(frame, response.data(), 0, 0, 0).map(|len| len as u64)
-    })
-    .unwrap_or_else(linux_errno)
+    let take_mark = phase_mark();
+    let result = match take_inline_reply::<IPC_REGISTER_BYTES>(
+        reply, task_id, IPC_REGISTER_BYTES, transport,
+    ) {
+        Ok(Some(response)) => {
+            let _ = charge_phase(IpcCallPhase::FastTake, take_mark);
+            write_register_result(frame, response.data(), 0, 0, 0).map(|len| len as u64)
+        }
+        Ok(None) => collect_inline_reply::<IPC_REGISTER_BYTES>(
+            reply,
+            task_id,
+            record.deadline_tick,
+            IPC_REGISTER_BYTES,
+            take_mark,
+            transport,
+            Some(core::ptr::from_mut(frame)),
+        )
+        .and_then(|response| {
+            write_register_result(frame, response.data(), 0, 0, 0).map(|len| len as u64)
+        }),
+        Err(errno) => Err(errno),
+    };
+    let out = result.unwrap_or_else(linux_errno);
+    let _ = charge_phase(IpcCallPhase::FastResumeReturn, resume_mark);
+    out
 }
 
 fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall::ParkRecord) -> u64 {
+    let take_mark = server_phase_mark();
     let task_id = multitask::current_task_id().expect("parked register receive lost its task");
     let endpoint = KernelEndpointHandle::from_raw(record.endpoint);
     let error = |errno| {
@@ -284,10 +307,12 @@ fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall:
     >(endpoint, task_id, IPC_REGISTER_BYTES)
     {
         note_fast_ipc(IpcFastCounter::ReceiverTaken);
-        return match (ReceiveDestination::Registers(frame)).write_fast(received) {
+        let out = match (ReceiveDestination::Registers(frame)).write_fast(received) {
             Ok(len) => len as u64,
             Err(errno) => error(errno),
         };
+        let _ = charge_server_phase(IpcServerPhase::RegisterRecvTake, take_mark);
+        return out;
     }
     // Anything else (a wake that carried no request) takes the full receive.
     match recv_with_sender_blocking_prepared_inner::<IPC_REGISTER_BYTES>(
@@ -345,10 +370,12 @@ fn reply_receive(
     )
     .map_err(ipc_error_to_linux_errno)?;
     let handle = KernelReplyHandle::from_raw(reply);
+    let reply_mark = server_phase_mark();
     let deferred = match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
         handle, task_id, response,
     ) {
         Ok(published) => {
+            let _ = charge_server_phase(IpcServerPhase::RegisterReplyPublish, reply_mark);
             let deferred = fast_reply::DeferredFastReply::new(reply, published.completion);
             if let Some(error) = published.terminal_error {
                 drop(deferred);

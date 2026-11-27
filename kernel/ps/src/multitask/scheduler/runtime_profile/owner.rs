@@ -344,7 +344,9 @@ fn lane_fold(cpu: usize, pending: &mut LanePending) {
                 row.runtime_profile_dispatches[entry.slot] =
                     row.runtime_profile_dispatches[entry.slot].saturating_add(entry.dispatches);
             }
-            row.account(entry.slot, entry.ns);
+            if entry.slot < row.runtime_profile_ns.len() {
+                row.account(entry.slot, entry.ns);
+            }
         }
         row.runtime_profile_task_switches =
             row.runtime_profile_task_switches.saturating_add(switches);

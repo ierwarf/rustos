@@ -162,6 +162,113 @@ struct CounterTotal {
     operations: u128,
 }
 
+struct KernelTailEvent {
+    is_irq: bool,
+    cpu: u8,
+    kind: u8,
+    flags: u8,
+    task_slot: u32,
+    tsc: u64,
+    arg0: u64,
+    arg1: u64,
+    has_b: bool,
+}
+
+#[derive(Default)]
+struct KernelTailTotal {
+    drains: u64,
+    total_events: u64,
+    overwritten_events: u64,
+    kind_counts: std::collections::BTreeMap<u8, u64>,
+    events: Vec<KernelTailEvent>,
+    pending_ev_a: Option<KernelTailEvent>,
+}
+
+impl KernelTailTotal {
+    fn flush_pending(&mut self) {
+        if let Some(ev) = self.pending_ev_a.take() {
+            self.events.push(ev);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.drains == 0 && self.kind_counts.is_empty() && self.events.is_empty()
+    }
+}
+
+fn kernel_tail_kind_name(kind: u8) -> Option<&'static str> {
+    match kind {
+        1 => Some("EnqueueReq"),
+        2 => Some("WakeTarget"),
+        3 => Some("SwitchOut"),
+        4 => Some("SwitchIn"),
+        5 => Some("DirectHandoff"),
+        6 => Some("ReplyPublish"),
+        7 => Some("CallerWakeRetry"),
+        8 => Some("IrqEntry"),
+        9 => Some("RescheduleIpi"),
+        10 => Some("QueueFullRetry"),
+        11 => Some("WaitArm"),
+        12 => Some("WaitResume"),
+        13 => Some("SchedulerAck"),
+        14 => Some("UserCopyOrValidate"),
+        _ => None,
+    }
+}
+
+fn parse_kernel_tail_milestone(line: &str, kernel_tails: &mut KernelTailTotal) -> bool {
+    let Some(name) = milestone_name(line) else {
+        return false;
+    };
+    if !matches!(
+        name,
+        "ipc-tail-summary" | "ipc-tail-kind" | "ipc-tail-ev-a" | "ipc-tail-ev-b"
+    ) {
+        return false;
+    }
+    let (Some(arg0), Some(arg1)) = (hex_field(line, "arg0="), hex_field(line, "arg1=")) else {
+        return false;
+    };
+    match name {
+        "ipc-tail-summary" => {
+            kernel_tails.flush_pending();
+            kernel_tails.drains = kernel_tails.drains.saturating_add(1);
+            kernel_tails.total_events = kernel_tails.total_events.saturating_add(arg0);
+            kernel_tails.overwritten_events =
+                kernel_tails.overwritten_events.saturating_add(arg1);
+        }
+        "ipc-tail-kind" => {
+            let kind = u8::try_from(arg0).unwrap_or(u8::MAX);
+            let entry = kernel_tails.kind_counts.entry(kind).or_insert(0);
+            *entry = entry.saturating_add(arg1);
+        }
+        "ipc-tail-ev-a" => {
+            kernel_tails.flush_pending();
+            kernel_tails.pending_ev_a = Some(KernelTailEvent {
+                is_irq: ((arg0 >> 56) & 0xff) != 0,
+                cpu: ((arg0 >> 48) & 0xff) as u8,
+                kind: ((arg0 >> 40) & 0xff) as u8,
+                flags: ((arg0 >> 32) & 0xff) as u8,
+                task_slot: arg0 as u32,
+                tsc: arg1,
+                arg0: 0,
+                arg1: 0,
+                has_b: false,
+            });
+        }
+        "ipc-tail-ev-b" => {
+            if let Some(mut ev) = kernel_tails.pending_ev_a.take() {
+                ev.arg0 = arg0;
+                ev.arg1 = arg1;
+                ev.has_b = true;
+                kernel_tails.events.push(ev);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 impl PhaseTotal {
     fn per_sample(&self) -> u128 {
         if self.samples == 0 {
@@ -269,6 +376,7 @@ struct ParsedRun {
     local_shadow: LocalShadowTotal,
     lifecycle: Vec<LifecycleTotal>,
     tails: tails::Data,
+    kernel_tails: KernelTailTotal,
     placements: core_paths::Placements,
 }
 
@@ -281,6 +389,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
     let mut local_shadow = LocalShadowTotal::default();
     let mut lifecycle: Vec<LifecycleTotal> = Vec::new();
     let mut tails = tails::Data::default();
+    let mut kernel_tails = KernelTailTotal::default();
     let mut placements = core_paths::Placements::default();
     let mut saw_end = false;
     // Scheduler policy is system-wide too, but IPC bench writes its TSC record
@@ -316,7 +425,11 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         } else if let Some(rest) = line.strip_prefix("ipcbench: placement ") {
             anyhow::ensure!(inside_run, "ipcbench placement outside its measurement window");
             core_paths::record_placement(&mut placements, rest)?;
-        } else if line.starts_with(tails::PREFIX) || line.starts_with(tails::SAMPLE_PREFIX) {
+        } else if line.starts_with(tails::PREFIX)
+            || line.starts_with(tails::SAMPLE_PREFIX)
+            || line.starts_with(tails::SEQ_SUMMARY_PREFIX)
+            || line.starts_with(tails::SEQ_PREFIX)
+        {
             anyhow::ensure!(inside_run, "ipcbench tail outside its measurement window");
             tails.record(line)?;
         } else if let Some(rest) = line.strip_prefix(SKIP_PREFIX) {
@@ -361,6 +474,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
                     samples: u128::from(samples),
                 }),
             }
+        } else if inside_run && parse_kernel_tail_milestone(line, &mut kernel_tails) {
         } else if inside_run && let Some((name, units, operations)) = parse_counter_milestone(line)
         {
             match counters.iter_mut().find(|counter| counter.name == name) {
@@ -376,6 +490,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
             }
         }
     }
+    kernel_tails.flush_pending();
 
     if !saw_end {
         bail!("ipcbench never reached its end marker; the harness did not finish");
@@ -397,6 +512,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         local_shadow,
         lifecycle,
         tails,
+        kernel_tails,
         placements,
     })
 }
@@ -707,16 +823,65 @@ fn render(tsc_khz: u64, results: &[BenchResult], skipped: &[String]) -> String {
     out
 }
 
+fn render_kernel_tails(kernel_tails: &KernelTailTotal) -> String {
+    if kernel_tails.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\nkernel tail attribution (system-wide, drains={}, total_events={}, overwritten={}):\n",
+        kernel_tails.drains, kernel_tails.total_events, kernel_tails.overwritten_events
+    );
+    if !kernel_tails.kind_counts.is_empty() {
+        out.push_str("  kinds:");
+        for (&kind, &count) in &kernel_tails.kind_counts {
+            match kernel_tail_kind_name(kind) {
+                Some(name) => out.push_str(&format!(" {name}={count}")),
+                None => out.push_str(&format!(" Unknown({kind})={count}")),
+            }
+        }
+        out.push('\n');
+    }
+    if !kernel_tails.events.is_empty() {
+        out.push_str(&format!("  events ({}):\n", kernel_tails.events.len()));
+        out.push_str(&format!(
+            "    {:<8} {:<18} {:>5} {:>6} {:>16} {:>16} {:>16}\n",
+            "ctx/cpu", "kind", "flags", "slot", "tsc", "arg0", "arg1"
+        ));
+        for ev in &kernel_tails.events {
+            let ctx = format!("{}/{}", if ev.is_irq { "irq" } else { "task" }, ev.cpu);
+            let kind = kernel_tail_kind_name(ev.kind)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Unknown({})", ev.kind));
+            let arg0 = if ev.has_b {
+                format!("0x{:x}", ev.arg0)
+            } else {
+                "-".to_owned()
+            };
+            let arg1 = if ev.has_b {
+                format!("0x{:x}", ev.arg1)
+            } else {
+                "-".to_owned()
+            };
+            out.push_str(&format!(
+                "    {:<8} {:<18} 0x{:02x}  {:>6} {:>16} {:>16} {:>16}\n",
+                ctx, kind, ev.flags, ev.task_slot, ev.tsc, arg0, arg1
+            ));
+        }
+    }
+    out
+}
+
 fn render_isolated(run: &ParsedRun, probe: &str, rustos_vcpus: u8, check: &str) -> String {
     let table = render(run.tsc_khz, &run.results, &run.skipped);
     let phases = render_phases(&run.phases);
     let counters = render_counters(&run.counters);
     let local_shadow = render_local_shadow(&run.local_shadow);
     let lifecycle = render_lifecycle(&run.lifecycle);
+    let kernel_tails = render_kernel_tails(&run.kernel_tails);
     let tails = run.tails.render();
     format!(
         "\n=== ipcbench (isolated: {probe}, rustos_vcpus={rustos_vcpus}) ===\n\
-         {table}{tails}{phases}{counters}{local_shadow}{lifecycle}\nisolation check: PASS ({check})\n"
+         {table}{tails}{kernel_tails}{phases}{counters}{local_shadow}{lifecycle}\nisolation check: PASS ({check})\n"
     )
 }
 
@@ -868,8 +1033,8 @@ pub(crate) fn bench(
     let run = parse_log(&log)?;
 
     if let Some(suite) = core_suite {
-        println!("\n=== ipcbench core paths (suite={suite}, rustos_vcpus={rustos_vcpus}) ===\n{}{}{}",
-            render(run.tsc_khz, &run.results, &run.skipped), run.tails.render(), core_paths::render_quality(&run));
+        println!("\n=== ipcbench core paths (suite={suite}, rustos_vcpus={rustos_vcpus}) ===\n{}{}{}{}",
+            render(run.tsc_khz, &run.results, &run.skipped), run.tails.render(), render_kernel_tails(&run.kernel_tails), core_paths::render_quality(&run));
         core_paths::validate(&run, suite, false)?;
         if let Some(path) = linux_baseline {
             println!("{}", core_paths::compare_linux(config, &run, suite, rustos_vcpus, path)?);
@@ -926,8 +1091,9 @@ pub(crate) fn bench(
     let counters = render_counters(&run.counters);
     let local_shadow = render_local_shadow(&run.local_shadow);
     let lifecycle = render_lifecycle(&run.lifecycle);
+    let kernel_tails = render_kernel_tails(&run.kernel_tails);
     let tails = run.tails.render();
-    println!("\n=== ipcbench ===\n{table}{tails}{derived}{phases}{counters}{local_shadow}{lifecycle}");
+    println!("\n=== ipcbench ===\n{table}{tails}{kernel_tails}{derived}{phases}{counters}{local_shadow}{lifecycle}");
     core_paths::validate(&run, core_paths::contract::STATE, false)?;
     println!("persistent-state null/IPC regression rail PASS (p50 <= pristine-null / before-IPC x 1.5)");
 
@@ -943,7 +1109,7 @@ pub(crate) fn bench(
         }
         fs::write(
             path,
-            format!("{table}{tails}{derived}{phases}{counters}{lifecycle}"),
+            format!("{table}{tails}{kernel_tails}{derived}{phases}{counters}{lifecycle}"),
         )
         .with_context(|| format!("write baseline {}", path.display()))?;
         println!("baseline written to {}", path.display());
@@ -967,3 +1133,106 @@ const fn benchmark_timeout_seconds(_rustos_vcpus: u8, isolated: bool) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kernel_tail_tests {
+    use super::*;
+
+    fn milestone(name: &str, arg0: u64, arg1: u64) -> String {
+        format!(
+            "seq=1 ts_us=100 tick=1 lvl=info cat=compat mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=1 seq=1 ts_us=100 tick=1 cat=compat name={name} arg0=0x{arg0:x} arg1=0x{arg1:x} pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\""
+        )
+    }
+
+    #[test]
+    fn kernel_tail_milestones_parse_inside_run_and_decode_all_event_kinds() {
+        let pre = milestone("ipc-tail-summary", 99, 1);
+        let summary = milestone("ipc-tail-summary", 14, 2);
+        let mut kind_lines = String::new();
+        for kind in 1..=14u64 {
+            kind_lines.push_str(&milestone("ipc-tail-kind", kind, kind * 10));
+            kind_lines.push('\n');
+        }
+        let meta = (1u64 << 56) | (2u64 << 48) | (8u64 << 40) | (0x5au64 << 32) | 17u64;
+        let ev_a = milestone("ipc-tail-ev-a", meta, 123_456);
+        let ev_b = milestone("ipc-tail-ev-b", 0xdead, 0xbeef);
+        let post = milestone("ipc-tail-summary", 77, 3);
+        let log = format!(
+            "{pre}\n\
+             user-debug payload=ipcbench: tsc_khz=3990809\\n\n\
+             {summary}\n{kind_lines}{ev_a}\n{ev_b}\n\
+             user-debug payload=ipcbench: result name=vmexit_cpuid iters=50000 min=4760 p50=4800 p99=5200 max=8000 mean=4900 min_ns=1192 p50_ns=1202\\n\n\
+             user-debug payload=ipcbench: result name=ipc_rt_queued_0fd_16b iters=20000 min=100 p50=200 p99=300 max=400 mean=210 min_ns=25 p50_ns=50\\n\n\
+             user-debug payload=ipcbench: end\\n\n\
+             {post}\n"
+        );
+        let run = parse_log(&log).expect("kernel tail log parses");
+        assert_eq!(run.kernel_tails.drains, 1);
+        assert_eq!(run.kernel_tails.total_events, 14);
+        assert_eq!(run.kernel_tails.overwritten_events, 2);
+        assert_eq!(run.kernel_tails.events.len(), 1);
+        let ev = &run.kernel_tails.events[0];
+        assert!(ev.is_irq);
+        assert_eq!(ev.cpu, 2);
+        assert_eq!(ev.kind, 8);
+        assert_eq!(ev.flags, 0x5a);
+        assert_eq!(ev.task_slot, 17);
+        assert_eq!(ev.tsc, 123_456);
+        assert_eq!(ev.arg0, 0xdead);
+        assert_eq!(ev.arg1, 0xbeef);
+        assert!(ev.has_b);
+
+        let rendered = render_kernel_tails(&run.kernel_tails);
+        for name in [
+            "EnqueueReq",
+            "WakeTarget",
+            "SwitchOut",
+            "SwitchIn",
+            "DirectHandoff",
+            "ReplyPublish",
+            "CallerWakeRetry",
+            "IrqEntry",
+            "RescheduleIpi",
+            "QueueFullRetry",
+            "WaitArm",
+            "WaitResume",
+            "SchedulerAck",
+            "UserCopyOrValidate",
+        ] {
+            assert!(rendered.contains(name), "missing {name} in {rendered}");
+        }
+        assert!(rendered.contains("irq/2"), "{rendered}");
+        assert!(rendered.contains("0xdead"), "{rendered}");
+        assert!(rendered.contains("0xbeef"), "{rendered}");
+        assert!(isolated_primary_result_holds(&run, "ipc_rt_queued_0fd_16b"));
+    }
+
+    #[test]
+    fn new_isolated_ipc_probe_names_pass_primary_and_placement_checks() {
+        for probe in [
+            "ipc_rt_diag_register_echo",
+            "ipc_rt_diag_switch_floor",
+            "ipc_rt_queued_0fd_16b",
+            "ipc_rt_queued_fd_16b",
+            "ipc_rt_queued_reg_16b",
+            "ipc_rt_queued_256b",
+            "ipc_rt_queued_32k",
+            "ipc_rt_queued_backlog",
+            "ipc_rt_queued_cross_proc",
+        ] {
+            assert!(probe.starts_with("ipc_rt_"));
+            assert!(requires_phase_attribution(probe));
+            let log = format!(
+                "user-debug payload=ipcbench: tsc_khz=3990809\\n\n\
+                 user-debug payload=ipcbench: result name=vmexit_cpuid iters=50000 min=4760 p50=4800 p99=5200 max=8000 mean=4900 min_ns=1192 p50_ns=1202\\n\n\
+                 user-debug payload=ipcbench: result name={probe} iters=20000 min=100 p50=200 p99=300 max=400 mean=210 min_ns=25 p50_ns=50\\n\n\
+                 user-debug payload=ipcbench: end\\n\n"
+            );
+            let run = parse_log(&log).unwrap();
+            assert!(run.kernel_tails.is_empty());
+            assert!(render_kernel_tails(&run.kernel_tails).is_empty());
+            assert!(isolated_primary_result_holds(&run, probe));
+            validate_ipc_max(&run, probe, 400).unwrap();
+        }
+    }
+}

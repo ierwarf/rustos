@@ -106,6 +106,14 @@ pub(in crate::multitask::scheduler) fn publish_direct_handoff(
         if remote_wake_owner_is_already_owned(owner.state) {
             return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
         }
+        if owner.state == RunOwnerState::Paired {
+            if let Some(pair_cpu) = owner.cpu {
+                super::super::pair::request_break_with_wake(pair_cpu, slot, owner.generation);
+                #[cfg(not(test))]
+                crate::multitask::irq::request_target_reschedule(pair_cpu);
+            }
+            return RemoteWakeOutcome::Rejected;
+        }
         if owner.state != RunOwnerState::Blocked {
             return RemoteWakeOutcome::Rejected;
         }
@@ -208,6 +216,14 @@ pub(in crate::multitask::scheduler) fn publish_remote_wake(
         }
         if remote_wake_owner_is_already_owned(owner.state) {
             return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
+        }
+        if owner.state == RunOwnerState::Paired {
+            if let Some(pair_cpu) = owner.cpu {
+                super::super::pair::request_break_with_wake(pair_cpu, slot, owner.generation);
+                #[cfg(not(test))]
+                crate::multitask::irq::request_target_reschedule(pair_cpu);
+            }
+            return RemoteWakeOutcome::Rejected;
         }
         if owner.state != RunOwnerState::Blocked {
             return RemoteWakeOutcome::Rejected;
@@ -447,7 +463,10 @@ fn rehome_queued_inner(
                 }
             }
             RunOwnerState::Migrating => core::hint::spin_loop(),
-            RunOwnerState::Dormant | RunOwnerState::Retiring | RunOwnerState::Retired => {
+            RunOwnerState::Dormant
+            | RunOwnerState::Retiring
+            | RunOwnerState::Retired
+            | RunOwnerState::Paired => {
                 return RemoteWakeOutcome::Rejected;
             }
         }

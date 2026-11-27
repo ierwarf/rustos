@@ -76,9 +76,15 @@ impl Grant {
         self.cohort.begin_effects();
         let mut reschedule_required = false;
         for &(slot, id) in &self.members[..self.len] {
-            let migrate = runqueue::owner(slot)
+            let owner_snap = runqueue::owner(slot);
+            let migrate = owner_snap
                 .cpu
                 .is_some_and(|cpu| self.requested & (1u64 << cpu) == 0);
+            if migrate && owner_snap.state == runqueue::RunOwnerState::Paired {
+                if let Some(pair_cpu) = owner_snap.cpu {
+                    super::pair::request_break_for_affinity(pair_cpu, slot, owner_snap.generation);
+                }
+            }
             runqueue::affinity_payload::set_affinity_owned(
                 slot,
                 id,

@@ -14,20 +14,28 @@
 
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Barrier;
 use std::thread;
 use std::time::Duration;
 
+use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    IpcReplyRecvWithSenderArgs, IPC_ABI_VERSION, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_TRY_RECV,
-    ipc_register_syscall, SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV,
-    SYS_RUSTOS_IPC_REGISTER_REPLY_RECV, SYS_RUSTOS_IPC_REGISTER_REPLY,
+    ipc_register_buffer_syscall, ipc_register_syscall, IpcCallWithHandlesArgs,
+    IpcRecvWithHandlesArgs, IpcRecvWithSenderArgs, IpcReplyRecvWithSenderArgs,
+    IpcReplyWithHandlesArgs, IPC_ABI_VERSION, IPC_REGISTER_BUFFER_MODE, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_HANDLES,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+    SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV, SYS_RUSTOS_IPC_REGISTER_REPLY,
+    SYS_RUSTOS_IPC_REGISTER_REPLY_RECV, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
+    SYS_RUSTOS_IPC_TRY_RECV,
 };
 
+use crate::tails::{current_guest_cpu, Sample, SeqRing, Worst, PHASE_PROFILE_ENABLED};
 use crate::{
-    measure, measure_stamped, report, skip, summarize, syscall0, syscall1, syscall3, syscall4, syscall5, syscall6,
-    tsc, IPC_ITERS, SYSCALL_ITERS, SYS_LINUX_GETUID, WARMUP,
+    measure, measure_stamped, report, skip, summarize, syscall0, syscall1, syscall3, syscall4,
+    syscall5, syscall6, tsc, IPC_ITERS, SYSCALL_ITERS, SYS_LINUX_GETUID, WARMUP,
 };
 
 #[repr(C)]
@@ -553,6 +561,17 @@ fn measure_intra_process_round_trip(
     server_entry: fn(u64),
     mode: CallMode,
 ) {
+    measure_intra_process_round_trip_with_seq(tsc_khz, name, split_names, server_entry, mode, false);
+}
+
+fn measure_intra_process_round_trip_with_seq(
+    tsc_khz: u64,
+    name: &str,
+    split_names: [&str; 3],
+    server_entry: fn(u64),
+    mode: CallMode,
+    explicit_seq: bool,
+) {
     let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
     if endpoint < 0 {
         skip(name, "endpoint-create-failed");
@@ -582,27 +601,14 @@ fn measure_intra_process_round_trip(
             return result.status;
         }
         if mode == CallMode::Queued {
-            // The handle form requires a count word even when no descriptor returns.
-            let mut received_fd_count: u16 = 0;
-            let args = rustos_user_abi::syscall::IpcCallWithHandlesArgs {
+            return call_with_handles(
                 endpoint,
-                request_ptr: (request as *const BenchMsg) as u64,
-                request_len: size_of::<BenchMsg>() as u64,
-                reply_ptr: (response as *mut BenchMsg) as u64,
-                reply_capacity: reply_capacity as u64,
-                send_fds_ptr: 0,
-                send_fd_count: 0,
-                recv_fd_capacity: 0,
-                reserved0: 0,
-                recv_fds_ptr: 0,
-                recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
-            };
-            return unsafe {
-                syscall1(
-                    SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
-                    (&args as *const rustos_user_abi::syscall::IpcCallWithHandlesArgs) as u64,
-                )
-            };
+                (request as *const BenchMsg) as *const u8,
+                size_of::<BenchMsg>(),
+                (response as *mut BenchMsg) as *mut u8,
+                reply_capacity,
+                &[],
+            );
         }
         unsafe {
             syscall5(
@@ -621,10 +627,11 @@ fn measure_intra_process_round_trip(
     // server's (near-zero) work, which is the part the in-kernel phase
     // instrumentation cannot see.
     let mut total = Vec::with_capacity(IPC_ITERS);
-    let mut worst = crate::tails::Worst::new();
+    let mut worst = Worst::new();
     let mut to_recv = Vec::with_capacity(IPC_ITERS);
     let mut server_body = Vec::with_capacity(IPC_ITERS);
     let mut to_return = Vec::with_capacity(IPC_ITERS);
+    let mut seq_ring = SeqRing::new(explicit_seq);
     let mut ok = true;
     for _ in 0..WARMUP {
         request.seq = request.seq.wrapping_add(1);
@@ -633,26 +640,32 @@ fn measure_intra_process_round_trip(
             break;
         }
     }
-    for _ in 0..IPC_ITERS {
-        request.seq = request.seq.wrapping_add(1);
-        let Some((start, end)) =
-            validated_round_trip_sample(&request, &mut response, &mut call, tsc)
-        else {
-            ok = false;
-            break;
-        };
-        let recv_at = RECV_TSC.load(Ordering::Relaxed);
-        let reply_at = REPLY_TSC.load(Ordering::Acquire);
-        total.push(end.wrapping_sub(start));
-        // A stamp outside the interval means the server lapped this sample;
-        // drop it rather than record a wrapped difference as a cost.
-        let parts = if recv_at > start && reply_at >= recv_at && end >= reply_at {
-            to_recv.push(recv_at - start);
-            server_body.push(reply_at - recv_at);
-            to_return.push(end - reply_at);
-            Some([recv_at - start, reply_at - recv_at, end - reply_at])
-        } else { None };
-        worst.observe(crate::tails::Sample { seq: request.seq, start, end, parts });
+    if PHASE_PROFILE_ENABLED || explicit_seq {
+        run_intra_loop::<true>(
+            &mut request,
+            &mut response,
+            &mut call,
+            &mut total,
+            &mut worst,
+            &mut seq_ring,
+            &mut to_recv,
+            &mut server_body,
+            &mut to_return,
+            &mut ok,
+        );
+    } else {
+        run_intra_loop::<false>(
+            &mut request,
+            &mut response,
+            &mut call,
+            &mut total,
+            &mut worst,
+            &mut seq_ring,
+            &mut to_recv,
+            &mut server_body,
+            &mut to_return,
+            &mut ok,
+        );
     }
     request.op = BENCH_OP_STOP;
     request.seq = request.seq.wrapping_add(1);
@@ -681,18 +694,1080 @@ fn measure_intra_process_round_trip(
             "ipcbench: proof name={name} transport={transport} request_bytes=16 response_bytes=16 reply_capacity={reply_capacity} fast_reply_limit={FAST_REPLY_LIMIT} warmup={WARMUP} samples={IPC_ITERS} tail_intact=1"
         ));
     }
-    report(name, &summarize(&mut total), tsc_khz);
+    finish_round_trip_report(
+        tsc_khz,
+        name,
+        split_names,
+        &mut total,
+        worst,
+        seq_ring,
+        &mut to_recv,
+        &mut server_body,
+        &mut to_return,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_intra_loop<const SEQ: bool>(
+    request: &mut BenchMsg,
+    response: &mut BenchMsg,
+    call: &mut impl FnMut(&BenchMsg, &mut BenchMsg) -> i64,
+    total: &mut Vec<u64>,
+    worst: &mut Worst,
+    seq_ring: &mut SeqRing,
+    to_recv: &mut Vec<u64>,
+    server_body: &mut Vec<u64>,
+    to_return: &mut Vec<u64>,
+    ok: &mut bool,
+) {
+    for _ in 0..IPC_ITERS {
+        request.seq = request.seq.wrapping_add(1);
+        let Some((start, end)) =
+            validated_round_trip_sample(request, response, call, tsc)
+        else {
+            *ok = false;
+            break;
+        };
+        let recv_at = RECV_TSC.load(Ordering::Relaxed);
+        let reply_at = REPLY_TSC.load(Ordering::Acquire);
+        record_round_trip_sample::<SEQ>(
+            0,
+            request.seq,
+            start,
+            end,
+            recv_at,
+            reply_at,
+            total,
+            worst,
+            seq_ring,
+            to_recv,
+            server_body,
+            to_return,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn record_round_trip_sample<const SEQ: bool>(
+    run: u32,
+    seq: u64,
+    start: u64,
+    end: u64,
+    recv_at: u64,
+    reply_at: u64,
+    total: &mut Vec<u64>,
+    worst: &mut Worst,
+    seq_ring: &mut SeqRing,
+    to_recv: &mut Vec<u64>,
+    server_body: &mut Vec<u64>,
+    to_return: &mut Vec<u64>,
+) {
+    total.push(end.wrapping_sub(start));
+    // A stamp outside the interval means the server lapped this sample;
+    // drop it rather than record a wrapped difference as a cost.
+    let parts = if recv_at > start && reply_at >= recv_at && end >= reply_at {
+        to_recv.push(recv_at - start);
+        server_body.push(reply_at - recv_at);
+        to_return.push(end - reply_at);
+        Some([recv_at - start, reply_at - recv_at, end - reply_at])
+    } else {
+        None
+    };
+    let sample = Sample {
+        seq,
+        start,
+        end,
+        parts,
+    };
+    worst.observe(sample);
+    if SEQ {
+        seq_ring.observe(run, sample, current_guest_cpu());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_round_trip_report(
+    tsc_khz: u64,
+    name: &str,
+    split_names: [&str; 3],
+    total: &mut [u64],
+    worst: Worst,
+    seq_ring: SeqRing,
+    to_recv: &mut [u64],
+    server_body: &mut [u64],
+    to_return: &mut [u64],
+) {
+    report(name, &summarize(total), tsc_khz);
     worst.defer(name);
-    for (split, samples) in
-        split_names
-            .into_iter()
-            .zip([&mut to_recv, &mut server_body, &mut to_return])
+    seq_ring.defer(name);
+    for (split, samples) in split_names
+        .into_iter()
+        .zip([to_recv, server_body, to_return])
     {
         if samples.is_empty() {
             skip(split, "no-paired-server-stamps");
         } else {
             report(split, &summarize(samples), tsc_khz);
         }
+    }
+}
+
+// ------------------------------------------------------------------- B0.e
+
+const DIAG_ECHO_WORD0: u64 = 0xB0EC_0001;
+const DIAG_ECHO_WORD1: u64 = 0xB0EC_0002;
+const DIAG_ECHO_MAGIC: u64 = 0xB0EC_4000_0000_0001;
+const DIAG_SWITCH_SERVER_MAGIC: u64 = 0xB0EC_4000_0000_0002;
+const DIAG_SWITCH_CALL_MAGIC: u64 = 0xB0EC_4000_0000_0003;
+const DIAG_SWITCH_STOP_MAGIC: u64 = 0xB0EC_4000_0000_0004;
+
+#[inline(always)]
+unsafe fn diag_register_magic_syscall(magic: u64, w0: u64, w1: u64) -> (i64, [u64; 2]) {
+    let (status, out0, out1);
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_RUSTOS_IPC_REGISTER_CALL => status,
+            inlateout("rdi") 0_u64 => _,
+            inlateout("rsi") 16_u64 => _,
+            inlateout("rdx") w0 => out0,
+            inlateout("r10") w1 => out1,
+            inlateout("r8") 0_u64 => _,
+            inlateout("r9") magic => _,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    (status, [out0, out1])
+}
+
+/// B0.e: measures the bare two-crossing register fastcall boundary without
+/// endpoint/scheduler dispatch when the kernel enables the diagnostic echo gate.
+pub(crate) fn probe_ipc_diag_register_echo(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_diag_register_echo";
+    let (status, words) = unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+    if status != 16 {
+        skip(NAME, "diag-echo-not-enabled");
+        return;
+    }
+    if words != [DIAG_ECHO_WORD0, DIAG_ECHO_WORD1] {
+        skip(NAME, "diag-echo-mismatch");
+        return;
+    }
+    for _ in 0..WARMUP {
+        let (s0, r0) = unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+        let (s1, r1) = unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+        if s0 != 16
+            || r0 != [DIAG_ECHO_WORD0, DIAG_ECHO_WORD1]
+            || s1 != 16
+            || r1 != [DIAG_ECHO_WORD0, DIAG_ECHO_WORD1]
+        {
+            skip(NAME, "diag-echo-warmup-failed");
+            return;
+        }
+    }
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    for _ in 0..IPC_ITERS {
+        let start = tsc();
+        let (s0, r0) = unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+        let (s1, r1) = unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+        let end = tsc();
+        if s0 != 16
+            || r0 != [DIAG_ECHO_WORD0, DIAG_ECHO_WORD1]
+            || s1 != 16
+            || r1 != [DIAG_ECHO_WORD0, DIAG_ECHO_WORD1]
+        {
+            skip(NAME, "diag-echo-runtime-failed");
+            return;
+        }
+        total.push(end.wrapping_sub(start));
+    }
+    report(NAME, &summarize(&mut total), tsc_khz);
+}
+
+/// B0.s: measures two actual L2 paired kernel switches (`C -> S -> C`) with no
+/// endpoint lookups or transfer objects, checking cold formation separately
+/// and verifying foreign callers cannot enter the diagnostic pair.
+pub(crate) fn probe_ipc_diag_switch_floor(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_diag_switch_floor";
+    let (probe_status, _) =
+        unsafe { diag_register_magic_syscall(DIAG_ECHO_MAGIC, DIAG_ECHO_WORD0, DIAG_ECHO_WORD1) };
+    if probe_status != 16 {
+        skip(NAME, "diag-switch-not-enabled");
+        return;
+    }
+
+    let server = thread::spawn(|| {
+        let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_SERVER_MAGIC, 0, 0) };
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    // Confirm a foreign process cannot enter the kernel-bound diagnostic pair.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let (foreign_status, _) =
+            unsafe { diag_register_magic_syscall(DIAG_SWITCH_CALL_MAGIC, 1, 2) };
+        let code = if foreign_status == -1 { 0 } else { 1 };
+        unsafe { libc::_exit(code) };
+    }
+    let mut wait_status: libc::c_int = 0;
+    if child < 0
+        || unsafe { libc::waitpid(child, &mut wait_status, 0) } != child
+        || !libc::WIFEXITED(wait_status)
+        || libc::WEXITSTATUS(wait_status) != 0
+    {
+        let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_STOP_MAGIC, 0, 0) };
+        let _ = server.join();
+        skip(NAME, "foreign-caller-check-failed");
+        return;
+    }
+
+    // Measure cold pair formation separately on the very first call.
+    let cold_start = tsc();
+    let (cold_status, cold_words) =
+        unsafe { diag_register_magic_syscall(DIAG_SWITCH_CALL_MAGIC, 0xB05E_0000, 1) };
+    let cold_end = tsc();
+    if cold_status != 16 || cold_words != [0xB05E_0000, 1] {
+        let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_STOP_MAGIC, 0, 0) };
+        let _ = server.join();
+        skip(NAME, "diag-switch-cold-failed");
+        return;
+    }
+    let mut cold = vec![cold_end.wrapping_sub(cold_start)];
+    report("ipc_rt_diag_switch_floor_cold", &summarize(&mut cold), tsc_khz);
+
+    for i in 0..WARMUP {
+        let (st, w) =
+            unsafe { diag_register_magic_syscall(DIAG_SWITCH_CALL_MAGIC, DIAG_ECHO_WORD0, i as u64) };
+        if st != 16 || w != [DIAG_ECHO_WORD0, i as u64] {
+            let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_STOP_MAGIC, 0, 0) };
+            let _ = server.join();
+            skip(NAME, "diag-switch-warmup-failed");
+            return;
+        }
+    }
+
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    for i in 0..IPC_ITERS {
+        let w1 = i as u64 + 1;
+        let start = tsc();
+        let (st, w) =
+            unsafe { diag_register_magic_syscall(DIAG_SWITCH_CALL_MAGIC, DIAG_ECHO_WORD0, w1) };
+        let end = tsc();
+        if st != 16 || w != [DIAG_ECHO_WORD0, w1] {
+            let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_STOP_MAGIC, 0, 0) };
+            let _ = server.join();
+            skip(NAME, "diag-switch-runtime-failed");
+            return;
+        }
+        total.push(end.wrapping_sub(start));
+    }
+
+    let _ = unsafe { diag_register_magic_syscall(DIAG_SWITCH_STOP_MAGIC, 0, 0) };
+    let _ = server.join();
+    report(NAME, &summarize(&mut total), tsc_khz);
+}
+
+// --------------------------------------------------------------------- Q0
+
+#[inline(always)]
+fn call_with_handles(
+    endpoint: u64,
+    request_ptr: *const u8,
+    request_len: usize,
+    reply_ptr: *mut u8,
+    reply_capacity: usize,
+    send_fds: &[i32],
+) -> i64 {
+    let mut received_fd_count: u16 = 0;
+    let args = IpcCallWithHandlesArgs {
+        endpoint,
+        request_ptr: request_ptr as u64,
+        request_len: request_len as u64,
+        reply_ptr: reply_ptr as u64,
+        reply_capacity: reply_capacity as u64,
+        send_fds_ptr: if send_fds.is_empty() {
+            0
+        } else {
+            send_fds.as_ptr() as u64
+        },
+        send_fd_count: send_fds.len() as u16,
+        recv_fd_capacity: 0,
+        reserved0: 0,
+        recv_fds_ptr: 0,
+        recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
+    };
+    unsafe {
+        syscall1(
+            SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
+            (&args as *const IpcCallWithHandlesArgs) as u64,
+        )
+    }
+}
+
+#[inline(always)]
+fn recv_with_handles(
+    endpoint: u64,
+    request_ptr: *mut u8,
+    request_capacity: usize,
+    reply_cap: &mut u64,
+    recv_fds: &mut [i32],
+    recv_fd_count: &mut u16,
+) -> i64 {
+    *recv_fd_count = 0;
+    let args = IpcRecvWithHandlesArgs {
+        endpoint,
+        request_ptr: request_ptr as u64,
+        request_capacity: request_capacity as u64,
+        reply_cap_ptr: (reply_cap as *mut u64) as u64,
+        recv_fds_ptr: if recv_fds.is_empty() {
+            0
+        } else {
+            recv_fds.as_mut_ptr() as u64
+        },
+        recv_fd_count_ptr: (recv_fd_count as *mut u16) as u64,
+        recv_fd_capacity: recv_fds.len() as u16,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    unsafe {
+        syscall1(
+            SYS_RUSTOS_IPC_RECV_WITH_HANDLES,
+            (&args as *const IpcRecvWithHandlesArgs) as u64,
+        )
+    }
+}
+
+#[inline(always)]
+fn reply_with_handles(reply_cap: u64, response_ptr: *const u8, response_len: usize) -> i64 {
+    let args = IpcReplyWithHandlesArgs {
+        reply_cap,
+        response_ptr: response_ptr as u64,
+        response_len: response_len as u64,
+        send_fds_ptr: 0,
+        send_fd_count: 0,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    unsafe {
+        syscall1(
+            SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
+            (&args as *const IpcReplyWithHandlesArgs) as u64,
+        )
+    }
+}
+
+pub(crate) fn probe_ipc_queued_0fd_16b(tsc_khz: u64) {
+    measure_intra_process_round_trip_with_seq(
+        tsc_khz,
+        "ipc_rt_queued_0fd_16b",
+        [
+            "ipc_split_queued_0fd_call_to_recv",
+            "ipc_split_queued_0fd_server_body",
+            "ipc_split_queued_0fd_reply_to_return",
+        ],
+        bench_server_reply_recv,
+        CallMode::Queued,
+        true,
+    );
+}
+
+pub(crate) fn probe_ipc_queued_fd_16b(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_queued_fd_16b";
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 {
+        skip(NAME, "endpoint-create-failed");
+        return;
+    }
+    let endpoint = endpoint as u64;
+    let mut pipe_fds = [-1i32; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        skip(NAME, "pipe2-failed");
+        return;
+    }
+    let server = thread::spawn(move || -> bool {
+        let mut request = BenchMsg::default();
+        let mut recv_fds = [-1i32; 1];
+        let mut recv_fd_count = 0_u16;
+        loop {
+            let mut reply_cap = 0_u64;
+            let received = recv_with_handles(
+                endpoint,
+                (&mut request as *mut BenchMsg) as *mut u8,
+                size_of::<BenchMsg>(),
+                &mut reply_cap,
+                &mut recv_fds,
+                &mut recv_fd_count,
+            );
+            if received != size_of::<BenchMsg>() as i64 || reply_cap == 0 {
+                return false;
+            }
+            RECV_TSC.store(tsc(), Ordering::Relaxed);
+            if recv_fd_count != 1 || recv_fds[0] < 0 {
+                let _ = reply_with_handles(
+                    reply_cap,
+                    (&request as *const BenchMsg) as *const u8,
+                    size_of::<BenchMsg>(),
+                );
+                return false;
+            }
+            if unsafe { libc::close(recv_fds[0]) } != 0 {
+                return false;
+            }
+            let stop = request.op == BENCH_OP_STOP;
+            let response = request;
+            REPLY_TSC.store(tsc(), Ordering::Release);
+            if reply_with_handles(
+                reply_cap,
+                (&response as *const BenchMsg) as *const u8,
+                size_of::<BenchMsg>(),
+            ) != 0
+            {
+                return false;
+            }
+            if stop {
+                return true;
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let send_fds = [pipe_fds[0]];
+    let mut request = BenchMsg {
+        op: BENCH_OP_PING,
+        seq: 0,
+    };
+    let mut response = BenchMsg::default();
+    let mut call = |req: &BenchMsg, resp: &mut BenchMsg| -> i64 {
+        call_with_handles(
+            endpoint,
+            (req as *const BenchMsg) as *const u8,
+            size_of::<BenchMsg>(),
+            (resp as *mut BenchMsg) as *mut u8,
+            size_of::<BenchMsg>(),
+            &send_fds,
+        )
+    };
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    let mut worst = Worst::new();
+    let mut seq_ring = SeqRing::new(true);
+    let mut to_recv = Vec::with_capacity(IPC_ITERS);
+    let mut server_body = Vec::with_capacity(IPC_ITERS);
+    let mut to_return = Vec::with_capacity(IPC_ITERS);
+    let mut ok = true;
+    for _ in 0..WARMUP {
+        request.seq = request.seq.wrapping_add(1);
+        if !valid_round_trip_reply(call(&request, &mut response), &request, &response) {
+            ok = false;
+            break;
+        }
+    }
+    if ok {
+        run_intra_loop::<true>(
+            &mut request,
+            &mut response,
+            &mut call,
+            &mut total,
+            &mut worst,
+            &mut seq_ring,
+            &mut to_recv,
+            &mut server_body,
+            &mut to_return,
+            &mut ok,
+        );
+    }
+    request.op = BENCH_OP_STOP;
+    request.seq = request.seq.wrapping_add(1);
+    let stopped = valid_round_trip_reply(call(&request, &mut response), &request, &response);
+    let joined = server.join().is_ok_and(|valid| valid);
+    unsafe {
+        libc::close(pipe_fds[0]);
+        libc::close(pipe_fds[1]);
+    }
+    if !round_trip_transcript_complete(ok, stopped, joined, total.len()) {
+        skip(NAME, "ipc-queued-fd-transcript-invalid");
+        return;
+    }
+    finish_round_trip_report(
+        tsc_khz,
+        NAME,
+        [
+            "ipc_split_queued_fd_call_to_recv",
+            "ipc_split_queued_fd_server_body",
+            "ipc_split_queued_fd_reply_to_return",
+        ],
+        &mut total,
+        worst,
+        seq_ring,
+        &mut to_recv,
+        &mut server_body,
+        &mut to_return,
+    );
+}
+
+pub(crate) fn probe_ipc_queued_reg_16b(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_queued_reg_16b";
+    if !crate::ipc_service::preflight() {
+        skip(NAME, "service-buffer-preflight-failed");
+        return;
+    }
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 {
+        skip(NAME, "endpoint-create-failed");
+        return;
+    }
+    let endpoint = endpoint as u64;
+    let server = thread::spawn(move || -> bool {
+        let mut request = BenchMsg::default();
+        let mut reply_cap = 0_u64;
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
+        let recv_args = IpcRecvWithSenderArgs {
+            endpoint,
+            request_ptr: (&mut request as *mut BenchMsg) as u64,
+            request_capacity: size_of::<BenchMsg>() as u64,
+            reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+            sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+            sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+        };
+        let Some(mut received) = (unsafe {
+            ipc_register_buffer_syscall(
+                SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+                [
+                    (&recv_args as *const IpcRecvWithSenderArgs) as u64,
+                    IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        }) else {
+            return false;
+        };
+        loop {
+            if received != size_of::<BenchMsg>() as i64 || reply_cap == 0 {
+                return false;
+            }
+            RECV_TSC.store(tsc(), Ordering::Relaxed);
+            let response = request;
+            let stop = request.op == BENCH_OP_STOP;
+            REPLY_TSC.store(tsc(), Ordering::Release);
+            if stop {
+                return unsafe {
+                    ipc_register_buffer_syscall(
+                        SYS_RUSTOS_IPC_REPLY,
+                        [
+                            reply_cap,
+                            (&response as *const BenchMsg) as u64,
+                            size_of::<BenchMsg>() as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    )
+                } == Some(0);
+            }
+            let fused = IpcReplyRecvWithSenderArgs {
+                abi_version: IPC_ABI_VERSION,
+                flags: 0,
+                reserved0: 0,
+                endpoint,
+                reply_cap,
+                response_ptr: (&response as *const BenchMsg) as u64,
+                response_len: size_of::<BenchMsg>() as u64,
+                request_ptr: (&mut request as *mut BenchMsg) as u64,
+                request_capacity: size_of::<BenchMsg>() as u64,
+                next_reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+                sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+                sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+                reserved1: 0,
+            };
+            let Some(next) = (unsafe {
+                ipc_register_buffer_syscall(
+                    SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
+                    [(&fused as *const IpcReplyRecvWithSenderArgs) as u64, 0, 0, 0, 0, 0],
+                )
+            }) else {
+                return false;
+            };
+            received = next;
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let mut request = BenchMsg {
+        op: BENCH_OP_PING,
+        seq: 0,
+    };
+    let mut response = BenchMsg::default();
+    let mut call = |req: &BenchMsg, resp: &mut BenchMsg| -> i64 {
+        let block = rustos_user_abi::syscall::IpcRegisterBufferArgs {
+            operation: SYS_RUSTOS_IPC_CALL_BOUNDED,
+            args: [
+                endpoint,
+                (req as *const BenchMsg) as u64,
+                size_of::<BenchMsg>() as u64,
+                (resp as *mut BenchMsg) as u64,
+                size_of::<BenchMsg>() as u64,
+                IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            ],
+        };
+        let status: i64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SYS_RUSTOS_IPC_REGISTER_CALL => status,
+                inlateout("rdi") (&block as *const rustos_user_abi::syscall::IpcRegisterBufferArgs) as u64 => _,
+                inlateout("rsi") 0_u64 => _,
+                inlateout("rdx") 0_u64 => _,
+                inlateout("r10") 0_u64 => _,
+                inlateout("r8") 0_u64 => _,
+                inlateout("r9") IPC_REGISTER_BUFFER_MODE => _,
+                clobber_abi("C"),
+                options(nostack),
+            );
+        }
+        status
+    };
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    let mut worst = Worst::new();
+    let mut seq_ring = SeqRing::new(true);
+    let mut to_recv = Vec::with_capacity(IPC_ITERS);
+    let mut server_body = Vec::with_capacity(IPC_ITERS);
+    let mut to_return = Vec::with_capacity(IPC_ITERS);
+    let mut ok = true;
+    for _ in 0..WARMUP {
+        request.seq = request.seq.wrapping_add(1);
+        if !valid_round_trip_reply(call(&request, &mut response), &request, &response) {
+            ok = false;
+            break;
+        }
+    }
+    if ok {
+        run_intra_loop::<true>(
+            &mut request,
+            &mut response,
+            &mut call,
+            &mut total,
+            &mut worst,
+            &mut seq_ring,
+            &mut to_recv,
+            &mut server_body,
+            &mut to_return,
+            &mut ok,
+        );
+    }
+    request.op = BENCH_OP_STOP;
+    request.seq = request.seq.wrapping_add(1);
+    let stopped = valid_round_trip_reply(call(&request, &mut response), &request, &response);
+    let joined = server.join().is_ok_and(|valid| valid);
+    if !round_trip_transcript_complete(ok, stopped, joined, total.len()) {
+        skip(NAME, "ipc-queued-reg-transcript-invalid");
+        return;
+    }
+    finish_round_trip_report(
+        tsc_khz,
+        NAME,
+        [
+            "ipc_split_queued_reg_call_to_recv",
+            "ipc_split_queued_reg_server_body",
+            "ipc_split_queued_reg_reply_to_return",
+        ],
+        &mut total,
+        worst,
+        seq_ring,
+        &mut to_recv,
+        &mut server_body,
+        &mut to_return,
+    );
+}
+
+pub(crate) fn probe_ipc_queued_256b(tsc_khz: u64) {
+    probe_ipc_queued_sized(
+        tsc_khz,
+        "ipc_rt_queued_256b",
+        [
+            "ipc_split_queued_256b_call_to_recv",
+            "ipc_split_queued_256b_server_body",
+            "ipc_split_queued_256b_reply_to_return",
+        ],
+        256,
+        64,
+    );
+}
+
+pub(crate) fn probe_ipc_queued_32k(tsc_khz: u64) {
+    probe_ipc_queued_sized(
+        tsc_khz,
+        "ipc_rt_queued_32k",
+        [
+            "ipc_split_queued_32k_call_to_recv",
+            "ipc_split_queued_32k_server_body",
+            "ipc_split_queued_32k_reply_to_return",
+        ],
+        32_768,
+        256,
+    );
+}
+
+fn fill_sized_request(buf: &mut [u8], op: u64, seq: u64) {
+    buf[..8].copy_from_slice(&op.to_le_bytes());
+    buf[8..16].copy_from_slice(&seq.to_le_bytes());
+    let len = buf.len();
+    buf[len - 8..].copy_from_slice(&seq.to_le_bytes());
+}
+
+fn read_bench_header(buf: &[u8]) -> BenchMsg {
+    BenchMsg {
+        op: u64::from_le_bytes(buf[..8].try_into().unwrap()),
+        seq: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+    }
+}
+
+fn probe_ipc_queued_sized(
+    tsc_khz: u64,
+    name: &str,
+    split_names: [&str; 3],
+    msg_bytes: usize,
+    canary_bytes: usize,
+) {
+    debug_assert!(msg_bytes >= size_of::<BenchMsg>());
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 {
+        skip(name, "endpoint-create-failed");
+        return;
+    }
+    let endpoint = endpoint as u64;
+    let server = thread::spawn(move || -> bool {
+        let mut buf = vec![0_u8; msg_bytes];
+        let mut recv_fd_count = 0_u16;
+        loop {
+            let mut reply_cap = 0_u64;
+            let received = recv_with_handles(
+                endpoint,
+                buf.as_mut_ptr(),
+                msg_bytes,
+                &mut reply_cap,
+                &mut [],
+                &mut recv_fd_count,
+            );
+            if received != msg_bytes as i64 || reply_cap == 0 {
+                return false;
+            }
+            RECV_TSC.store(tsc(), Ordering::Relaxed);
+            let stop = read_bench_header(&buf).op == BENCH_OP_STOP;
+            REPLY_TSC.store(tsc(), Ordering::Release);
+            if reply_with_handles(reply_cap, buf.as_ptr(), msg_bytes) != 0 {
+                return false;
+            }
+            if stop {
+                return true;
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let mut req = vec![0_u8; msg_bytes];
+    for (idx, byte) in req.iter_mut().enumerate() {
+        *byte = ((idx.wrapping_mul(31)) ^ 0x5a) as u8;
+    }
+    let mut resp = vec![0xcc_u8; msg_bytes + canary_bytes];
+    let reply_capacity = msg_bytes + canary_bytes;
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    let mut worst = Worst::new();
+    let mut seq_ring = SeqRing::new(true);
+    let mut to_recv = Vec::with_capacity(IPC_ITERS);
+    let mut server_body = Vec::with_capacity(IPC_ITERS);
+    let mut to_return = Vec::with_capacity(IPC_ITERS);
+    let mut seq = 0_u64;
+    let mut ok = true;
+    for _ in 0..WARMUP {
+        seq = seq.wrapping_add(1);
+        fill_sized_request(&mut req, BENCH_OP_PING, seq);
+        let status = call_with_handles(
+            endpoint,
+            req.as_ptr(),
+            msg_bytes,
+            resp.as_mut_ptr(),
+            reply_capacity,
+            &[],
+        );
+        if status != msg_bytes as i64 || resp[..msg_bytes] != req[..msg_bytes] {
+            ok = false;
+            break;
+        }
+    }
+    if ok {
+        for _ in 0..IPC_ITERS {
+            seq = seq.wrapping_add(1);
+            fill_sized_request(&mut req, BENCH_OP_PING, seq);
+            let start = tsc();
+            let status = call_with_handles(
+                endpoint,
+                req.as_ptr(),
+                msg_bytes,
+                resp.as_mut_ptr(),
+                reply_capacity,
+                &[],
+            );
+            let end = tsc();
+            if status != msg_bytes as i64 || resp[..msg_bytes] != req[..msg_bytes] {
+                ok = false;
+                break;
+            }
+            let recv_at = RECV_TSC.load(Ordering::Relaxed);
+            let reply_at = REPLY_TSC.load(Ordering::Acquire);
+            record_round_trip_sample::<true>(
+                0,
+                seq,
+                start,
+                end,
+                recv_at,
+                reply_at,
+                &mut total,
+                &mut worst,
+                &mut seq_ring,
+                &mut to_recv,
+                &mut server_body,
+                &mut to_return,
+            );
+        }
+    }
+    seq = seq.wrapping_add(1);
+    fill_sized_request(&mut req, BENCH_OP_STOP, seq);
+    let stop_status = call_with_handles(
+        endpoint,
+        req.as_ptr(),
+        msg_bytes,
+        resp.as_mut_ptr(),
+        reply_capacity,
+        &[],
+    );
+    let stopped = stop_status == msg_bytes as i64 && resp[..msg_bytes] == req[..msg_bytes];
+    let joined = server.join().is_ok_and(|valid| valid);
+    if !resp[msg_bytes..].iter().all(|&byte| byte == 0xcc) {
+        skip(name, "reply-tail-overwritten");
+        return;
+    }
+    if !round_trip_transcript_complete(ok, stopped, joined, total.len()) {
+        skip(name, "ipc-queued-sized-transcript-invalid");
+        return;
+    }
+    finish_round_trip_report(
+        tsc_khz,
+        name,
+        split_names,
+        &mut total,
+        worst,
+        seq_ring,
+        &mut to_recv,
+        &mut server_body,
+        &mut to_return,
+    );
+}
+
+static BACKLOG_RECV_TSC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static BACKLOG_REPLY_TSC: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(crate) fn probe_ipc_queued_backlog(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_queued_backlog";
+    const PER_CLIENT_ITERS: usize = IPC_ITERS / 2;
+    const PER_CLIENT_WARMUP: usize = WARMUP / 2;
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 {
+        skip(NAME, "endpoint-create-failed");
+        return;
+    }
+    let endpoint = endpoint as u64;
+    let server = thread::spawn(move || -> bool {
+        let mut request = BenchMsg::default();
+        let mut recv_fd_count = 0_u16;
+        loop {
+            let mut reply_cap = 0_u64;
+            let received = recv_with_handles(
+                endpoint,
+                (&mut request as *mut BenchMsg) as *mut u8,
+                size_of::<BenchMsg>(),
+                &mut reply_cap,
+                &mut [],
+                &mut recv_fd_count,
+            );
+            if received != size_of::<BenchMsg>() as i64 || reply_cap == 0 {
+                return false;
+            }
+            let recv_at = tsc();
+            let stop = request.op == BENCH_OP_STOP;
+            let slot = ((request.seq >> 48) as usize) & 1;
+            BACKLOG_RECV_TSC[slot].store(recv_at, Ordering::Relaxed);
+            let response = request;
+            BACKLOG_REPLY_TSC[slot].store(tsc(), Ordering::Release);
+            if reply_with_handles(
+                reply_cap,
+                (&response as *const BenchMsg) as *const u8,
+                size_of::<BenchMsg>(),
+            ) != 0
+            {
+                return false;
+            }
+            if stop {
+                return true;
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let barrier = Barrier::new(2);
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(2);
+        for client_idx in 0..2usize {
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || {
+                let mut request = BenchMsg {
+                    op: BENCH_OP_PING,
+                    seq: (client_idx as u64) << 48,
+                };
+                let mut response = BenchMsg::default();
+                let mut total = Vec::with_capacity(PER_CLIENT_ITERS);
+                let mut worst = Worst::new();
+                let mut seq_ring = SeqRing::with_capacity(true, PER_CLIENT_ITERS);
+                let mut to_recv = Vec::with_capacity(PER_CLIENT_ITERS);
+                let mut server_body = Vec::with_capacity(PER_CLIENT_ITERS);
+                let mut to_return = Vec::with_capacity(PER_CLIENT_ITERS);
+                let mut ok = true;
+                for _ in 0..PER_CLIENT_WARMUP {
+                    request.seq += 1;
+                    let status = call_with_handles(
+                        endpoint,
+                        (&request as *const BenchMsg) as *const u8,
+                        size_of::<BenchMsg>(),
+                        (&mut response as *mut BenchMsg) as *mut u8,
+                        size_of::<BenchMsg>(),
+                        &[],
+                    );
+                    if !valid_round_trip_reply(status, &request, &response) {
+                        ok = false;
+                        break;
+                    }
+                }
+                barrier.wait();
+                if ok {
+                    for _ in 0..PER_CLIENT_ITERS {
+                        request.seq += 1;
+                        let start = tsc();
+                        let status = call_with_handles(
+                            endpoint,
+                            (&request as *const BenchMsg) as *const u8,
+                            size_of::<BenchMsg>(),
+                            (&mut response as *mut BenchMsg) as *mut u8,
+                            size_of::<BenchMsg>(),
+                            &[],
+                        );
+                        let end = tsc();
+                        if !valid_round_trip_reply(status, &request, &response) {
+                            ok = false;
+                            break;
+                        }
+                        let recv_at = BACKLOG_RECV_TSC[client_idx].load(Ordering::Relaxed);
+                        let reply_at = BACKLOG_REPLY_TSC[client_idx].load(Ordering::Acquire);
+                        record_round_trip_sample::<true>(
+                            client_idx as u32,
+                            request.seq,
+                            start,
+                            end,
+                            recv_at,
+                            reply_at,
+                            &mut total,
+                            &mut worst,
+                            &mut seq_ring,
+                            &mut to_recv,
+                            &mut server_body,
+                            &mut to_return,
+                        );
+                    }
+                }
+                (ok, total, worst, seq_ring, to_recv, server_body, to_return)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().ok())
+            .collect::<Vec<_>>()
+    });
+
+    let stop_req = BenchMsg {
+        op: BENCH_OP_STOP,
+        seq: 0xFFFF_FFFF,
+    };
+    let mut stop_resp = BenchMsg::default();
+    let stopped = valid_round_trip_reply(
+        call_with_handles(
+            endpoint,
+            (&stop_req as *const BenchMsg) as *const u8,
+            size_of::<BenchMsg>(),
+            (&mut stop_resp as *mut BenchMsg) as *mut u8,
+            size_of::<BenchMsg>(),
+            &[],
+        ),
+        &stop_req,
+        &stop_resp,
+    );
+    let joined = server.join().is_ok_and(|valid| valid);
+
+    let mut total = Vec::with_capacity(IPC_ITERS);
+    let mut worst = Worst::new();
+    let mut seq_ring = SeqRing::new(true);
+    let mut to_recv = Vec::with_capacity(IPC_ITERS);
+    let mut server_body = Vec::with_capacity(IPC_ITERS);
+    let mut to_return = Vec::with_capacity(IPC_ITERS);
+    let mut clients_ok = true;
+    for res in results {
+        let Some((ok, c_total, c_worst, c_seq, c_recv, c_body, c_ret)) = res else {
+            clients_ok = false;
+            break;
+        };
+        if !ok {
+            clients_ok = false;
+        }
+        total.extend(c_total);
+        worst.merge_from(c_worst);
+        seq_ring.merge_from(c_seq);
+        to_recv.extend(c_recv);
+        server_body.extend(c_body);
+        to_return.extend(c_ret);
+    }
+    if !round_trip_transcript_complete(clients_ok, stopped, joined, total.len()) {
+        skip(NAME, "ipc-queued-backlog-transcript-invalid");
+        return;
+    }
+    finish_round_trip_report(
+        tsc_khz,
+        NAME,
+        [
+            "ipc_split_queued_backlog_call_to_recv",
+            "ipc_split_queued_backlog_server_body",
+            "ipc_split_queued_backlog_reply_to_return",
+        ],
+        &mut total,
+        worst,
+        seq_ring,
+        &mut to_recv,
+        &mut server_body,
+        &mut to_return,
+    );
+}
+
+pub(crate) fn probe_ipc_queued_cross_proc(tsc_khz: u64) {
+    const NAME: &str = "ipc_rt_queued_cross_proc";
+    // `getgroups(0, NULL)` uses `call_syscalld_value` -> `call_linux_syscall_endpoint`,
+    // exercising the queued cross-process IPC path into `syscalld` without private-handle ACLs.
+    let result = crate::measure(IPC_ITERS, WARMUP, || unsafe {
+        crate::syscall2(libc::SYS_getgroups as u64, 0, 0) >= 0
+    });
+    match result {
+        Some(mut samples) => report(NAME, &summarize(&mut samples), tsc_khz),
+        None => skip(NAME, "getgroups-failed"),
     }
 }
 

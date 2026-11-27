@@ -925,9 +925,9 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
             }
             next
         } else {
-            cap
+            0
         };
-        if backing.as_ref().is_none_or(|v| v.len() < need_cap) {
+        if need_cap != 0 && backing.as_ref().is_none_or(|v| v.len() < need_cap) {
             let mut candidate = Vec::new();
             if candidate.try_reserve_exact(need_cap).is_err() {
                 return false;
@@ -955,7 +955,11 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
             }
         };
         #[cfg(rustos_boot_image)]
-        let res = interrupts::without_interrupts(attempt);
+        let res = if interrupts::are_enabled() {
+            interrupts::without_interrupts(attempt)
+        } else {
+            attempt()
+        };
         #[cfg(not(rustos_boot_image))]
         let res = attempt();
         match res {
@@ -1009,7 +1013,11 @@ pub fn disarm_sleep_waiter(task_id: u64) -> bool {
     };
     #[cfg(rustos_boot_image)]
     {
-        interrupts::without_interrupts(disarm)
+        if interrupts::are_enabled() {
+            interrupts::without_interrupts(disarm)
+        } else {
+            disarm()
+        }
     }
     #[cfg(not(rustos_boot_image))]
     {

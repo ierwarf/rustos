@@ -71,7 +71,7 @@ fn every_state_event_pair_has_at_most_one_row_and_rows_follow_the_duty_rule() {
         assert_eq!(lookup(state, OwnerEvent::Withdraw).is_some(), state.is_editable(), "{state:?}");
     }
     // Every state is reachable from Dormant through the table.
-    let mut reached = [false; 9];
+    let mut reached = [false; 10];
     reached[RunOwnerState::Dormant as usize] = true;
     for _ in 0..TRANSITIONS.len() {
         for row in TRANSITIONS {

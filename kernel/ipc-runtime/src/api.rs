@@ -1,21 +1,24 @@
 pub use crate::ipc::{
     CancelledCall, CancelledCallDisposition, ChannelIdentity, EndpointCallPriority,
-    EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
-    EndpointResponseWithHandles, EndpointWakeSet, FastEndpointReceived, FastEndpointResponseTake,
-    FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IPC_FAST_MAX_BYTES, IpcError,
-    KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
-    KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
-    PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
+    EndpointPayload, EndpointPayloadTake, EndpointReceived, EndpointReceivedPayloadWithSender,
+    EndpointReceivedWithSender, EndpointResponseTake, EndpointResponseWithHandles,
+    EndpointWakeSet, EnqueuedCall, FastEndpointReceived, FastEndpointResponseTake,
+    FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IPC_FAST_MAX_BYTES,
+    IPC_QUEUED_INLINE_BYTES, IpcError, KernelEndpointHandle, KernelReplyHandle,
+    KernelSharedRegionHandle, KernelSharedRegionMappingHold, KernelTransferTicket,
+    KernelTransferredHandle, PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
     ReplySchedulingContextCustody, ReplySchedulingContextReturn, ServiceIdentity, TransferContext,
 };
 
 pub mod endpoint {
     pub use crate::ipc::{
-        EndpointCallPriority, EndpointReceive, EndpointWakeSet, FastEndpointReceived,
+        EndpointCallPriority, EndpointPayload, EndpointPayloadTake, EndpointReceive,
+        EndpointReceivePayload, EndpointWakeSet, EnqueuedCall, FastEndpointReceived,
         FastEndpointResponseTake, FastEndpointRollback, FastReplyCompletion, IpcError,
         KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
         PreparedReplyHandleBindError, ReplyCompletion, ReplySchedulingContextCustody,
         ReplySchedulingContextReturn, receive_or_wait, receive_or_wait_inline,
+        receive_or_wait_inline_payload,
     };
 
     pub fn create_for_task(owner_task_id: u64) -> Result<KernelEndpointHandle, IpcError> {
@@ -83,6 +86,26 @@ pub mod endpoint {
         kmem_group: Option<usize>,
     ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
         crate::ipc::enqueue_endpoint_call_with_handles_priority_custody_in_group(
+            endpoint,
+            caller_task_id,
+            request,
+            attached_handles,
+            priority,
+            scheduling_context,
+            kmem_group,
+        )
+    }
+
+    pub fn enqueue_call_with_handles_priority_custody_owned(
+        endpoint: KernelEndpointHandle,
+        caller_task_id: u64,
+        request: EndpointPayload,
+        attached_handles: &[KernelTransferredHandle],
+        priority: EndpointCallPriority,
+        scheduling_context: ReplySchedulingContextCustody,
+        kmem_group: Option<usize>,
+    ) -> Result<EnqueuedCall, (IpcError, bool, EndpointPayload)> {
+        crate::ipc::enqueue_endpoint_call_with_handles_priority_custody_owned(
             endpoint,
             caller_task_id,
             request,
@@ -261,11 +284,48 @@ pub mod endpoint {
         )
     }
 
+    pub fn reply_payload_for_process_with_custody(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: EndpointPayload,
+    ) -> Result<ReplyCompletion, IpcError> {
+        crate::ipc::complete_endpoint_reply_payload_for_process_with_custody(
+            reply,
+            receiver_process_id,
+            response,
+        )
+    }
+
+    pub fn reply_with_handles_payload_for_process_with_custody(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: EndpointPayload,
+        attached_handles: &[KernelTransferredHandle],
+    ) -> Result<ReplyCompletion, IpcError> {
+        crate::ipc::complete_endpoint_reply_with_handles_payload_for_process_with_custody(
+            reply,
+            receiver_process_id,
+            response,
+            attached_handles,
+        )
+    }
+
+    pub fn reply_is_known_pending(reply: KernelReplyHandle) -> bool {
+        crate::ipc::endpoint_reply_is_known_pending(reply)
+    }
+
     pub fn take_response_detailed(
         reply: KernelReplyHandle,
         handle_capacity: usize,
     ) -> Result<super::EndpointResponseTake, IpcError> {
         crate::ipc::take_endpoint_response_detailed(reply, handle_capacity)
+    }
+
+    pub fn take_response_payload_detailed(
+        reply: KernelReplyHandle,
+        handle_capacity: usize,
+    ) -> Result<super::EndpointPayloadTake, IpcError> {
+        crate::ipc::take_endpoint_response_payload_detailed(reply, handle_capacity)
     }
 
     pub fn cancel_call_with_transfers(
@@ -363,6 +423,7 @@ pub use endpoint::{
     enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles_priority_and_custody as enqueue_endpoint_call_with_handles_priority_and_custody,
     enqueue_call_with_handles_priority_custody_in_group as enqueue_endpoint_call_with_handles_priority_custody_in_group,
+    enqueue_call_with_handles_priority_custody_owned as enqueue_endpoint_call_with_handles_priority_custody_owned,
     fail_owned_by_process as fail_endpoints_owned_by_process,
     fail_owned_by_task as fail_endpoints_owned_by_task,
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
@@ -371,8 +432,11 @@ pub use endpoint::{
     restore_receiver_waiter as restore_endpoint_receiver_waiter,
     reply_custody_returned as endpoint_reply_custody_returned,
     reply_for_process_with_custody as complete_endpoint_reply_for_process_with_custody,
+    reply_payload_for_process_with_custody as complete_endpoint_reply_payload_for_process_with_custody,
     reply_with_handles_for_process_with_custody as complete_endpoint_reply_with_handles_for_process_with_custody,
+    reply_with_handles_payload_for_process_with_custody as complete_endpoint_reply_with_handles_payload_for_process_with_custody,
     take_response_detailed as take_endpoint_response_detailed,
+    take_response_payload_detailed as take_endpoint_response_payload_detailed,
 };
 pub use region::{
     acquire_mapping as acquire_shared_region_mapping,

@@ -66,11 +66,15 @@ pub(in crate::multitask::scheduler) enum RunOwnerState {
     /// synchronous-handoff FIFO (or a `DirectSwitch`) is its sole ordering
     /// owner until dispatch.
     DirectHandoff = 8,
+    /// Inactive member of a per-CPU paired execution descriptor on `cpu`.
+    /// Not runnable, not queued, and not independently wakeable or migratable
+    /// until the owning CPU dissolves the pair or resumes it.
+    Paired = 9,
 }
 
 impl RunOwnerState {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::Dormant,
         Self::Local,
         Self::RemoteQueued,
@@ -80,6 +84,7 @@ impl RunOwnerState {
         Self::Retiring,
         Self::Retired,
         Self::DirectHandoff,
+        Self::Paired,
     ];
 
     fn decode(raw: u64) -> Self {
@@ -93,6 +98,7 @@ impl RunOwnerState {
             6 => Self::Retiring,
             7 => Self::Retired,
             8 => Self::DirectHandoff,
+            9 => Self::Paired,
             state => panic!("scheduler owner word contains invalid state {state}"),
         }
     }
@@ -257,11 +263,16 @@ pub(in crate::multitask::scheduler) enum OwnerEvent {
     Withdraw = 17,
     CompleteRetire = 18,
     Release = 19,
+    PairClaim = 20,
+    PairPark = 21,
+    PairResume = 22,
+    PairBreakBlocked = 23,
+    PairBreakLocal = 24,
 }
 
 #[cfg(test)]
 impl OwnerEvent {
-    pub(super) const ALL: [Self; 19] = [
+    pub(super) const ALL: [Self; 24] = [
         Self::Admit,
         Self::AdmitRunning,
         Self::AdmitInitial,
@@ -281,6 +292,11 @@ impl OwnerEvent {
         Self::Withdraw,
         Self::CompleteRetire,
         Self::Release,
+        Self::PairClaim,
+        Self::PairPark,
+        Self::PairResume,
+        Self::PairBreakBlocked,
+        Self::PairBreakLocal,
     ];
 }
 
@@ -372,18 +388,24 @@ pub(super) const TRANSITIONS: &[Row] = &[
     row(S::Running, E::Withdraw, S::Retiring, Clear, KeepCpu, DutyKind::None),
     row(S::Migrating, E::Withdraw, S::Retiring, Clear, KeepCpu, DutyKind::None),
     row(S::DirectHandoff, E::Withdraw, S::Retiring, Clear, KeepCpu, DutyKind::None),
+    row(S::Blocked, E::PairClaim, S::Paired, Clear, Target, DutyKind::None),
+    row(S::Running, E::PairPark, S::Paired, Keep, Target, DutyKind::None),
+    row(S::Paired, E::PairResume, S::Running, Clear, Target, DutyKind::None),
+    row(S::Paired, E::PairBreakBlocked, S::Blocked, Clear, NoCpu, DutyKind::None),
+    row(S::Paired, E::PairBreakLocal, S::Local, Clear, Target, RunQueue),
+    row(S::Paired, E::Withdraw, S::Retiring, Clear, KeepCpu, DutyKind::None),
     row(S::Retiring, E::CompleteRetire, S::Retired, Clear, NoCpu, DutyKind::None),
     row(S::Retired, E::Release, S::Dormant, Clear, NoCpu, DutyKind::None),
 ];
 
-const EVENT_SLOTS: usize = 20;
+const EVENT_SLOTS: usize = 25;
 const NO_ROW: u8 = u8::MAX;
 
 /// `TRANSITIONS` indexed by `[state][event]`, built at compile time, so a
 /// transition's row lookup is one load instead of a scan of the table. A
 /// duplicate `(from, event)` pair fails the build.
-const ROW_INDEX: [[u8; EVENT_SLOTS]; 9] = {
-    let mut index = [[NO_ROW; EVENT_SLOTS]; 9];
+const ROW_INDEX: [[u8; EVENT_SLOTS]; 10] = {
+    let mut index = [[NO_ROW; EVENT_SLOTS]; 10];
     let mut row = 0;
     while row < TRANSITIONS.len() {
         let from = TRANSITIONS[row].from as usize;
@@ -890,6 +912,9 @@ pub(in crate::multitask::scheduler) fn commit_wait(slot: usize) -> WaitCommitOut
 /// only while the SAME wait-payload epoch leaf is retained.
 pub(super) fn wake_wait_locked(slot: usize) {
     word(slot).edit_in_place(|observed| {
+        if observed.state == RunOwnerState::Paired {
+            return None;
+        }
         let runnable = observed.runnable || observed.state.holds_run_custody();
         Some(observed.with_runnable(runnable).with_wait(false, 0))
     });

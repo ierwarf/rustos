@@ -21,11 +21,22 @@ pub enum EndpointReceive<const N: usize = IPC_FAST_INLINE_BYTES> {
     Empty,
 }
 
+#[derive(Debug)]
+pub enum EndpointReceivePayload<const N: usize = IPC_FAST_INLINE_BYTES> {
+    Fast(FastEndpointReceived<N>),
+    Queued(EndpointReceivedPayloadWithSender),
+    Waiting,
+    Empty,
+}
+
 /// Read-only observation of an already consumed QUEUED request, not a wake or
 /// funding grant. A nonempty request was required at enqueue; only actual recv
 /// takes it. The advisory message id never authorizes a recycled reply: both
 /// exact objects are rejoined under Message -> Reply leaves before accepting.
 pub fn received_request_retains_custody(reply: KernelReplyHandle, caller: u64) -> bool {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::received_request_retains_custody(reply.raw(), caller);
+    }
     // A fast frame is received once its receiver took it (`RequestTaken` or
     // later) and is still owed a response while the reply is neither used nor
     // consumed. Without this, a call handed off through a fast frame whose
@@ -130,6 +141,29 @@ pub fn receive_or_wait_inline<const N: usize>(
     handle_capacity: usize,
     may_wait: bool,
 ) -> Result<EndpointReceive<N>, IpcError> {
+    match receive_or_wait_inline_payload::<N>(
+        endpoint,
+        receiver_task_id,
+        request_capacity,
+        handle_capacity,
+        may_wait,
+    )? {
+        EndpointReceivePayload::Fast(received) => Ok(EndpointReceive::Fast(received)),
+        EndpointReceivePayload::Queued((reply, payload, handles, caller)) => Ok(
+            EndpointReceive::Queued((reply, payload.into_vec(), handles, caller)),
+        ),
+        EndpointReceivePayload::Waiting => Ok(EndpointReceive::Waiting),
+        EndpointReceivePayload::Empty => Ok(EndpointReceive::Empty),
+    }
+}
+
+pub fn receive_or_wait_inline_payload<const N: usize>(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    request_capacity: usize,
+    handle_capacity: usize,
+    may_wait: bool,
+) -> Result<EndpointReceivePayload<N>, IpcError> {
     // The legacy 256-byte fast image also receives larger queued byte messages.
     // Only a smaller compact image narrows the queued admission bound.
     let request_capacity = if N < IPC_FAST_INLINE_BYTES { request_capacity.min(N) } else { request_capacity };
@@ -138,18 +172,18 @@ pub fn receive_or_wait_inline<const N: usize>(
             if let Some(received) =
                 take_fast_request_inline::<N>(object, endpoint, receiver_task_id, request_capacity)?
             {
-                return Ok(EndpointReceive::Fast(received));
+                return Ok(EndpointReceivePayload::Fast(received));
             }
             if let Some(received) =
-                take_queued_request(object, endpoint, request_capacity, handle_capacity)?
+                take_queued_request_payload(object, endpoint, request_capacity, handle_capacity)?
             {
-                return Ok(EndpointReceive::Queued(received));
+                return Ok(EndpointReceivePayload::Queued(received));
             }
             if !may_wait {
-                return Ok(EndpointReceive::Empty);
+                return Ok(EndpointReceivePayload::Empty);
             }
             register_receiver(object, receiver_task_id, request_capacity)?;
-            Ok(EndpointReceive::Waiting)
+            Ok(EndpointReceivePayload::Waiting)
         })
         .ok_or(IpcError::InvalidHandle)?
 }
@@ -163,6 +197,18 @@ pub(super) fn take_fast_request_inline<const N: usize>(
     let Some(reply_id) = object.fast_reply else {
         return Ok(None);
     };
+    if virtual_rendezvous::is_virtual_reply_token(reply_id) {
+        let received = virtual_rendezvous::take_request::<N>(
+            reply_id,
+            endpoint.raw(),
+            receiver_task_id,
+            request_capacity,
+        )?;
+        if received.is_some() {
+            object.fast_reply = None;
+        }
+        return Ok(received);
+    }
     // LOCK ORDER: Endpoint -> Reply. The frame and endpoint publication are
     // validated and consumed together; no advisory read authorizes a take.
     let received = REPLIES
@@ -217,6 +263,17 @@ pub(super) fn take_queued_request(
     request_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
+    take_queued_request_payload(object, endpoint, request_capacity, handle_capacity).map(|opt| {
+        opt.map(|(reply, payload, handles, caller)| (reply, payload.into_vec(), handles, caller))
+    })
+}
+
+pub(super) fn take_queued_request_payload(
+    object: &mut EndpointObject,
+    endpoint: KernelEndpointHandle,
+    request_capacity: usize,
+    handle_capacity: usize,
+) -> Result<Option<EndpointReceivedPayloadWithSender>, IpcError> {
     // Stale identities cannot wedge a lane. Byte and handle capacity refusal
     // both preserve the exact request and its caller-owned transfer custody;
     // a later capable receiver may take it, or the caller may cancel it.

@@ -596,11 +596,16 @@ pub(super) fn retain_activation(cpu: usize, incoming: ActivationCredential) {
     // original bank grant remains live: close never sees a zero-unit gap.
 }
 
-pub(super) fn current_placement_scope(cpu: usize, slot: usize) -> Option<Option<PlacementGrant>> {
+pub(in crate::multitask) fn current_placement_scope(cpu: usize, slot: usize) -> Option<Option<PlacementGrant>> {
     let cell = TURNS.get(cpu)?;
+    #[cfg(rustos_boot_image)]
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "installed placement read before protected IRQ admission"
+    );
     #[cfg(not(test))]
     assert_eq!(
-        current_cpu(),
+        nucleus_core::util::lockdep::current_cpu_index(),
         cpu,
         "installed placement read by foreign CPU"
     );
@@ -614,6 +619,35 @@ pub(super) fn current_placement_scope(cpu: usize, slot: usize) -> Option<Option<
         Some(grant) if grant.slot() == slot => Some(Some(grant.copy_current_scope()?)),
         Some(_) => None,
     }
+}
+
+pub(in crate::multitask) fn has_installed_placement_for_paired(
+    cpu: usize,
+    slot: usize,
+    id: u64,
+    generation: u64,
+) -> bool {
+    let Some(cell) = TURNS.get(cpu) else {
+        return false;
+    };
+    #[cfg(rustos_boot_image)]
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "installed placement read before protected IRQ admission"
+    );
+    #[cfg(not(test))]
+    assert_eq!(
+        nucleus_core::util::lockdep::current_cpu_index(),
+        cpu,
+        "installed placement read by foreign CPU"
+    );
+    if !matches!(cell.phase.load(Ordering::Acquire), VACANT | OPEN) {
+        return false;
+    }
+    // SAFETY: continuous own-CPU IRQ scope; no producer/consumer overlaps.
+    unsafe { &*cell.installed_placement.get() }
+        .as_ref()
+        .is_some_and(|grant| grant.slot() == slot && grant.is_current_generation(id, generation))
 }
 
 pub(super) fn has_placement(cpu: usize, slot: usize) -> bool {
@@ -682,6 +716,21 @@ pub(super) fn lane_vacant(cpu: usize) -> bool {
 pub(super) fn install_lane_placement(cpu: usize, grant: PlacementGrant) {
     assert_eq!(TURNS[cpu].phase.load(Ordering::Acquire), VACANT, "lane placement over a live turn");
     TURNS[cpu].complete_placement_vacant(grant);
+}
+
+/// Exchanges the installed placement permission on a vacant turn cell during
+/// paired execution switches or pair dissolution.
+pub(in crate::multitask) fn swap_installed_placement(
+    cpu: usize,
+    grant: Option<PlacementGrant>,
+) -> Option<PlacementGrant> {
+    assert_eq!(
+        TURNS[cpu].phase.load(Ordering::Acquire),
+        VACANT,
+        "paired placement swap over a live turn"
+    );
+    // SAFETY: unique IRQ-excluded own-CPU Vacant actor owns installed_placement.
+    core::mem::replace(unsafe { &mut *TURNS[cpu].installed_placement.get() }, grant)
 }
 
 pub(super) fn begin_commit(cpu: usize) -> Option<CpuRspCommit<'static>> {

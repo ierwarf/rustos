@@ -16,6 +16,15 @@
 //!   `monotonic-deadline-lifecycle`, and `user-memory-access`.
 use x86_64::instructions::interrupts;
 
+#[inline]
+fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(test))]
+    if !interrupts::are_enabled() {
+        return f();
+    }
+    interrupts::without_interrupts(f)
+}
+
 pub(super) mod group_exit;
 mod job_policy;
 pub use job_policy::{current_user_job_charge_group, current_user_job_policy_allows};
@@ -208,6 +217,14 @@ pub fn current_user_id() -> Option<u64> {
 pub fn current_task_id() -> Option<u64> {
     if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
         return None;
+    }
+    #[cfg(not(test))]
+    if !interrupts::are_enabled() {
+        if let Some(identity) = published_current_identity() {
+            return identity.task_id;
+        }
+        return super::scheduler::stack_resources::context::current_task_start()
+            .map(|start| start.id);
     }
     interrupts::without_interrupts(|| {
         if let Some(identity) = published_current_identity() {
@@ -451,7 +468,7 @@ pub fn current_user_process_thread_count() -> Option<usize> {
 /// authoritative state has to be consulted; a `false` answer is conclusive and
 /// costs no scheduler lock.
 pub fn current_thread_may_have_pending_signals() -> bool {
-    interrupts::without_interrupts(|| {
+    irq_excluded(|| {
         cpu_local::current_cpu_task_slot().is_none_or(super::current_identity::signal_pending)
     })
 }
@@ -480,7 +497,7 @@ pub fn current_user_thread_id() -> Option<u64> {
 /// one coherent observation. Missing publication falls back only to joined
 /// allocation-bank Current/context/entry custody, not a Scheduler catalog.
 pub fn current_user_abi() -> Option<UserAbi> {
-    interrupts::without_interrupts(|| {
+    irq_excluded(|| {
         if let Some(abi) = cpu_local::current_cpu_task_slot()
             .and_then(super::current_identity::read_user_abi)
         {

@@ -270,3 +270,6 @@ kernel/mm/src/memory/phys/frame_descriptor_ledger/anon_run.rs	0	0
 kernel/mm/src/memory/phys/free_word_index.rs	0	0
 kernel/nucleus-core/src/debug/deferred.rs	0	0
 services/netd/src/ref_replay.rs	0	0
+kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs	0	4
+kernel/ps/src/multitask/scheduler/pair.rs	0	31
+kernel/ps/src/multitask/scheduler/pair/tests.rs	0	23

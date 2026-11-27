@@ -73,6 +73,7 @@ pub(in crate::multitask::scheduler) fn retained_architecture(
     cell.with(|r| architecture_locked(cell, r, slot, id, view))
 }
 
+
 pub(super) fn architecture_locked(
     cell: &super::ResourceCell, r: &super::Resources, slot: usize, id: u64,
     view: super::super::PublishedFrameView,

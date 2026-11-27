@@ -20,7 +20,7 @@ use nucleus_core::debug::LogCategory;
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
 #[cfg(any(test, rustos_ipc_phase_profile))]
-pub(super) const IPC_CALL_PHASE_COUNT: usize = 18;
+pub(super) const IPC_CALL_PHASE_COUNT: usize = 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IpcCallPhase {
@@ -63,6 +63,22 @@ pub(super) enum IpcCallPhase {
     FastHandoff = 16,
     /// Response take after the original handoff returns.
     FastTake = 17,
+    /// Fast path entry identity & endpoint authorization (B0.f).
+    FastAuthority = 18,
+    /// Fast path parked resume + response take + register/frame copyout (B0.f).
+    FastResumeReturn = 19,
+    /// Queued handle call: FD export loop (Q0).
+    CallExportHandles = 20,
+    /// Queued handle call: FD receive/install loop (Q0).
+    CallInstallHandles = 21,
+    /// Queued call retry loop on transient queue saturation (Q0).
+    CallQueueFullRetry = 22,
+    /// Queued handle call: user-buffer pre-copy/validate split (Q0).
+    CallValidateOutputs = 23,
+    /// Queued handle call: request user copy (Q0).
+    CallHandlesCopyRequest = 24,
+    /// Queued handle call: enqueue + wake (Q0).
+    CallHandlesEnqueue = 25,
 }
 
 #[cfg(rustos_ipc_phase_profile)]
@@ -87,6 +103,14 @@ static PROFILE: PhaseProfile<IPC_CALL_PHASE_COUNT> = PhaseProfile::new(
         "ipc-call-phase-fast-arm",
         "ipc-call-phase-fast-handoff",
         "ipc-call-phase-fast-take",
+        "ipc-call-phase-fast-authority",
+        "ipc-call-phase-fast-resume-return",
+        "ipc-call-phase-export-handles",
+        "ipc-call-phase-install-handles",
+        "ipc-call-phase-queue-full-retry",
+        "ipc-call-phase-validate-outputs",
+        "ipc-call-phase-handles-copy-request",
+        "ipc-call-phase-handles-enqueue",
     ],
     "ipc-call-phase-discarded",
 );
@@ -176,6 +200,14 @@ mod tests {
             (IpcCallPhase::FastArm, 15),
             (IpcCallPhase::FastHandoff, 16),
             (IpcCallPhase::FastTake, 17),
+            (IpcCallPhase::FastAuthority, 18),
+            (IpcCallPhase::FastResumeReturn, 19),
+            (IpcCallPhase::CallExportHandles, 20),
+            (IpcCallPhase::CallInstallHandles, 21),
+            (IpcCallPhase::CallQueueFullRetry, 22),
+            (IpcCallPhase::CallValidateOutputs, 23),
+            (IpcCallPhase::CallHandlesCopyRequest, 24),
+            (IpcCallPhase::CallHandlesEnqueue, 25),
         ];
         for (phase, index) in phases {
             assert_eq!(phase as usize, index, "phase {phase:?} moved slot");

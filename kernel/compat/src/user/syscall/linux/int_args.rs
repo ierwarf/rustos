@@ -231,17 +231,24 @@ fn canonicalize(value: u64, kind: Kind) -> u64 {
     }
 }
 
-pub(super) fn normalize_linux_int_fd_args(frame: &mut SyscallFrame) {
+/// Canonicalizes 32-bit C argument slots for a Linux syscall without mutating
+/// `frame`: x86-64 `syscall`/`sysretq` preserves user `rdi`, `rsi`, `rdx`, `r10`,
+/// `r8`, and `r9` across the trap boundary, so truncating or sign-extending a
+/// slot inside `SyscallFrame` would corrupt caller-live registers on return.
+pub(super) fn canonical_linux_args(frame: &SyscallFrame) -> [u64; 6] {
     let kinds = arg_kinds(frame.rax);
+    let raw = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
     if kinds == [W; 6] {
-        return;
+        return raw;
     }
-    frame.rdi = canonicalize(frame.rdi, kinds[0]);
-    frame.rsi = canonicalize(frame.rsi, kinds[1]);
-    frame.rdx = canonicalize(frame.rdx, kinds[2]);
-    frame.r10 = canonicalize(frame.r10, kinds[3]);
-    frame.r8 = canonicalize(frame.r8, kinds[4]);
-    frame.r9 = canonicalize(frame.r9, kinds[5]);
+    [
+        canonicalize(raw[0], kinds[0]),
+        canonicalize(raw[1], kinds[1]),
+        canonicalize(raw[2], kinds[2]),
+        canonicalize(raw[3], kinds[3]),
+        canonicalize(raw[4], kinds[4]),
+        canonicalize(raw[5], kinds[5]),
+    ]
 }
 
 #[cfg(test)]
@@ -273,9 +280,24 @@ mod tests {
     }
 
     fn run(nr: u64, args: [u64; 6]) -> [u64; 6] {
-        let mut f = frame(nr, args);
-        normalize_linux_int_fd_args(&mut f);
-        [f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9]
+        let f = frame(nr, args);
+        canonical_linux_args(&f)
+    }
+
+    #[test]
+    fn canonicalization_does_not_clobber_frame_registers() {
+        let orig = [
+            0x7000,
+            0x8d61_0000_0089,
+            0x0001_0000_0001,
+            0x10,
+            0x20,
+            0x008d_6138_85a0,
+        ];
+        let f = frame(SYS_FUTEX, orig);
+        let out = canonical_linux_args(&f);
+        assert_eq!(out, [0x7000, 0x89, 1, 0x10, 0x20, 0x6138_85a0]);
+        assert_eq!([f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9], orig);
     }
 
     #[test]

@@ -333,7 +333,7 @@ if ! grep -Fq 'libc::epoll_wait(' <<<"$wayland_accept_body" \
     echo 'Wayland accept must block on listener readiness and publish queue ownership before waking UI' >&2
     static_failures=$((static_failures + 1))
 fi
-if ! grep -Fq 'wayland_service_required(protocol_input, input.input_events, callback_due)' \
+if ! rg -Uq 'wayland_service_required\(\s*protocol_input,\s*input\.input_events,\s*callback_due,' \
         services/uiserver/src/main.rs; then
     echo 'Wayland client dispatch must require protocol input, server events, or a due callback' >&2
     static_failures=$((static_failures + 1))
@@ -897,7 +897,7 @@ if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$
     echo 'DVM block/input/network shared RAM must be exact prefetchable WB, Linux BAR2 must clear PAT cache flags, raw network resource2 access must remain absent, host input must MAP_SHARED, and ambiguous mmio::map must remain absent' >&2
     static_failures=$((static_failures + 1))
 fi
-if ! grep -Fq 'use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};' <<<"$network_ring_atomic_production" \
+if ! grep -Fq 'use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};' <<<"$network_ring_atomic_production" \
     || ! grep -Fq ').load(Ordering::Acquire)' <<<"$network_ring_atomic_production" \
     || ! grep -Fq ').store(u32::from_le(value), Ordering::Release)' <<<"$network_ring_atomic_production" \
     || ! grep -Fq 'for index in 0..36' <<<"$network_ring_atomic_production" \
@@ -1316,7 +1316,7 @@ if ! grep -Fq '.user_range_is_unmapped(' <<<"$ordinary_vma_publish_body" \
     || ! grep -Fq '.validate_user_read_buffer(VirtAddr::new(args.ctid_ptr), byte_len)?' <<<"$fork_broker_body" \
     || ! grep -Fq 'clone_user_space_cow(&cow_ranges, &eager_private_ranges)' <<<"$fork_broker_body" \
     || grep -Fq 'region.prot != 0' <<<"$pager_template_body" \
-    || ! rg -Uq '(?s)existing\.process_handle != process\.slot\(\).*existing\.process_generation != process_generation.*existing\.mm_generation != mm_generation.*slot\.publish\(None\)\?' kernel/ps/src/multitask/pager_vma.rs \
+    || ! rg -Uq '(?s)fn matches_owner\(&self, process_slot: u64, identity: ProcessIdentity\) -> bool \{.*self\.owner_process_slot == process_slot.*self\.owner_process_generation == u64::from\(identity\.process_generation\(\)\).*self\.owner_mm_generation == u64::from\(identity\.mm_generation\(\)\).*if writer\.matches_owner\(process_slot, identity\).*slot\.publish\(None\)\?' kernel/ps/src/multitask/pager_vma.rs \
     || ! rg -Uq '(?s)PagerVmaError::Malformed => 1,.*PagerVmaError::Overlap => 2,.*PagerVmaError::Pressure => 3,.*PagerVmaError::Stale => 4,.*PagerVmaError::Unstable => 5,.*PagerVmaError::Denied => 6,' "$pager_admission_source" \
     || ! grep -Fq 'count.saturating_mul(1 << 8) | pager_vma_error_class(error)' "$pager_admission_source"; then
     echo 'fork inheritance must preserve VMA authority, separate resident publication from ordinary mmap, private pre-publication copyout, reclaim stale generations, accept PROT_NONE, and retain exact failure classes' >&2
@@ -2782,6 +2782,11 @@ netd-deferred-reply/NetdDeferredReply|netd|provider_accounting::tests::refund_cu
 netd-deferred-reply/NetdDeferredReply|netd|provider_accounting::tests::delayed_charge_and_rejected_reply_never_leave_an_unowned_socket_or_charge
 service-mutation-recovery/ServiceMutationRecovery|netd|provider_accounting::tests::lost_charge_ack_is_cancelled_with_original_nonce_before_accept_token_reuse
 netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::inet_provider_start_deadline_and_token_gate_precede_the_start_closure
+ipc-register-rendezvous/IpcRegisterRendezvous|kernel-ipc-runtime|ipc::tests::virtual_rendezvous_tests::register_calls_use_disjoint_virtual_tokens_without_touching_replies_slab
+ipc-register-rendezvous/IpcRegisterRendezvous|kernel-ipc-runtime|ipc::tests::virtual_rendezvous_tests::virtual_call_rollback_before_and_after_take_matches_slab_semantics
+ipc-register-rendezvous/IpcRegisterRendezvous|kernel-ipc-runtime|ipc::tests::virtual_rendezvous_tests::virtual_call_cancellation_task_exit_and_owner_exit_settle_once
+ipc-register-rendezvous/IpcRegisterRendezvous|kernel-ipc-runtime|ipc::tests::virtual_rendezvous_tests::virtual_saturation_falls_back_cleanly_to_replies_slab
+ipc-register-rendezvous/IpcRegisterRendezvous|kernel-ipc-runtime|ipc::tests::virtual_rendezvous_tests::concurrent_virtual_replies_publish_custody_once
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-user-abi|syscall::ipc_reply_recv::tests::reply_recv_wire_shape_and_error_partition_are_stable
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-svc-runtime|ipc::tests::reply_recv_phase_tag_cannot_alias_linux_errno
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|kernel-compat|user::syscall::linux::ipc_ops::handle_receive::tests::authenticated_handle_receive_is_classified_and_keeps_deferred_reply_custody

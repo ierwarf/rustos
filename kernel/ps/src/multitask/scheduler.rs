@@ -66,6 +66,7 @@ mod reclaim;
 pub(in crate::multitask) mod retirement_cleanup;
 pub(in crate::multitask) mod runqueue;
 pub(in crate::multitask) mod resident;
+pub(in crate::multitask) mod pair;
 mod terminal_quarantine;
 pub(super) mod wake_publication;
 pub(super) mod wake_retry;
@@ -101,6 +102,14 @@ pub(super) use task_weight::{
 };
 #[cfg(test)]
 pub(super) use task_weight::MIN_LOAD_WEIGHT;
+
+#[cfg(rustos_ipc_phase_profile)]
+pub(in crate::multitask) fn diag_scheduling_context_identity(
+    slot: usize,
+    task_id: u64,
+) -> Option<kernel_object::api::identity::ObjectIdentity> {
+    scheduling_context::SchedulingContext::derived_identity(slot, task_id)
+}
 
 /// See `housekeeping_kick::task_slot_available`.
 pub(in crate::multitask) fn task_slot_available() -> bool {

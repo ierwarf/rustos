@@ -24,7 +24,7 @@ use super::RunOwnerState;
 
 /// 2 s at the 1024 Hz scheduler tick: three orders of magnitude above
 /// scheduling latency and above the ~13 ms 8-vCPU stalls in the IPC notes.
-pub(super) const THRESHOLD_TICKS: u64 = 2048;
+pub(in crate::multitask::scheduler) const THRESHOLD_TICKS: u64 = 2048;
 /// One scan per quarter second at most, on whichever CPU gets there first.
 pub(super) const PERIOD_TICKS: u64 = 256;
 const MAX_REPORTS_PER_SCAN: usize = 4;
@@ -40,6 +40,7 @@ pub(in crate::multitask::scheduler) enum CustodyGap {
     MigratingStuck = 4,
     BlockedWithRunIntent = 5,
     RunningWithoutCpu = 6,
+    PairedWithoutDescriptor = 7,
 }
 
 /// One reported lost-custody observation.
@@ -104,7 +105,10 @@ fn reserve_report_slot(emitted_this_scan: usize) -> bool {
 
 /// The classification pass, separated from rate limiting for witnesses. The
 /// caller holds `SCANNING` (or is a single-threaded witness).
-pub(super) fn scan_slots(now_ticks: u64, mut report: impl FnMut(CustodyReport)) {
+pub(in crate::multitask::scheduler) fn scan_slots(
+    now_ticks: u64,
+    mut report: impl FnMut(CustodyReport),
+) {
     #[cfg(not(test))]
     let slots = task_table::active_slots();
     #[cfg(test)]
@@ -170,6 +174,13 @@ fn classify(slot: usize, word: u64) -> Option<CustodyGap> {
         RunOwnerState::Running => crate::multitask::cpu_local::task_execution_owner(slot)
             .is_none()
             .then_some(CustodyGap::RunningWithoutCpu),
+        RunOwnerState::Paired => {
+            let Some(cpu) = owner.cpu else {
+                return Some(CustodyGap::PairedWithoutDescriptor);
+            };
+            (owner.runnable || !super::super::pair::holds_partner(cpu, slot, owner.generation))
+                .then_some(CustodyGap::PairedWithoutDescriptor)
+        }
         RunOwnerState::Dormant | RunOwnerState::Retiring | RunOwnerState::Retired => None,
     }
 }

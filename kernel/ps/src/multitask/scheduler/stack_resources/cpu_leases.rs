@@ -288,6 +288,27 @@ pub(in crate::multitask::scheduler) fn take_outgoing(cpu: usize) -> Option<Stack
     CpuLeases::take(&CPU_LEASES[cpu].outgoing)
 }
 
+/// Paired execution swap: exchanges the owning CPU's active `current` allocation pin
+/// with the inactive paired partner's retained `StackPin` under IRQ exclusion.
+pub(in crate::multitask::scheduler) fn swap_paired(
+    cpu: usize,
+    from: usize,
+    incoming: StackPin,
+) -> StackPin {
+    let bank = &CPU_LEASES[cpu];
+    assert_eq!(
+        bank.current.load(Ordering::Acquire),
+        from + 1,
+        "paired CPU allocation swap lost current custody"
+    );
+    assert_eq!(
+        bank.outgoing.load(Ordering::Acquire),
+        0,
+        "paired CPU allocation swap overlapped an uncommitted switch"
+    );
+    CpuLeases::park(&bank.current, incoming).expect("paired CPU allocation swap vanished")
+}
+
 #[cfg(test)]
 pub(in crate::multitask::scheduler) fn with_test_bank<R>(
     cpu: usize,

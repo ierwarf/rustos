@@ -511,6 +511,12 @@ flows = ["scheduler-dispatch"]
 reason = "Kernel-derived endpoint lane selection prevents service priority inversion without permitting untrusted self-promotion or ordinary-call starvation."
 
 [[risk_surfaces]]
+path = "kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Objectless virtual rendezvous slots own 16-byte register RPC state, non-reusing virtual tokens disjoint from slab handles, custody tracking, and teardown discovery."
+
+[[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
 severity = "critical"
 flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup", "process-lifecycle-transaction", "cow-frame-lifecycle"]
@@ -1817,9 +1823,17 @@ path = "kernel/ipc-runtime/src/ipc/endpoint_receive.rs"
 models = [
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
     "ipc-fast-handoff/IpcFastHandoff",
+    "ipc-register-rendezvous/IpcRegisterRendezvous",
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-priority-queue/IpcPriorityQueue",
     "ipc-handle-transfer/IpcHandleTransfer",
+]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs"
+models = [
+    "ipc-register-rendezvous/IpcRegisterRendezvous",
+    "ipc-fast-handoff/IpcFastHandoff",
 ]
 
 [[source_mappings]]
@@ -2307,6 +2321,24 @@ models = ["scheduler-resident-cell/SchedulerResidentCell"]
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/ipc_lane.rs"
 models = ["scheduler-resident-cell/SchedulerResidentCell"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/pair.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "scheduler-owner-word", "scheduler-resident-cell"]
+reason = "L2 per-CPU paired register IPC execution keeps a validated caller/server pair in masked Running<->Paired custody on a single CPU, transferring CpuLeases, current placement, and execution banks directly across fast call/reply switches while dissolving immediately to Local or Blocked(exact wait reason) on any IRQ, preemption, wake, affinity migration, or retire request. Native pair tests witness state-machine and break invariants, not full physical CR3/RSP/IRET hardware execution."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/pair.rs"
+models = ["ipc-fast-handoff/IpcFastHandoff", "scheduler-owner-word/SchedulerOwnerWord", "scheduler-resident-cell/SchedulerResidentCell"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/pair/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "scheduler-owner-word", "scheduler-resident-cell"]
+reason = "Native tests verify L2 pair cold formation, warm call/reply alternation, Paired custody checks in conservation, wake/affinity/retire/IRQ break transitions back to Local or Blocked with exact wait reasons, and reset isolation. Hardware CR3/RSP execution remains covered by KVM benchmarks."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/pair/tests.rs"
+models = ["ipc-fast-handoff/IpcFastHandoff", "scheduler-owner-word/SchedulerOwnerWord", "scheduler-resident-cell/SchedulerResidentCell"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"

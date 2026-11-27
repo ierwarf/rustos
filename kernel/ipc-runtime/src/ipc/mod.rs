@@ -28,11 +28,13 @@ mod endpoint_receive;
 mod reply_publication;
 mod shared_region_hold;
 mod slab;
+mod virtual_rendezvous;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
 pub use endpoint_receive::{
-    EndpointReceive, published_request_retains_custody, receive_or_wait, receive_or_wait_inline,
+    EndpointReceive, EndpointReceivePayload, published_request_retains_custody, receive_or_wait,
+    receive_or_wait_inline, receive_or_wait_inline_payload,
     received_request_custody_conditions, received_request_retains_custody,
 };
 pub use shared_region_hold::KernelSharedRegionMappingHold;
@@ -240,13 +242,153 @@ pub struct TransferContext {
 }
 
 pub type EndpointReceived = (KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>);
+pub const IPC_QUEUED_INLINE_BYTES: usize = 16;
+
+/// Compact payload carrier (`size_of == 24`, identical to `Vec<u8>`) avoiding
+/// heap allocation for small (<= 16-byte) queued IPC messages while moving larger
+/// `Vec<u8>` buffers by ownership without copying or enlarging slab slots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EndpointPayload {
+    Inline {
+        len: u8,
+        bytes: [u8; IPC_QUEUED_INLINE_BYTES],
+    },
+    Heap(Vec<u8>),
+}
+
+const _: () = assert!(core::mem::size_of::<EndpointPayload>() <= 32);
+
+impl Default for EndpointPayload {
+    fn default() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; IPC_QUEUED_INLINE_BYTES],
+        }
+    }
+}
+
+impl EndpointPayload {
+    #[inline]
+    pub const fn empty() -> Self {
+        Self::Inline {
+            len: 0,
+            bytes: [0; IPC_QUEUED_INLINE_BYTES],
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => usize::from(*len),
+            Self::Heap(vec) => vec.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn from_inline(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > IPC_QUEUED_INLINE_BYTES {
+            return None;
+        }
+        let mut buf = [0_u8; IPC_QUEUED_INLINE_BYTES];
+        if !bytes.is_empty() {
+            buf[..bytes.len()].copy_from_slice(bytes);
+        }
+        Some(Self::Inline {
+            len: bytes.len() as u8,
+            bytes: buf,
+        })
+    }
+
+    #[inline]
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        if bytes.is_empty() {
+            Self::empty()
+        } else {
+            Self::Heap(bytes)
+        }
+    }
+
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, IpcError> {
+        if let Some(inline) = Self::from_inline(bytes) {
+            return Ok(inline);
+        }
+        copy_endpoint_bytes(bytes).map(Self::Heap)
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Inline { len, bytes } => {
+                let len = usize::from(len);
+                if len == 0 {
+                    Vec::new()
+                } else {
+                    bytes[..len].to_vec()
+                }
+            }
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
+impl core::ops::Deref for EndpointPayload {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for EndpointPayload {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 pub type EndpointReceivedWithSender = (
     KernelReplyHandle,
     Vec<u8>,
     Vec<KernelTransferredHandle>,
     u64,
 );
+pub type EndpointReceivedPayloadWithSender = (
+    KernelReplyHandle,
+    EndpointPayload,
+    Vec<KernelTransferredHandle>,
+    u64,
+);
 pub type EndpointResponseWithHandles = (Vec<u8>, Vec<KernelTransferredHandle>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EnqueuedCall {
+    pub reply: KernelReplyHandle,
+    pub receiver_to_wake: Option<u64>,
+    pub receiver_owner_process: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EndpointPayloadTake {
+    Pending,
+    Response((EndpointPayload, Vec<KernelTransferredHandle>)),
+    Error {
+        error: IpcError,
+        discarded_request_handles: Vec<KernelTransferredHandle>,
+    },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EndpointResponseTake {
@@ -682,7 +824,7 @@ struct EndpointMessageObject {
     reply_id: u64,
     caller_task_id: u64,
     published: bool,
-    request: Vec<u8>,
+    request: EndpointPayload,
     attached_handles: Vec<KernelTransferredHandle>,
     // A broker may reserve a descriptor after the request was delivered but
     // before its service completes the exact reply.  It remains invisible
@@ -842,7 +984,7 @@ pub enum FastEndpointResponseTake<const N: usize = IPC_FAST_INLINE_BYTES> {
 
 enum EndpointResponse {
     Data {
-        bytes: Vec<u8>,
+        bytes: EndpointPayload,
         attached_handles: Vec<KernelTransferredHandle>,
         prepared_handles: Option<Vec<KernelTransferredHandle>>,
     },
@@ -1394,6 +1536,30 @@ fn endpoint_queue_is_full(endpoint: &EndpointObject) -> bool {
     endpoint.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES
 }
 
+pub fn enqueue_endpoint_call_with_handles_priority_custody_owned(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: EndpointPayload,
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+    scheduling_context: ReplySchedulingContextCustody,
+    kmem_group: Option<usize>,
+) -> Result<EnqueuedCall, (IpcError, bool, EndpointPayload)> {
+    if scheduling_context.donor_task_id() != caller_task_id {
+        return Err((IpcError::InvalidArgument, false, request));
+    }
+    enqueue_endpoint_call_with_handles_owned_faultable(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        priority,
+        Some(scheduling_context),
+        kmem_group,
+        rustos_fault_injection::should_fail("ipc.endpoint.enqueue"),
+    )
+}
+
 fn enqueue_endpoint_call_with_handles_faultable(
     endpoint: KernelEndpointHandle,
     caller_task_id: u64,
@@ -1404,12 +1570,39 @@ fn enqueue_endpoint_call_with_handles_faultable(
     kmem_group: Option<usize>,
     injected_failure: bool,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    let payload = EndpointPayload::try_from_slice(request)?;
+    enqueue_endpoint_call_with_handles_owned_faultable(
+        endpoint,
+        caller_task_id,
+        payload,
+        attached_handles,
+        priority,
+        scheduling_context,
+        kmem_group,
+        injected_failure,
+    )
+    .map(|enqueued| (enqueued.reply, enqueued.receiver_to_wake))
+    .map_err(|(err, _, _)| err)
+}
+
+fn enqueue_endpoint_call_with_handles_owned_faultable(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: EndpointPayload,
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+    scheduling_context: Option<ReplySchedulingContextCustody>,
+    kmem_group: Option<usize>,
+    injected_failure: bool,
+) -> Result<EnqueuedCall, (IpcError, bool, EndpointPayload)> {
     if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
-        return Err(IpcError::InvalidArgument);
+        return Err((IpcError::InvalidArgument, false, request));
     }
-    validate_endpoint_transfer_handles(attached_handles)?;
+    if let Err(err) = validate_endpoint_transfer_handles(attached_handles) {
+        return Err((err, false, request));
+    }
     if injected_failure {
-        return Err(IpcError::NoMemory);
+        return Err((IpcError::NoMemory, false, request));
     }
     // Bill the sender's Job before any message storage is allocated. The
     // charge moves into the message object, whose Drop refunds it on every
@@ -1422,7 +1615,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
                 group,
                 bytes,
             ) {
-                return Err(IpcError::NoMemory);
+                return Err((IpcError::NoMemory, false, request));
             }
             Some((group, bytes))
         }
@@ -1430,44 +1623,55 @@ fn enqueue_endpoint_call_with_handles_faultable(
     };
     let mut kmem_guard = MessageKmemGuard(message_kmem);
 
-    let receiver_owner = ENDPOINTS
-        .with_mut(endpoint.raw(), |endpoint| {
-            if request.len() > endpoint.max_request_bytes {
-                return Err(IpcError::InvalidArgument);
-            }
-            if attached_handles.len() > endpoint.max_request_handles {
-                return Err(IpcError::InvalidArgument);
-            }
-            if endpoint_queue_is_full(endpoint) {
-                endpoint.queue_full_hits = endpoint.queue_full_hits.wrapping_add(1);
-                return Err(IpcError::NoMemory);
-            }
-            Ok(endpoint.owner)
-        })
-        .ok_or(IpcError::InvalidHandle)??;
+    let receiver_owner = match ENDPOINTS.with_mut(endpoint.raw(), |endpoint| {
+        if request.len() > endpoint.max_request_bytes {
+            return Err((IpcError::InvalidArgument, false));
+        }
+        if attached_handles.len() > endpoint.max_request_handles {
+            return Err((IpcError::InvalidArgument, false));
+        }
+        if endpoint_queue_is_full(endpoint) {
+            endpoint.queue_full_hits = endpoint.queue_full_hits.wrapping_add(1);
+            return Err((IpcError::NoMemory, true));
+        }
+        Ok(endpoint.owner)
+    }) {
+        Some(Ok(owner)) => owner,
+        Some(Err((err, queue_full))) => return Err((err, queue_full, request)),
+        None => return Err((IpcError::InvalidHandle, false, request)),
+    };
+    let receiver_owner_process = match receiver_owner {
+        Some(EndpointOwner::Process(pid)) => Some(pid),
+        _ => None,
+    };
 
     let mut request_handles = Vec::new();
     if !attached_handles.is_empty() {
         // Retirement may collect this request and a maximum-sized reply.
-        request_handles
+        if request_handles
             .try_reserve_exact(attached_handles.len() + MAX_ENDPOINT_TRANSFER_HANDLES)
-            .map_err(|_| IpcError::NoMemory)?;
+            .is_err()
+        {
+            return Err((IpcError::NoMemory, false, request));
+        }
         request_handles.extend_from_slice(attached_handles);
     }
-    let request = copy_endpoint_bytes(request)?;
-    let message_id = ENDPOINT_MESSAGES
-        .insert(EndpointMessageObject {
-            endpoint_id: endpoint.raw(),
-            reply_id: 0,
-            caller_task_id,
-            published: false,
-            request,
-            attached_handles: request_handles,
-            prepared_reply_handles: None,
-            response: None,
-            kmem: kmem_guard.0.take(),
-        })
-        .map_err(|_| IpcError::NoMemory)?;
+    let message_id = match ENDPOINT_MESSAGES.insert(EndpointMessageObject {
+        endpoint_id: endpoint.raw(),
+        reply_id: 0,
+        caller_task_id,
+        published: false,
+        request,
+        attached_handles: request_handles,
+        prepared_reply_handles: None,
+        response: None,
+        kmem: kmem_guard.0.take(),
+    }) {
+        Ok(message_id) => message_id,
+        Err(mut rejected_msg) => {
+            return Err((IpcError::NoMemory, false, core::mem::take(&mut rejected_msg.request)));
+        }
+    };
     let reply_id = match insert_reply_object(ReplyObject {
         message_id,
         receiver_owner,
@@ -1478,8 +1682,11 @@ fn enqueue_endpoint_call_with_handles_faultable(
     }) {
         Ok(reply_id) => reply_id,
         Err(_) => {
-            drop(ENDPOINT_MESSAGES.remove(message_id));
-            return Err(IpcError::NoMemory);
+            let removed_req = ENDPOINT_MESSAGES
+                .remove(message_id)
+                .map(|mut msg| core::mem::take(&mut msg.request))
+                .unwrap_or_default();
+            return Err((IpcError::NoMemory, false, removed_req));
         }
     };
     #[cfg(test)]
@@ -1488,7 +1695,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     let receiver_to_wake = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
         if endpoint_queue_is_full(endpoint_object) {
             endpoint_object.queue_full_hits = endpoint_object.queue_full_hits.wrapping_add(1);
-            return None;
+            return Err(true);
         }
         let published = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
             message.reply_id = reply_id;
@@ -1509,10 +1716,18 @@ fn enqueue_endpoint_call_with_handles_faultable(
             true
         });
         if published != Some(true) {
-            return None;
+            return Err(false);
         }
         endpoint_object.push_pending(priority, message_id);
-        Some(
+        let depth = endpoint_object.pending_len() as u64;
+        nucleus_core::debug::ipc_tail::record_task_tail_event(
+            nucleus_core::debug::ipc_tail::IpcTailEventKind::EnqueueReq,
+            priority as u8,
+            caller_task_id as u32,
+            endpoint.raw(),
+            depth,
+        );
+        Ok(
             endpoint_object
                 .waiting_receivers
                 .pop_front()
@@ -1524,17 +1739,33 @@ fn enqueue_endpoint_call_with_handles_faultable(
                 .filter(|task_id| *task_id != caller_task_id),
         )
     });
-    let Some(Some(receiver_to_wake)) = receiver_to_wake else {
-        let _ = REPLIES.remove(reply_id);
-        drop(ENDPOINT_MESSAGES.remove(message_id));
-        return if ENDPOINTS.with(endpoint.raw(), |_| ()).is_some() {
-            Err(IpcError::NoMemory)
-        } else {
-            Err(IpcError::InvalidHandle)
-        };
+    let receiver_to_wake = match receiver_to_wake {
+        Some(Ok(wake)) => wake,
+        Some(Err(queue_full)) => {
+            reply_publication::clear_reply_publication(reply_id);
+            let _ = REPLIES.remove(reply_id);
+            let removed_req = ENDPOINT_MESSAGES
+                .remove(message_id)
+                .map(|mut msg| core::mem::take(&mut msg.request))
+                .unwrap_or_default();
+            return Err((IpcError::NoMemory, queue_full, removed_req));
+        }
+        None => {
+            reply_publication::clear_reply_publication(reply_id);
+            let _ = REPLIES.remove(reply_id);
+            let removed_req = ENDPOINT_MESSAGES
+                .remove(message_id)
+                .map(|mut msg| core::mem::take(&mut msg.request))
+                .unwrap_or_default();
+            return Err((IpcError::InvalidHandle, false, removed_req));
+        }
     };
 
-    Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
+    Ok(EnqueuedCall {
+        reply: KernelReplyHandle::from_raw(reply_id),
+        receiver_to_wake,
+        receiver_owner_process,
+    })
 }
 
 /// Reports whether a live endpoint's queued request backlog has reached
@@ -1620,35 +1851,50 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
             // front waiter to the reply frame; no advisory read/reacquisition
             // can race a receiver cancellation between selection and publish.
             let receiver_owner = endpoint_object.owner;
-            let reply_id = insert_fast_reply_object(caller_task_id, || {
-                let mut frame = FastCallFrame {
-                    endpoint_id: endpoint.raw(),
-                    caller_process_id,
-                    caller_task_id,
-                    receiver_task_id: receiver_waiter.task_id,
-                    receiver_request_capacity: receiver_waiter.request_capacity,
-                    caller_response_capacity: response_capacity,
-                    request_len: request.len(),
-                    response_len: 0,
-                    state: FastCallState::RequestReady,
-                    terminal_error: None,
-                    request: [0; IPC_FAST_INLINE_BYTES],
-                    response: [0; IPC_FAST_INLINE_BYTES],
-                    spill: spill.take(),
-                };
-                if frame.spill.is_none() {
-                    frame.request[..request.len()].copy_from_slice(request);
-                }
-                ReplyObject {
-                    message_id: 0,
-                    receiver_owner,
-                    used: false,
-                    consumed: false,
-                    scheduling_context,
-                    fast_frame: Some(frame),
-                }
-            })
-            .ok_or(IpcError::NoMemory)?;
+            let mut scheduling_context = scheduling_context;
+            let reply_id = if let Some(virtual_id) = virtual_rendezvous::try_reserve(
+                endpoint.raw(),
+                receiver_owner,
+                caller_process_id,
+                caller_task_id,
+                receiver_waiter.task_id,
+                receiver_waiter.request_capacity,
+                response_capacity,
+                request,
+                &mut scheduling_context,
+            ) {
+                virtual_id
+            } else {
+                insert_fast_reply_object(caller_task_id, || {
+                    let mut frame = FastCallFrame {
+                        endpoint_id: endpoint.raw(),
+                        caller_process_id,
+                        caller_task_id,
+                        receiver_task_id: receiver_waiter.task_id,
+                        receiver_request_capacity: receiver_waiter.request_capacity,
+                        caller_response_capacity: response_capacity,
+                        request_len: request.len(),
+                        response_len: 0,
+                        state: FastCallState::RequestReady,
+                        terminal_error: None,
+                        request: [0; IPC_FAST_INLINE_BYTES],
+                        response: [0; IPC_FAST_INLINE_BYTES],
+                        spill: spill.take(),
+                    };
+                    if frame.spill.is_none() {
+                        frame.request[..request.len()].copy_from_slice(request);
+                    }
+                    ReplyObject {
+                        message_id: 0,
+                        receiver_owner,
+                        used: false,
+                        consumed: false,
+                        scheduling_context,
+                        fast_frame: Some(frame),
+                    }
+                })
+                .ok_or(IpcError::NoMemory)?
+            };
 
             endpoint_object.waiting_receivers.pop_front();
             endpoint_object.fast_reply = Some(reply_id);
@@ -1672,10 +1918,16 @@ pub fn rollback_fast_endpoint_call(
     caller_task_id: u64,
     receiver_task_id: u64,
 ) -> Result<FastEndpointRollback, IpcError> {
+    let is_virtual = virtual_rendezvous::is_virtual_reply_token(reply.raw());
     let rollback = ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
             if endpoint_object.fast_reply != Some(reply.raw()) {
-                return Err(if REPLIES.with(reply.raw(), |_| ()).is_some() {
+                let exists = if is_virtual {
+                    virtual_rendezvous::reply_diagnostic(reply.raw()).is_some()
+                } else {
+                    REPLIES.with(reply.raw(), |_| ()).is_some()
+                };
+                return Err(if exists {
                     IpcError::PermissionDenied
                 } else {
                     IpcError::InvalidHandle
@@ -1684,25 +1936,34 @@ pub fn rollback_fast_endpoint_call(
             // Revalidate and consume under Endpoint -> Reply, before changing
             // endpoint publication. Cancellation and receive cannot split this
             // transaction or restore a waiter for a cancelled frame.
-            let (rollback, capacity) = REPLIES
-                .with_mut(reply.raw(), |reply_object| {
-                    let frame = reply_object.fast_frame.as_ref().ok_or(IpcError::InvalidHandle)?;
-                    if reply_object.used || reply_object.consumed
-                        || frame.endpoint_id != endpoint.raw()
-                        || frame.caller_task_id != caller_task_id
-                        || frame.receiver_task_id != receiver_task_id
-                        || frame.state != FastCallState::RequestReady
-                    {
-                        return Err(IpcError::PermissionDenied);
-                    }
-                    let capacity = frame.receiver_request_capacity;
-                    reply_object.consumed = true;
-                    Ok((FastEndpointRollback {
-                        receiver_task_id,
-                        scheduling_context: reply_object.scheduling_context.take(),
-                    }, capacity))
-                })
-                .ok_or(IpcError::InvalidHandle)??;
+            let (rollback, capacity) = if is_virtual {
+                virtual_rendezvous::rollback(
+                    endpoint.raw(),
+                    reply.raw(),
+                    caller_task_id,
+                    receiver_task_id,
+                )?
+            } else {
+                REPLIES
+                    .with_mut(reply.raw(), |reply_object| {
+                        let frame = reply_object.fast_frame.as_ref().ok_or(IpcError::InvalidHandle)?;
+                        if reply_object.used || reply_object.consumed
+                            || frame.endpoint_id != endpoint.raw()
+                            || frame.caller_task_id != caller_task_id
+                            || frame.receiver_task_id != receiver_task_id
+                            || frame.state != FastCallState::RequestReady
+                        {
+                            return Err(IpcError::PermissionDenied);
+                        }
+                        let capacity = frame.receiver_request_capacity;
+                        reply_object.consumed = true;
+                        Ok((FastEndpointRollback {
+                            receiver_task_id,
+                            scheduling_context: reply_object.scheduling_context.take(),
+                        }, capacity))
+                    })
+                    .ok_or(IpcError::InvalidHandle)??
+            };
             endpoint_object.fast_reply = None;
             if let Some(waiter) = endpoint_object.waiting_receivers.iter_mut()
                 .find(|waiter| waiter.task_id == receiver_task_id)
@@ -1719,7 +1980,9 @@ pub fn rollback_fast_endpoint_call(
             Ok(rollback)
         })
         .ok_or(IpcError::InvalidHandle)??;
-    drop(REPLIES.remove(reply.raw()));
+    if !is_virtual {
+        drop(REPLIES.remove(reply.raw()));
+    }
     Ok(rollback)
 }
 
@@ -1728,6 +1991,9 @@ pub fn rollback_fast_endpoint_call(
 /// The caller must then wait for that response rather than report a failure
 /// for a request that the server is executing.
 pub fn fast_endpoint_request_owned_by_receiver(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::fast_request_owned_by_receiver(reply.raw(), caller_task_id);
+    }
     REPLIES
         .with(reply.raw(), |reply_object| {
             !reply_object.consumed
@@ -1826,6 +2092,13 @@ fn complete_fast_endpoint_reply(
     receiver_task_id: u64,
     mut response: FastReplyBytes<'_>,
 ) -> Result<FastReplyCompletion, IpcError> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::complete_reply(
+            reply.raw(),
+            receiver_task_id,
+            response.as_slice(),
+        );
+    }
     let response_len = response.as_slice().len();
     // Validate before preparing a potentially large buffer. This observation
     // grants no authority: cancellation, teardown or another reply may win
@@ -1944,6 +2217,9 @@ pub fn take_fast_endpoint_response_inline<const N: usize>(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<FastEndpointResponseTake<N>, IpcError> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::take_response::<N>(reply.raw(), caller_task_id);
+    }
     // One acquisition where `with_mut` then `remove` took this slot's lock
     // twice; `GenerationalSlab::with_mut_take` says why the object comes back.
     let (result, retired) = REPLIES
@@ -2000,6 +2276,9 @@ pub fn take_fast_endpoint_response_inline<const N: usize>(
 /// capability.  The scheduler uses this only to establish bounded priority
 /// inheritance before a process-owned endpoint has selected a specific worker.
 pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::endpoint_receiver_process_for_reply(reply.raw());
+    }
     REPLIES
         .with(reply.raw(), |reply_object| {
             match reply_object.receiver_owner {
@@ -2016,6 +2295,9 @@ pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u
 /// request taken by a receiver (`used`), 4 response present, 8 consumed,
 /// 16 fast frame. Grants nothing; for stall reports only.
 pub fn reply_diagnostic(reply: KernelReplyHandle) -> Option<(u64, u64, u64)> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::reply_diagnostic(reply.raw());
+    }
     let (message_id, receiver, mut bits) = REPLIES.with(reply.raw(), |object| {
         let receiver = match object.receiver_owner {
             Some(EndpointOwner::Process(id)) => id,
@@ -2361,6 +2643,19 @@ pub fn complete_endpoint_reply_for_process_with_custody(
     )
 }
 
+pub fn complete_endpoint_reply_payload_for_process_with_custody(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: EndpointPayload,
+) -> Result<ReplyCompletion, IpcError> {
+    complete_endpoint_reply_with_handles_payload_for_process_with_custody(
+        reply,
+        receiver_process_id,
+        response,
+        &[],
+    )
+}
+
 pub fn complete_endpoint_reply_with_handles_for_process_with_custody(
     reply: KernelReplyHandle,
     receiver_process_id: u64,
@@ -2375,8 +2670,33 @@ pub fn complete_endpoint_reply_with_handles_for_process_with_custody(
     )
 }
 
+pub fn complete_endpoint_reply_with_handles_payload_for_process_with_custody(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: EndpointPayload,
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<ReplyCompletion, IpcError> {
+    if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
+    validate_endpoint_transfer_handles(attached_handles)?;
+    if rustos_fault_injection::should_fail("ipc.endpoint.reply") {
+        return Err(IpcError::NoMemory);
+    }
+    complete_endpoint_reply_prepared(
+        reply,
+        Some(EndpointOwner::Process(receiver_process_id)),
+        prepare_endpoint_response_payload(response, attached_handles)?,
+    )
+}
+
 #[cfg(test)]
 fn ensure_reply_has_no_scheduling_context(reply: KernelReplyHandle) -> Result<(), IpcError> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return (!virtual_rendezvous::has_scheduling_context(reply.raw())?)
+            .then_some(())
+            .ok_or(IpcError::InvalidArgument);
+    }
     REPLIES
         .with(reply.raw(), |object| object.scheduling_context.is_none())
         .ok_or(IpcError::InvalidHandle)?
@@ -2445,8 +2765,8 @@ fn complete_endpoint_reply_with_handles_for_owner_faultable(
     .map(|completion| completion.caller_task_id)
 }
 
-fn prepare_endpoint_response(
-    response: &[u8],
+fn prepare_endpoint_response_payload(
+    bytes: EndpointPayload,
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<EndpointResponse, IpcError> {
     let mut handles = Vec::new();
@@ -2458,10 +2778,17 @@ fn prepare_endpoint_response(
         handles.extend_from_slice(attached_handles);
     }
     Ok(EndpointResponse::Data {
-        bytes: copy_endpoint_bytes(response)?,
+        bytes,
         attached_handles: handles,
         prepared_handles: None,
     })
+}
+
+fn prepare_endpoint_response(
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<EndpointResponse, IpcError> {
+    prepare_endpoint_response_payload(EndpointPayload::try_from_slice(response)?, attached_handles)
 }
 
 fn copy_endpoint_bytes(bytes: &[u8]) -> Result<Vec<u8>, IpcError> {
@@ -2478,6 +2805,13 @@ fn complete_endpoint_reply_prepared(
     response: EndpointResponse,
 ) -> Result<ReplyCompletion, IpcError> {
     let message_id = published_reply_message_id(reply.raw()).ok_or(IpcError::InvalidHandle)?;
+    nucleus_core::debug::ipc_tail::record_task_tail_event(
+        nucleus_core::debug::ipc_tail::IpcTailEventKind::ReplyPublish,
+        0,
+        0,
+        reply.raw(),
+        message_id,
+    );
 
     // Keep ownership outside both slot locks until the exact reply identity
     // has been revalidated. If the transaction loses a race, the backing
@@ -2528,6 +2862,7 @@ fn complete_endpoint_reply_prepared(
                     let caller_task_id = message.caller_task_id;
                     message.response = response.take();
                     reply_object.used = true;
+                    reply_publication::note_reply_published(reply.raw());
                     Ok(ReplyCompletion {
                         caller_task_id,
                         scheduling_context: reply_object.scheduling_context.take(),
@@ -2563,14 +2898,37 @@ pub fn take_endpoint_response_with_handle_limit(
     }
 }
 
+pub fn endpoint_reply_is_known_pending(reply: KernelReplyHandle) -> bool {
+    reply_publication::reply_is_known_pending(reply.raw())
+}
+
 pub fn take_endpoint_response_detailed(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<EndpointResponseTake, IpcError> {
+    match take_endpoint_response_payload_detailed(reply, handle_capacity)? {
+        EndpointPayloadTake::Pending => Ok(EndpointResponseTake::Pending),
+        EndpointPayloadTake::Response((bytes, handles)) => {
+            Ok(EndpointResponseTake::Response((bytes.into_vec(), handles)))
+        }
+        EndpointPayloadTake::Error {
+            error,
+            discarded_request_handles,
+        } => Ok(EndpointResponseTake::Error {
+            error,
+            discarded_request_handles,
+        }),
+    }
+}
+
+pub fn take_endpoint_response_payload_detailed(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+) -> Result<EndpointPayloadTake, IpcError> {
     enum RawTake {
         Pending,
         Response {
-            bytes: Vec<u8>,
+            bytes: EndpointPayload,
             attached_handles: Vec<KernelTransferredHandle>,
             prepared_handles: Option<Vec<KernelTransferredHandle>>,
         },
@@ -2642,6 +3000,9 @@ pub fn take_endpoint_response_detailed(
             }) else {
                 return ((Err(IpcError::InvalidHandle), None), false);
             };
+            if retired_reply.is_some() {
+                reply_publication::clear_reply_publication(reply.raw());
+            }
             let retire_message = retired_reply.is_some();
             ((inner, retired_reply), retire_message)
         })
@@ -2664,12 +3025,12 @@ pub fn take_endpoint_response_detailed(
         };
 
     match result? {
-        RawTake::Pending => Ok(EndpointResponseTake::Pending),
+        RawTake::Pending => Ok(EndpointPayloadTake::Pending),
         RawTake::Response {
             bytes,
             attached_handles,
             prepared_handles,
-        } => Ok(EndpointResponseTake::Response((
+        } => Ok(EndpointPayloadTake::Response((
             bytes,
             merge_handles(attached_handles, prepared_handles),
         ))),
@@ -2677,7 +3038,7 @@ pub fn take_endpoint_response_detailed(
             error,
             attached_handles: request_handles,
             prepared_handles,
-        } => Ok(EndpointResponseTake::Error {
+        } => Ok(EndpointPayloadTake::Error {
             error,
             discarded_request_handles: merge_handles(request_handles, prepared_handles),
         }),
@@ -2719,6 +3080,9 @@ pub fn cancel_endpoint_call_with_transfers(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<CancelledCall, IpcError> {
+    if virtual_rendezvous::is_virtual_reply_token(reply.raw()) {
+        return virtual_rendezvous::cancel_call(reply.raw(), caller_task_id);
+    }
     enum CancelTarget {
         Fast {
             endpoint_id: u64,
@@ -2836,6 +3200,7 @@ pub fn cancel_endpoint_call_with_transfers(
     let message = ENDPOINT_MESSAGES
         .remove(message_id)
         .ok_or(IpcError::InvalidHandle)?;
+    reply_publication::clear_reply_publication(reply.raw());
     let reply_object = REPLIES.remove(reply.raw()).ok_or(IpcError::InvalidHandle)?;
     Ok(CancelledCall {
         transfers: transfers_from_message(message),
@@ -2927,6 +3292,10 @@ pub fn cancel_endpoint_calls_for_task(
         }
         cancelled += 1;
     }
+    cancelled += virtual_rendezvous::cancel_calls_for_task(
+        task_id,
+        &mut release_scheduling_context,
+    );
     cancelled
 }
 
@@ -3059,7 +3428,11 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
             || owned_overflow.contains(&endpoint_id)
     };
 
-    wake_set.reserve_for_endpoint_teardown(REPLIES.occupied_count());
+    wake_set.reserve_for_endpoint_teardown(
+        REPLIES.occupied_count() + virtual_rendezvous::occupied_count_estimate(),
+    );
+
+    virtual_rendezvous::fail_endpoints(&owned_contains, err, &mut wake_set);
 
     // A receiver removes fast_reply when it takes the request, but the
     // live reply still belongs to this endpoint until completion. Fail both
@@ -3092,6 +3465,7 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
             }
             reply.used = true;
             message.response = Some(EndpointResponse::Error(err));
+            reply_publication::note_reply_published(message.reply_id);
             (true, reply.scheduling_context.take())
         });
         if let Some((true, scheduling_context)) = failed {

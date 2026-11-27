@@ -157,6 +157,9 @@ pub(in crate::multitask) fn call(
     if !ipc_publication::scoped(scope) || endpoint == 0 || reply == 0 || !cpu_local::lane_idle(cpu) {
         return declined;
     }
+    if let Some(next_rsp) = super::pair::try_call(scope, endpoint, reply, receiver_id, rsp, &clock) {
+        return Outcome::Switched(next_rsp);
+    }
     let Some(c) = cpu_local::current_cpu_task_slot() else { return declined };
     let Some(c_id) = stack_resources::task_start::read(c).map(|start| start.id) else { return declined };
     let c_owner = runqueue::owner(c);
@@ -241,6 +244,11 @@ pub(in crate::multitask) fn reply(
     let clock = crate::arch::rtc::sample();
     if !ipc_publication::scoped(scope) || reply == 0 || !cpu_local::lane_idle(cpu) {
         return declined;
+    }
+    if let Some(next_rsp) = super::pair::try_reply(
+        scope, reply, caller_id, context_owner, context, rsp, &clock,
+    ) {
+        return Outcome::Switched(next_rsp);
     }
     let Some(s) = cpu_local::current_cpu_task_slot() else { return declined };
     let Some(s_id) = stack_resources::task_start::read(s).map(|start| start.id) else { return declined };

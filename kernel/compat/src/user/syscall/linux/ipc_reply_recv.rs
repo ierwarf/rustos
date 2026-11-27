@@ -117,9 +117,14 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> LinuxResult<u64> {
     // Inline bytes were already snapshotted during preflight; a larger response is
     // copied once and serves both a fast frame's spill and a queued reply object.
     let mut large_response: Vec<u8> = Vec::new();
+    let copy_mark = crate::user::syscall::linux::ipc_server_profile::now();
     if !inline {
         large_response = copy_request_from_user(args.response_ptr, args.response_len)?;
     }
+    let _ = crate::user::syscall::linux::ipc_server_profile::charge(
+        crate::user::syscall::linux::ipc_server_profile::IpcServerPhase::ReplyCopy,
+        copy_mark,
+    );
     if response_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES {
         let reply_handle = KernelReplyHandle::from_raw(args.reply_cap);
         // A large response moves into the frame spill without a second copy; a
@@ -170,19 +175,25 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> LinuxResult<u64> {
             }
         }
     }
-    let response: &[u8] = if inline {
-        &inline_response[..response_len]
+    let response_len_bytes = if inline {
+        response_len
     } else {
-        large_response.as_slice()
+        large_response.len()
+    };
+    let response_payload = if inline {
+        kernel_ipc_runtime::api::EndpointPayload::try_from_slice(&inline_response[..response_len])
+            .map_err(ipc_error_to_linux_errno)?
+    } else {
+        kernel_ipc_runtime::api::EndpointPayload::from_vec(large_response)
     };
     // The fast branch above publishes in-kernel without a user copy and cannot
     // be slow; only this path pays for the slow-call timing reads.
     let start_ticks = crate::arch::rtc::ticks();
     let copy_ticks = crate::arch::rtc::ticks();
-    let completion = kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
+    let completion = kernel_ipc_runtime::api::complete_endpoint_reply_payload_for_process_with_custody(
         KernelReplyHandle::from_raw(args.reply_cap),
         receiver_process_id,
-        response,
+        response_payload,
     )
     .map_err(|err| {
         record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
@@ -195,7 +206,7 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> LinuxResult<u64> {
         start_ticks,
         copy_ticks,
         reply_ticks,
-        response.len(),
+        response_len_bytes,
     );
 
     // Both representations carry the same reply/context custody into receive.
