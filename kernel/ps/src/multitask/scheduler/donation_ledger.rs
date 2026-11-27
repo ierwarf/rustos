@@ -20,7 +20,7 @@
 
 use alloc::vec::Vec;
 use crate::multitask::task_table;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
@@ -61,10 +61,130 @@ impl FundingBasis {
     pub(super) fn root(&self) -> (usize, u64) { (self.root_slot, self.root_id) }
 }
 
+const EMPTY_BUCKET: u32 = u32::MAX;
+
+#[inline]
+const fn hash_u64(mut x: u64) -> usize {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x as usize
+}
+
+#[inline]
+const fn hash_reply(reply: u64, namespace: DonationNamespace) -> usize {
+    hash_u64(reply ^ ((namespace_tag(namespace) as u64) << 56))
+}
+
+/// Zero-allocation-under-lock open-addressed hash table with backward-shift
+/// deletion (no tombstones ever accumulate). Sized to `>= 2 * entries.len()`
+/// in unmasked `ensure_capacity`, keeping load factor `<= 0.5`.
+struct IndexTable {
+    buckets: Vec<u32>,
+}
+
+impl IndexTable {
+    const fn new() -> Self {
+        Self { buckets: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.buckets.fill(EMPTY_BUCKET);
+    }
+
+    fn reset_capacity(&mut self, power_of_two_cap: usize) {
+        debug_assert!(power_of_two_cap.is_power_of_two());
+        self.buckets.clear();
+        self.buckets.resize(power_of_two_cap, EMPTY_BUCKET);
+    }
+
+    #[inline]
+    fn find(&self, hash: usize, matches: impl Fn(usize) -> bool) -> Option<usize> {
+        let len = self.buckets.len();
+        if len == 0 {
+            return None;
+        }
+        let mask = len - 1;
+        let mut pos = hash & mask;
+        loop {
+            let idx = self.buckets[pos];
+            if idx == EMPTY_BUCKET {
+                return None;
+            }
+            if matches(idx as usize) {
+                return Some(idx as usize);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: usize, entry_idx: usize) {
+        let mask = self.buckets.len() - 1;
+        let mut pos = hash & mask;
+        while self.buckets[pos] != EMPTY_BUCKET {
+            pos = (pos + 1) & mask;
+        }
+        self.buckets[pos] = entry_idx as u32;
+    }
+
+    #[inline]
+    fn remove(&mut self, hash: usize, entry_idx: usize, hash_of_entry: impl Fn(usize) -> usize) {
+        let mask = self.buckets.len() - 1;
+        let target = entry_idx as u32;
+        let mut pos = hash & mask;
+        loop {
+            let cur = self.buckets[pos];
+            assert_ne!(cur, EMPTY_BUCKET, "donation index missing entry={entry_idx}");
+            if cur == target {
+                break;
+            }
+            pos = (pos + 1) & mask;
+        }
+        let mut hole = pos;
+        let mut cur = (hole + 1) & mask;
+        loop {
+            let next_idx = self.buckets[cur];
+            if next_idx == EMPTY_BUCKET {
+                self.buckets[hole] = EMPTY_BUCKET;
+                return;
+            }
+            let ideal = hash_of_entry(next_idx as usize) & mask;
+            if hole.wrapping_sub(ideal) & mask < cur.wrapping_sub(ideal) & mask {
+                self.buckets[hole] = next_idx;
+                hole = cur;
+            }
+            cur = (cur + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn repoint(&mut self, hash: usize, old_idx: usize, new_idx: usize) {
+        let mask = self.buckets.len() - 1;
+        let target = old_idx as u32;
+        let mut pos = hash & mask;
+        loop {
+            let cur = self.buckets[pos];
+            assert_ne!(cur, EMPTY_BUCKET, "donation index missing moved entry={old_idx}");
+            if cur == target {
+                self.buckets[pos] = new_idx as u32;
+                return;
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+}
+
 struct DonationLedger {
     /// One donation per task slot; sized once by `provision`, empty before.
     entries: Vec<Option<LedgerEntry>>,
     len: usize,
+    /// O(1) lookup for unbound reservations (`reply == 0`) keyed by `donor_task_id`.
+    reservation_index: IndexTable,
+    /// O(1) lookup for attached/bound replies (`reply != 0`) keyed by `(reply, namespace)`.
+    reply_index: IndexTable,
 }
 
 impl DonationLedger {
@@ -72,6 +192,8 @@ impl DonationLedger {
         Self {
             entries: Vec::new(),
             len: 0,
+            reservation_index: IndexTable::new(),
+            reply_index: IndexTable::new(),
         }
     }
 
@@ -79,11 +201,29 @@ impl DonationLedger {
     fn clear(&mut self) {
         self.entries.fill(None);
         self.len = 0;
+        self.reservation_index.clear();
+        self.reply_index.clear();
     }
 
     fn ensure_capacity(&mut self, slots: usize) {
         if self.entries.len() < slots {
             self.entries.resize(slots, None);
+        }
+        let target_buckets = self.entries.len().max(16).saturating_mul(2).next_power_of_two();
+        if self.reservation_index.buckets.len() < target_buckets {
+            self.reservation_index.reset_capacity(target_buckets);
+            self.reply_index.reset_capacity(target_buckets);
+            for idx in 0..self.len {
+                if let Some(entry) = self.entries[idx] {
+                    if entry.donation.reply == 0 {
+                        self.reservation_index
+                            .insert(hash_u64(entry.donation.donor_task_id), idx);
+                    } else {
+                        self.reply_index
+                            .insert(hash_reply(entry.donation.reply, entry.donation.namespace), idx);
+                    }
+                }
+            }
         }
     }
 
@@ -91,34 +231,122 @@ impl DonationLedger {
         if self.len == self.entries.len() {
             return false;
         }
-        self.entries[self.len] = Some(entry);
+        let idx = self.len;
+        self.entries[idx] = Some(entry);
         self.len += 1;
+        if entry.donation.reply == 0 {
+            self.reservation_index
+                .insert(hash_u64(entry.donation.donor_task_id), idx);
+        } else {
+            self.reply_index
+                .insert(hash_reply(entry.donation.reply, entry.donation.namespace), idx);
+        }
         true
     }
 
     fn remove(&mut self, index: usize) -> LedgerEntry {
         assert!(index < self.len, "scheduler donation index exceeds ledger");
+        let entry = self.entries[index]
+            .expect("scheduler donation ledger prefix contains an empty entry");
+        if entry.donation.reply == 0 {
+            let entries = &self.entries;
+            self.reservation_index
+                .remove(hash_u64(entry.donation.donor_task_id), index, |i| {
+                    hash_u64(
+                        entries[i]
+                            .expect("indexed reservation missing")
+                            .donation
+                            .donor_task_id,
+                    )
+                });
+        } else {
+            let entries = &self.entries;
+            self.reply_index.remove(
+                hash_reply(entry.donation.reply, entry.donation.namespace),
+                index,
+                |i| {
+                    let d = entries[i].expect("indexed reply missing").donation;
+                    hash_reply(d.reply, d.namespace)
+                },
+            );
+        }
         self.len -= 1;
         let removed = self.entries[index]
             .take()
             .expect("scheduler donation ledger prefix contains an empty entry");
         if index != self.len {
-            self.entries[index] = self.entries[self.len].take();
+            let moved = self.entries[self.len]
+                .take()
+                .expect("scheduler donation ledger tail missing");
+            self.entries[index] = Some(moved);
+            if moved.donation.reply == 0 {
+                self.reservation_index.repoint(
+                    hash_u64(moved.donation.donor_task_id),
+                    self.len,
+                    index,
+                );
+            } else {
+                self.reply_index.repoint(
+                    hash_reply(moved.donation.reply, moved.donation.namespace),
+                    self.len,
+                    index,
+                );
+            }
         }
         removed
     }
 
+    fn promote_reservation(
+        &mut self,
+        index: usize,
+        reply: u64,
+        namespace: Option<DonationNamespace>,
+    ) -> &mut LedgerEntry {
+        debug_assert!(reply != 0);
+        let donor_id = self.entries[index]
+            .expect("scheduler donation reservation disappeared")
+            .donation
+            .donor_task_id;
+        {
+            let entries = &self.entries;
+            self.reservation_index
+                .remove(hash_u64(donor_id), index, |i| {
+                    hash_u64(
+                        entries[i]
+                            .expect("indexed reservation missing")
+                            .donation
+                            .donor_task_id,
+                    )
+                });
+        }
+        let entry = self.entries[index]
+            .as_mut()
+            .expect("scheduler donation reservation disappeared");
+        entry.donation.reply = reply;
+        if let Some(ns) = namespace {
+            entry.donation.namespace = ns;
+        }
+        let final_ns = entry.donation.namespace;
+        self.reply_index.insert(hash_reply(reply, final_ns), index);
+        self.entries[index]
+            .as_mut()
+            .expect("scheduler donation reservation disappeared")
+    }
+
     fn find_reservation(&self, donor_task_id: u64) -> Option<usize> {
-        self.entries[..self.len].iter().position(|entry| {
-            entry.is_some_and(|entry| {
+        self.reservation_index.find(hash_u64(donor_task_id), |idx| {
+            self.entries[idx].is_some_and(|entry| {
                 entry.donation.reply == 0 && entry.donation.donor_task_id == donor_task_id
             })
         })
     }
 
     fn find_reply(&self, reply: u64, namespace: DonationNamespace) -> Option<usize> {
-        self.entries[..self.len].iter().position(|entry| {
-            entry.is_some_and(|entry| {
+        if reply == 0 {
+            return None;
+        }
+        self.reply_index.find(hash_reply(reply, namespace), |idx| {
+            self.entries[idx].is_some_and(|entry| {
                 entry.donation.reply == reply && entry.donation.namespace == namespace
             })
         })
@@ -171,6 +399,10 @@ pub(super) fn release_reply_lane(donor_slot: usize, donor_id: u64, reply: u64) -
         || release_reply(reply, DonationNamespace::IpcReply)
 }
 static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Number of currently active priority-donated edges across the kernel.
+/// Zero whenever no User task holds inherited System priority, enabling O(1)
+/// short-circuits in local overdue/hint scans.
+static LIVE_INHERITED_SYSTEM_EDGES: AtomicUsize = AtomicUsize::new(0);
 /// Read side of the class exclusion: claims in progress on each CPU. A count
 /// rather than a flag only so native fixtures, which run many test threads as
 /// one modeled CPU, cannot clear each other's section.
@@ -207,6 +439,7 @@ pub(super) fn reset() {
     lazy::reset();
     begin_class_publication();
     ledger.clear();
+    LIVE_INHERITED_SYSTEM_EDGES.store(0, Ordering::Release);
     for slot in task_table::allocated_slots() {
         let Some(task) = task_table::try_get(slot) else { continue; };
         // ORDERING: Release resets class/context metadata before test runs resume.
@@ -376,11 +609,7 @@ pub(super) fn attach(reply: u64, namespace: DonationNamespace, donor_task_id: u6
     let Some(index) = ledger.find_reservation(donor_task_id) else {
         return false;
     };
-    ledger.entries[index]
-        .as_mut()
-        .expect("scheduler donation reservation disappeared")
-        .donation
-        .reply = reply;
+    let _ = ledger.promote_reservation(index, reply, None);
     true
 }
 
@@ -514,11 +743,7 @@ fn bind_reserved_locked(
     let Some(index) = ledger.find_reservation(donor_task_id) else {
         return false;
     };
-    let entry = ledger.entries[index]
-        .as_mut()
-        .expect("scheduler donation reservation disappeared");
-    entry.donation.reply = reply;
-    entry.donation.namespace = namespace;
+    let entry = ledger.promote_reservation(index, reply, Some(namespace));
     bind_entry_to_receiver(entry, receiver_task_id, receiver_slot);
     true
 }
@@ -665,6 +890,12 @@ pub(super) fn release_task(task_id: u64) {
 }
 
 #[inline]
+pub(super) fn live_inherited_system_count() -> usize {
+    // ORDERING: Acquire pairs with increment/decrement Release under class exclusion.
+    LIVE_INHERITED_SYSTEM_EDGES.load(Ordering::Acquire)
+}
+
+#[inline]
 pub(super) fn inherited_system(slot: usize) -> bool {
     task_table::try_get(slot)
         // ORDERING: Acquire pairs with increment/decrement Release under class exclusion.
@@ -795,6 +1026,7 @@ fn increment_receiver(slot: usize) {
         previous != u8::MAX,
         "scheduler donation receiver count overflow"
     );
+    LIVE_INHERITED_SYSTEM_EDGES.fetch_add(1, Ordering::Release);
     end_class_publication();
 }
 
@@ -803,6 +1035,7 @@ fn decrement_receiver(slot: usize) {
     // ORDERING: Release publishes decreased inherited_system count after class exclusion.
     let previous = task_table::get(slot).inherited_system.fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "scheduler donation receiver count underflow");
+    LIVE_INHERITED_SYSTEM_EDGES.fetch_sub(1, Ordering::Release);
     end_class_publication();
 }
 
@@ -984,6 +1217,85 @@ mod tests {
     #[test]
     fn multithreaded_server_charge_tokens_restore_the_previous_live_reply() {
         owned::restore_previous();
+    }
+
+    #[test]
+    fn donation_index_tables_handle_insert_promote_swap_remove_and_resize() {
+        use super::{DonationLedger, DonationNamespace, IpcDonationTarget, IpcPriorityDonation, LedgerEntry};
+
+        let mut ledger = DonationLedger::new();
+        ledger.ensure_capacity(16);
+
+        let make_res = |donor: u64| LedgerEntry {
+            donation: IpcPriorityDonation {
+                reply: 0,
+                namespace: DonationNamespace::IpcReply,
+                donor_task_id: donor,
+                context_owner_task_id: donor,
+                context_owner_slot: 1,
+                priority_donated: false,
+                custody_active: false,
+                target: IpcDonationTarget::AwaitingReceiver,
+            },
+            receiver_slot: None,
+            funding: None,
+        };
+
+        // Insert 12 reservations and verify O(1) lookup.
+        for donor in 1..=12_u64 {
+            assert!(ledger.insert(make_res(donor)));
+        }
+        for donor in 1..=12_u64 {
+            assert!(ledger.find_reservation(donor).is_some());
+        }
+        // Promote even donors to replies in both namespaces.
+        for donor in (2..=12_u64).step_by(2) {
+            let idx = ledger.find_reservation(donor).unwrap();
+            let ns = if donor % 4 == 0 {
+                DonationNamespace::PagerFault
+            } else {
+                DonationNamespace::IpcReply
+            };
+            let _ = ledger.promote_reservation(idx, 100 + donor, Some(ns));
+            assert_eq!(ledger.find_reservation(donor), None);
+            assert_eq!(ledger.find_reply(100 + donor, ns), Some(idx));
+        }
+        // Grow capacity and verify rebuild preserves every reservation and reply.
+        ledger.ensure_capacity(64);
+        for donor in (1..=11_u64).step_by(2) {
+            assert!(ledger.find_reservation(donor).is_some());
+        }
+        for donor in (2..=12_u64).step_by(2) {
+            let ns = if donor % 4 == 0 {
+                DonationNamespace::PagerFault
+            } else {
+                DonationNamespace::IpcReply
+            };
+            assert!(ledger.find_reply(100 + donor, ns).is_some());
+        }
+        // Swap-remove from the front repeatedly to exercise backward-shift + repoint.
+        while ledger.len > 0 {
+            let removed = ledger.remove(0);
+            if removed.donation.reply == 0 {
+                assert_eq!(ledger.find_reservation(removed.donation.donor_task_id), None);
+            } else {
+                assert_eq!(
+                    ledger.find_reply(removed.donation.reply, removed.donation.namespace),
+                    None
+                );
+            }
+            for idx in 0..ledger.len {
+                let e = ledger.entries[idx].unwrap();
+                if e.donation.reply == 0 {
+                    assert_eq!(ledger.find_reservation(e.donation.donor_task_id), Some(idx));
+                } else {
+                    assert_eq!(
+                        ledger.find_reply(e.donation.reply, e.donation.namespace),
+                        Some(idx)
+                    );
+                }
+            }
+        }
     }
 }
 

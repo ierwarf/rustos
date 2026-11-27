@@ -169,47 +169,27 @@ impl From<DvmGpuTimelineError> for GpuSceneError {
     }
 }
 
-/// Deterministic rectangle packer for one immutable atlas generation. It copies
-/// independently rasterized source surfaces into isolated regions; it never
-/// paints their final destination positions or performs z-order composition.
-/// One transparent texel around each region prevents nearest-sample bleed.
-pub(crate) struct GpuAtlasPacker<'a> {
-    pixels: &'a mut [u32],
+/// Pure-geometry rectangle packer matching [`GpuAtlasPacker`] identically.
+/// Planning layout before copying pixels lets a full-scene candidate fail
+/// fast with `AtlasFull` in microseconds instead of copying 20+ MiB of
+/// desktop pixels and then zero-filling the atlas to retry as cropped.
+pub(crate) struct AtlasLayoutPacker {
     width: usize,
     height: usize,
-    stride_pixels: usize,
     used_height: usize,
-    /// Disjoint free rectangles, including the padding texel. Each placement
-    /// carves one of them, so room left beside or under a large region (the
-    /// desktop, say) stays usable instead of being stranded by a row cursor.
     free: Vec<Rect>,
 }
 
-impl<'a> GpuAtlasPacker<'a> {
-    const PADDING: usize = 1;
+impl AtlasLayoutPacker {
+    pub(crate) const PADDING: usize = 1;
 
-    pub(crate) fn new(
-        pixels: &'a mut [u32],
-        width: usize,
-        height: usize,
-        stride_pixels: usize,
-    ) -> Result<Self, GpuSceneError> {
-        let required = height
-            .checked_sub(1)
-            .and_then(|rows| rows.checked_mul(stride_pixels))
-            .and_then(|prefix| prefix.checked_add(width));
-        if width == 0
-            || height == 0
-            || stride_pixels < width
-            || required.is_none_or(|required| required > pixels.len())
-        {
+    pub(crate) fn new(width: usize, height: usize) -> Result<Self, GpuSceneError> {
+        if width == 0 || height == 0 {
             return Err(GpuSceneError::InvalidLayer);
         }
         Ok(Self {
-            pixels,
             width,
             height,
-            stride_pixels,
             used_height: 0,
             free: vec![Rect {
                 x: 0,
@@ -224,15 +204,6 @@ impl<'a> GpuAtlasPacker<'a> {
         self.used_height
     }
 
-    /// The atlas pixels and their stride, so a region that was just written can
-    /// be post-processed in place (the window alpha pass).
-    pub(crate) fn pixels_mut(&mut self) -> (&mut [u32], usize) {
-        (&mut *self.pixels, self.stride_pixels)
-    }
-
-    /// The free rectangle that fits `width` x `height` with the least room
-    /// left over on its tighter side. Ties break by position so a scene
-    /// always packs the same way.
     fn best_free_rect(&self, width: usize, height: usize) -> Option<(usize, Rect)> {
         self.free
             .iter()
@@ -245,8 +216,6 @@ impl<'a> GpuAtlasPacker<'a> {
             })
     }
 
-    /// Remove the chosen free rectangle and return what is left of it as at
-    /// most two new rectangles, split so the larger remainder stays whole.
     fn carve_free_rect(&mut self, index: usize, free: Rect, width: usize, height: usize) {
         self.free.swap_remove(index);
         let (spare_w, spare_h) = (free.width - width, free.height - height);
@@ -278,6 +247,103 @@ impl<'a> GpuAtlasPacker<'a> {
         }
     }
 
+    pub(crate) fn largest_available_crop(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<(usize, usize)> {
+        self.free
+            .iter()
+            .filter_map(|free| {
+                let width = width.min(free.width.checked_sub(2 * Self::PADDING)?);
+                let height = height.min(free.height.checked_sub(2 * Self::PADDING)?);
+                (width != 0 && height != 0).then_some((width, height))
+            })
+            .max_by_key(|&(width, height)| (width * height, width.min(height)))
+    }
+
+    pub(crate) fn reserve(&mut self, width: usize, height: usize) -> Result<Rect, GpuSceneError> {
+        if width == 0 || height == 0 {
+            return Err(GpuSceneError::InvalidLayer);
+        }
+        let padding = Self::PADDING;
+        let outer_width = width
+            .checked_add(padding * 2)
+            .ok_or(GpuSceneError::AtlasFull)?;
+        let outer_height = height
+            .checked_add(padding * 2)
+            .ok_or(GpuSceneError::AtlasFull)?;
+        if outer_width > self.width || outer_height > self.height {
+            return Err(GpuSceneError::AtlasFull);
+        }
+
+        let (free_index, free) = self
+            .best_free_rect(outer_width, outer_height)
+            .ok_or(GpuSceneError::AtlasFull)?;
+        let (outer_x, outer_y) = (free.x, free.y);
+        let destination = Rect {
+            x: outer_x + padding,
+            y: outer_y + padding,
+            width,
+            height,
+        };
+        self.used_height = self.used_height.max(outer_y + outer_height);
+        self.carve_free_rect(free_index, free, outer_width, outer_height);
+        Ok(destination)
+    }
+}
+
+/// Deterministic rectangle packer for one immutable atlas generation. It copies
+/// independently rasterized source surfaces into isolated regions; it never
+/// paints their final destination positions or performs z-order composition.
+/// One transparent texel around each region prevents nearest-sample bleed.
+pub(crate) struct GpuAtlasPacker<'a> {
+    pixels: &'a mut [u32],
+    width: usize,
+    height: usize,
+    stride_pixels: usize,
+    layout: AtlasLayoutPacker,
+}
+
+impl<'a> GpuAtlasPacker<'a> {
+    const PADDING: usize = AtlasLayoutPacker::PADDING;
+
+    pub(crate) fn new(
+        pixels: &'a mut [u32],
+        width: usize,
+        height: usize,
+        stride_pixels: usize,
+    ) -> Result<Self, GpuSceneError> {
+        let required = height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride_pixels))
+            .and_then(|prefix| prefix.checked_add(width));
+        if width == 0
+            || height == 0
+            || stride_pixels < width
+            || required.is_none_or(|required| required > pixels.len())
+        {
+            return Err(GpuSceneError::InvalidLayer);
+        }
+        Ok(Self {
+            pixels,
+            width,
+            height,
+            stride_pixels,
+            layout: AtlasLayoutPacker::new(width, height)?,
+        })
+    }
+
+    pub(crate) fn used_height(&self) -> usize {
+        self.layout.used_height()
+    }
+
+    /// The atlas pixels and their stride, so a region that was just written can
+    /// be post-processed in place (the window alpha pass).
+    pub(crate) fn pixels_mut(&mut self) -> (&mut [u32], usize) {
+        (&mut *self.pixels, self.stride_pixels)
+    }
+
     #[cfg(test)]
     pub(crate) fn place_bgra(
         &mut self,
@@ -290,6 +356,7 @@ impl<'a> GpuAtlasPacker<'a> {
     }
 
     /// Place an opaque XRGB cache into the premultiplied-alpha atlas.
+    #[cfg(test)]
     pub(crate) fn place_xrgb(
         &mut self,
         source: &[u32],
@@ -347,7 +414,8 @@ impl<'a> GpuAtlasPacker<'a> {
             return Err(GpuSceneError::InvalidLayer);
         }
         self.zero_padding_border(destination)?;
-        self.used_height = self
+        self.layout.used_height = self
+            .layout
             .used_height
             .max(destination.y + destination.height + Self::PADDING);
         for row in 0..destination.height {
@@ -374,12 +442,13 @@ impl<'a> GpuAtlasPacker<'a> {
             if force_opaque {
                 copy_xrgb_opaque_row(destination_row, source_row);
             } else {
-                destination_row.copy_from_slice(source_row);
+                crate::simd::copy_u32s(source_row, destination_row);
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn place(
         &mut self,
         source: &[u32],
@@ -425,7 +494,7 @@ impl<'a> GpuAtlasPacker<'a> {
             if force_opaque {
                 copy_xrgb_opaque_row(destination_row, source_row);
             } else {
-                destination_row.copy_from_slice(source_row);
+                crate::simd::copy_u32s(source_row, destination_row);
             }
         }
 
@@ -435,55 +504,24 @@ impl<'a> GpuAtlasPacker<'a> {
     /// Largest top-left crop of a requested region that fits remaining padded
     /// storage. The caller splits source/destination rectangles identically;
     /// no resampling or composition is introduced by allocator fragmentation.
+    #[cfg(test)]
     pub(crate) fn largest_available_crop(
         &self,
         width: usize,
         height: usize,
     ) -> Option<(usize, usize)> {
-        self.free
-            .iter()
-            .filter_map(|free| {
-                let width = width.min(free.width.checked_sub(2 * Self::PADDING)?);
-                let height = height.min(free.height.checked_sub(2 * Self::PADDING)?);
-                (width != 0 && height != 0).then_some((width, height))
-            })
-            .max_by_key(|&(width, height)| (width * height, width.min(height)))
+        self.layout.largest_available_crop(width, height)
     }
 
     /// Reserve padded source storage without rasterizing it. Fragment planning
     /// must prove the complete scene fits before copying any layer pixels.
     pub(crate) fn reserve(&mut self, width: usize, height: usize) -> Result<Rect, GpuSceneError> {
-        if width == 0 || height == 0 {
-            return Err(GpuSceneError::InvalidLayer);
-        }
-        let padding = Self::PADDING;
-        let outer_width = width
-            .checked_add(padding * 2)
-            .ok_or(GpuSceneError::AtlasFull)?;
-        let outer_height = height
-            .checked_add(padding * 2)
-            .ok_or(GpuSceneError::AtlasFull)?;
-        if outer_width > self.width || outer_height > self.height {
-            return Err(GpuSceneError::AtlasFull);
-        }
-
-        let (free_index, free) = self
-            .best_free_rect(outer_width, outer_height)
-            .ok_or(GpuSceneError::AtlasFull)?;
-        let (outer_x, outer_y) = (free.x, free.y);
-        let destination = Rect {
-            x: outer_x + padding,
-            y: outer_y + padding,
-            width,
-            height,
-        };
+        let destination = self.layout.reserve(width, height)?;
         self.zero_padding_border(destination)?;
-        self.used_height = self.used_height.max(outer_y + outer_height);
-        self.carve_free_rect(free_index, free, outer_width, outer_height);
         Ok(destination)
     }
 
-    fn zero_padding_border(&mut self, destination: Rect) -> Result<(), GpuSceneError> {
+    pub(crate) fn zero_padding_border(&mut self, destination: Rect) -> Result<(), GpuSceneError> {
         let outer_x = destination
             .x
             .checked_sub(Self::PADDING)
@@ -553,37 +591,7 @@ impl<'a> GpuAtlasPacker<'a> {
 /// preserves the exact `source | 0xff00_0000` semantics for every pixel.
 #[inline]
 fn copy_xrgb_opaque_row(destination: &mut [u32], source: &[u32]) {
-    debug_assert_eq!(destination.len(), source.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::x86_64::{
-            __m128i, _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32, _mm_storeu_si128,
-        };
-
-        let opaque = unsafe { _mm_set1_epi32(0xff00_0000_u32 as i32) };
-        let mut index = 0;
-        while index + 4 <= destination.len() {
-            // SAFETY: both four-pixel ranges are bounded by the loop
-            // condition, and the unaligned load/store intrinsics accept the
-            // row alignment provided by arbitrary atlas rectangles.
-            unsafe {
-                let pixels = _mm_loadu_si128(source.as_ptr().add(index).cast::<__m128i>());
-                _mm_storeu_si128(
-                    destination.as_mut_ptr().add(index).cast::<__m128i>(),
-                    _mm_or_si128(pixels, opaque),
-                );
-            }
-            index += 4;
-        }
-        for (destination, source) in destination[index..].iter_mut().zip(&source[index..]) {
-            *destination = *source | 0xff00_0000;
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    for (destination, source) in destination.iter_mut().zip(source) {
-        *destination = *source | 0xff00_0000;
-    }
+    crate::simd::copy_xrgb_opaque_row_u32(source, destination);
 }
 
 pub(crate) struct GpuSceneCompiler {

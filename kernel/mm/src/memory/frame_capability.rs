@@ -985,6 +985,7 @@ mod tests {
         let mask = 1_u64 << (index % 64);
         // Model a consumer after it claimed readiness but before extracting
         // the frame. The zero ready bit alone is not producer authority.
+        // ORDERING: unit test models AcqRel consumer claim of ready bitmap bit.
         assert_ne!(pool.ready[index / 64].fetch_and(!mask, Ordering::AcqRel) & mask, 0);
         let original = pool.frames[index].load(Ordering::Relaxed);
         let replacement = 0x1000_0000;
@@ -992,10 +993,12 @@ mod tests {
         assert_eq!(pool.frames[index].load(Ordering::Relaxed), original);
         assert_eq!(pool.available.load(Ordering::Relaxed), MAX_PREALLOCATED_PAGER_FAULT_FRAMES);
 
+        // ORDERING: unit test models AcqRel frame slot extraction.
         assert_eq!(pool.frames[index].swap(0, Ordering::AcqRel), original);
         pool.available.fetch_sub(1, Ordering::Relaxed);
         assert_eq!(pool.publish(replacement), Ok(()));
         assert_eq!(pool.frames[index].load(Ordering::Relaxed), replacement);
+        // ORDERING: unit test observes republished ready bit via Acquire.
         assert_ne!(pool.ready[index / 64].load(Ordering::Acquire) & mask, 0);
         assert_eq!(pool.available.load(Ordering::Relaxed), MAX_PREALLOCATED_PAGER_FAULT_FRAMES);
     }

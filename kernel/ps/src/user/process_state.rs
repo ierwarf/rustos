@@ -14,6 +14,7 @@
 //!   snapshot, or policy implementation in this substrate.
 //! - **Evidence:** `memory-map` and `process-address-space-lifecycle`.
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -211,16 +212,17 @@ pub struct UserMmState {
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
     mapping_cursor: u64,
-    shared_memfd_mappings: Vec<SharedMemfdMapping>,
-    shared_region_mappings: Vec<SharedRegionMapping>,
+    shared_memfd_mappings: BTreeMap<u64, SharedMemfdMapping>,
+    shared_region_mappings: BTreeMap<u64, SharedRegionMapping>,
     /// App DMA-BUF mappings. Not inherited by fork (the child has no PTEs for
     /// them and holds no custody); the child must import its own capability.
-    device_buffer_mappings: Vec<DeviceBufferMapping>,
+    device_buffer_mappings: BTreeMap<u64, DeviceBufferMapping>,
     /// Fixed physical windows (scanout/GPU surfaces) mapped into this process.
     /// They have no shared region to hold, and the surface handle's own record
-    /// dies with the fd, so this list is the only thing that keeps the PTEs
+    /// dies with the fd, so this map is the only thing that keeps the PTEs
     /// visible to `unmap` as external backing after the fd is closed.
-    external_physical_mappings: Vec<(u64, u64)>,
+    /// Keyed by start virtual address, value is byte length.
+    external_physical_mappings: BTreeMap<u64, u64>,
     /// `mlock` ranges and the `mlockall(MCL_FUTURE)` request. Not inherited by
     /// fork (Linux clears `VM_LOCKED` in the child) and replaced by exec.
     memlock: MemlockLedger,
@@ -307,7 +309,7 @@ pub(crate) struct ProcessStateBundle {
     owner_pid: u64,
     mm: Option<Box<UserMmState>>,
     owner_local: Option<Box<UserProcessLocal>>,
-    vfork_locals: Vec<(u64, Box<UserProcessLocal>)>,
+    vfork_locals: BTreeMap<u64, Box<UserProcessLocal>>,
 }
 
 struct BundleRestoreGuard<'a> {
@@ -331,28 +333,16 @@ impl ProcessStateBundle {
             owner_pid,
             mm: Some(state.mm),
             owner_local: Some(state.local),
-            vfork_locals: Vec::new(),
+            vfork_locals: BTreeMap::new(),
         }
     }
 
     pub(crate) fn insert_vfork_local(&mut self, child_pid: u64, local: Box<UserProcessLocal>) {
-        if let Some((_, slot)) = self
-            .vfork_locals
-            .iter_mut()
-            .find(|(pid, _)| *pid == child_pid)
-        {
-            *slot = local;
-        } else {
-            self.vfork_locals.push((child_pid, local));
-        }
+        self.vfork_locals.insert(child_pid, local);
     }
 
     pub(crate) fn remove_vfork_local(&mut self, child_pid: u64) -> Option<Box<UserProcessLocal>> {
-        let pos = self
-            .vfork_locals
-            .iter()
-            .position(|(pid, _)| *pid == child_pid)?;
-        Some(self.vfork_locals.swap_remove(pos).1)
+        self.vfork_locals.remove(&child_pid)
     }
 
     fn take_local_for_pid(&mut self, process_id: u64) -> Option<Box<UserProcessLocal>> {
@@ -373,7 +363,7 @@ impl ProcessStateBundle {
         if process_id == self.owner_pid {
             self.owner_local = Some(local);
         } else {
-            self.vfork_locals.push((process_id, local));
+            self.vfork_locals.insert(process_id, local);
         }
     }
 
@@ -703,6 +693,65 @@ fn overlap_segment(
     Some((overlap_start, overlap_end - overlap_start))
 }
 
+/// Visits all disjoint `[k, end_of(k, v))` entries in `map` that overlap
+/// `[start, end)` in ascending start-VA order in `O(log M + k)`.
+fn overlapping_entries<'a, V>(
+    map: &'a BTreeMap<u64, V>,
+    start: u64,
+    end: u64,
+    end_of: impl Fn(u64, &V) -> u64,
+) -> impl Iterator<Item = (u64, &'a V)> {
+    let pred = if start < end {
+        map.range(..start)
+            .next_back()
+            .filter(|&(&k, v)| end_of(k, v) > start)
+            .map(|(&k, v)| (k, v))
+    } else {
+        None
+    };
+    let tail = if start < end {
+        Some(map.range(start..end).map(|(&k, v)| (k, v)))
+    } else {
+        None
+    };
+    pred.into_iter().chain(tail.into_iter().flatten())
+}
+
+/// Returns whether any disjoint `[k, end_of(k, v))` entry in `map` overlaps
+/// `[start, end)` in `O(log M)` with zero heap allocations.
+fn has_overlapping_entry<V>(
+    map: &BTreeMap<u64, V>,
+    start: u64,
+    end: u64,
+    end_of: impl Fn(u64, &V) -> u64,
+) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some((&k, v)) = map.range(..start).next_back()
+        && end_of(k, v) > start
+    {
+        return true;
+    }
+    map.range(start..end).next().is_some()
+}
+
+/// Collects only the start keys of entries in `map` overlapping `[start, end)`.
+/// Allocates nothing when there is no overlap (`O(log M)`).
+fn overlapping_keys<V>(
+    map: &BTreeMap<u64, V>,
+    start: u64,
+    end: u64,
+    end_of: impl Fn(u64, &V) -> u64,
+) -> Vec<u64> {
+    if !has_overlapping_entry(map, start, end, &end_of) {
+        return Vec::new();
+    }
+    overlapping_entries(map, start, end, end_of)
+        .map(|(k, _)| k)
+        .collect()
+}
+
 impl WindowsThreadRuntimeState {
     pub const fn new(thread_id: u64, teb_address: u64) -> Self {
         Self {
@@ -742,10 +791,10 @@ impl UserProcessState {
             linux_memory_map,
             linux_runtime_profile,
             mapping_cursor: default_cursor,
-            shared_memfd_mappings: Vec::new(),
-            shared_region_mappings: Vec::new(),
-            device_buffer_mappings: Vec::new(),
-            external_physical_mappings: Vec::new(),
+            shared_memfd_mappings: BTreeMap::new(),
+            shared_region_mappings: BTreeMap::new(),
+            device_buffer_mappings: BTreeMap::new(),
+            external_physical_mappings: BTreeMap::new(),
             memlock: MemlockLedger::new(),
             mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(
                 kernel_mm::api::kmem_charge::Class::Vma,
@@ -836,24 +885,35 @@ impl UserProcessState {
         page_flags: PageTableFlags,
         hold: MemfdMappingHold,
     ) {
-        self.mm.shared_memfd_mappings.push(SharedMemfdMapping {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.release_shared_memfd_mappings_in_range(start, end);
+        self.mm.shared_memfd_mappings.insert(
             start,
-            len,
-            backing_offset,
-            page_flags,
-            hold,
-        });
+            SharedMemfdMapping {
+                start,
+                len,
+                backing_offset,
+                page_flags,
+                hold,
+            },
+        );
         self.sync_mapping_kmem();
     }
 
     pub fn shared_memfd_object_ids_in_range(&self, start: u64, end: u64) -> Vec<u64> {
         let mut ids = Vec::new();
-        for mapping in &self.mm.shared_memfd_mappings {
-            if end > mapping.start && start < mapping.end() {
-                let id = mapping.hold.object_id();
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
+        for (_, mapping) in overlapping_entries(
+            &self.mm.shared_memfd_mappings,
+            start,
+            end,
+            |_, m| m.end(),
+        ) {
+            let id = mapping.hold.object_id();
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
         ids
@@ -861,7 +921,7 @@ impl UserProcessState {
 
     pub fn shared_memfd_holds(&self) -> Vec<MemfdMappingHold> {
         let mut holds: Vec<MemfdMappingHold> = Vec::new();
-        for mapping in &self.mm.shared_memfd_mappings {
+        for mapping in self.mm.shared_memfd_mappings.values() {
             let id = mapping.hold.object_id();
             if !holds.iter().any(|h| h.object_id() == id) {
                 holds.push(mapping.hold.clone());
@@ -876,7 +936,7 @@ impl UserProcessState {
         frames: &[u64],
     ) -> Result<(), crate::memory::paging::AddressSpaceError> {
         let mut ranges = Vec::new();
-        for mapping in &self.mm.shared_memfd_mappings {
+        for mapping in self.mm.shared_memfd_mappings.values() {
             if mapping.hold.object_id() == object_id {
                 ranges.push((
                     mapping.start,
@@ -907,13 +967,17 @@ impl UserProcessState {
 
     pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
         let mut overlaps = Vec::new();
-        for mapping in &self.mm.shared_memfd_mappings {
-            let overlap_start = start.max(mapping.start);
-            let overlap_end = end.min(mapping.end());
-            if overlap_start >= overlap_end {
-                continue;
+        for (_, mapping) in overlapping_entries(
+            &self.mm.shared_memfd_mappings,
+            start,
+            end,
+            |_, m| m.end(),
+        ) {
+            if let Some((overlap_start, overlap_len)) =
+                overlap_segment(mapping.start, mapping.end(), start, end)
+            {
+                overlaps.push((overlap_start, overlap_len as usize));
             }
-            overlaps.push((overlap_start, (overlap_end - overlap_start) as usize));
         }
         overlaps
     }
@@ -923,56 +987,48 @@ impl UserProcessState {
     /// writable admission is where `F_SEAL_WRITE` and the writable-mapping
     /// count are enforced, so a later `mprotect(PROT_WRITE)` would bypass both.
     pub fn shared_memfd_range_forbids_write_upgrade(&self, start: u64, end: u64) -> bool {
-        self.mm
-            .shared_memfd_mappings
-            .iter()
-            .any(|mapping| {
-                end > mapping.start && start < mapping.end() && !mapping.hold.is_writable()
-            })
+        overlapping_entries(&self.mm.shared_memfd_mappings, start, end, |_, m| m.end())
+            .any(|(_, mapping)| !mapping.hold.is_writable())
     }
 
     pub fn release_shared_memfd_mappings_in_range(&mut self, start: u64, end: u64) {
-        // Every munmap/mprotect-style release lands here; most ranges touch no
-        // shared mapping, so do not rebuild (and reallocate) the list for them.
-        if !self
-            .mm
-            .shared_memfd_mappings
-            .iter()
-            .any(|mapping| end > mapping.start && start < mapping.end())
-        {
+        let keys = overlapping_keys(&self.mm.shared_memfd_mappings, start, end, |_, m| m.end());
+        if keys.is_empty() {
             return;
         }
-        let mut updated = Vec::with_capacity(self.mm.shared_memfd_mappings.len() + 1);
-        for mapping in self.mm.shared_memfd_mappings.drain(..) {
-            let mapping_end = mapping.end();
-            if end <= mapping.start || start >= mapping_end {
-                updated.push(mapping);
+        for key in keys {
+            let Some(mapping) = self.mm.shared_memfd_mappings.remove(&key) else {
                 continue;
-            }
-
+            };
+            let mapping_end = mapping.end();
             if start > mapping.start {
-                updated.push(SharedMemfdMapping {
-                    start: mapping.start,
-                    len: start - mapping.start,
-                    backing_offset: mapping.backing_offset,
-                    page_flags: mapping.page_flags,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.shared_memfd_mappings.insert(
+                    mapping.start,
+                    SharedMemfdMapping {
+                        start: mapping.start,
+                        len: start - mapping.start,
+                        backing_offset: mapping.backing_offset,
+                        page_flags: mapping.page_flags,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
             if end < mapping_end {
-                updated.push(SharedMemfdMapping {
-                    start: end,
-                    len: mapping_end - end,
-                    backing_offset: mapping
-                        .backing_offset
-                        .checked_add(end - mapping.start)
-                        .expect("shared memfd split offset overflow"),
-                    page_flags: mapping.page_flags,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.shared_memfd_mappings.insert(
+                    end,
+                    SharedMemfdMapping {
+                        start: end,
+                        len: mapping_end - end,
+                        backing_offset: mapping
+                            .backing_offset
+                            .checked_add(end - mapping.start)
+                            .expect("shared memfd split offset overflow"),
+                        page_flags: mapping.page_flags,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
         }
-        self.mm.shared_memfd_mappings = updated;
         self.sync_mapping_kmem();
     }
 
@@ -982,56 +1038,59 @@ impl UserProcessState {
         end: u64,
         page_flags: PageTableFlags,
     ) {
-        if !self
-            .mm
-            .shared_memfd_mappings
-            .iter()
-            .any(|mapping| end > mapping.start && start < mapping.end())
-        {
+        let keys = overlapping_keys(&self.mm.shared_memfd_mappings, start, end, |_, m| m.end());
+        if keys.is_empty() {
             return;
         }
-        let mut updated = Vec::with_capacity(self.mm.shared_memfd_mappings.len() + 2);
-        for mapping in self.mm.shared_memfd_mappings.drain(..) {
-            let mapping_end = mapping.end();
-            if end <= mapping.start || start >= mapping_end {
-                updated.push(mapping);
+        for key in keys {
+            let Some(mapping) = self.mm.shared_memfd_mappings.remove(&key) else {
                 continue;
-            }
+            };
+            let mapping_end = mapping.end();
             if start > mapping.start {
-                updated.push(SharedMemfdMapping {
-                    start: mapping.start,
-                    len: start - mapping.start,
-                    backing_offset: mapping.backing_offset,
-                    page_flags: mapping.page_flags,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.shared_memfd_mappings.insert(
+                    mapping.start,
+                    SharedMemfdMapping {
+                        start: mapping.start,
+                        len: start - mapping.start,
+                        backing_offset: mapping.backing_offset,
+                        page_flags: mapping.page_flags,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
             let overlap_start = start.max(mapping.start);
             let overlap_end = end.min(mapping_end);
-            updated.push(SharedMemfdMapping {
-                start: overlap_start,
-                len: overlap_end - overlap_start,
-                backing_offset: mapping
-                    .backing_offset
-                    .checked_add(overlap_start - mapping.start)
-                    .expect("shared memfd protect offset overflow"),
-                page_flags,
-                hold: mapping.hold.clone(),
-            });
-            if end < mapping_end {
-                updated.push(SharedMemfdMapping {
-                    start: end,
-                    len: mapping_end - end,
+            self.mm.shared_memfd_mappings.insert(
+                overlap_start,
+                SharedMemfdMapping {
+                    start: overlap_start,
+                    len: overlap_end - overlap_start,
                     backing_offset: mapping
                         .backing_offset
-                        .checked_add(end - mapping.start)
+                        .checked_add(overlap_start - mapping.start)
                         .expect("shared memfd protect offset overflow"),
-                    page_flags: mapping.page_flags,
+                    page_flags,
                     hold: mapping.hold.clone(),
-                });
+                },
+            );
+            if end < mapping_end {
+                self.mm.shared_memfd_mappings.insert(
+                    end,
+                    SharedMemfdMapping {
+                        start: end,
+                        len: mapping_end - end,
+                        backing_offset: mapping
+                            .backing_offset
+                            .checked_add(end - mapping.start)
+                            .expect("shared memfd protect offset overflow"),
+                        page_flags: mapping.page_flags,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
         }
-        self.mm.shared_memfd_mappings = updated;
+        self.sync_mapping_kmem();
     }
 
     pub fn record_shared_region_mapping(
@@ -1040,12 +1099,20 @@ impl UserProcessState {
         len: u64,
         hold: KernelSharedRegionMappingHold,
     ) {
-        self.mm.shared_region_mappings.push(SharedRegionMapping {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.release_shared_region_mappings_in_range(start, end);
+        self.mm.shared_region_mappings.insert(
             start,
-            len,
-            backing_offset: 0,
-            hold,
-        });
+            SharedRegionMapping {
+                start,
+                len,
+                backing_offset: 0,
+                hold,
+            },
+        );
         self.sync_mapping_kmem();
     }
 
@@ -1058,19 +1125,25 @@ impl UserProcessState {
         len: u64,
         hold: crate::user::handles::BufferMappingHold,
     ) {
-        self.mm.device_buffer_mappings.push(DeviceBufferMapping {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.release_device_buffer_mappings_in_range(start, end);
+        self.mm.device_buffer_mappings.insert(
             start,
-            len,
-            hold: alloc::sync::Arc::new(hold),
-        });
+            DeviceBufferMapping {
+                start,
+                len,
+                hold: alloc::sync::Arc::new(hold),
+            },
+        );
         self.sync_mapping_kmem();
     }
 
     pub fn device_buffer_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.mm
-            .device_buffer_mappings
-            .iter()
-            .filter_map(|mapping| {
+        overlapping_entries(&self.mm.device_buffer_mappings, start, end, |_, m| m.end())
+            .filter_map(|(_, mapping)| {
                 overlap_segment(mapping.start, mapping.end(), start, end)
                     .map(|(seg_start, len)| (seg_start, seg_start.saturating_add(len)))
             })
@@ -1078,130 +1151,134 @@ impl UserProcessState {
     }
 
     pub fn release_device_buffer_mappings_in_range(&mut self, start: u64, end: u64) {
-        if !self
-            .mm
-            .device_buffer_mappings
-            .iter()
-            .any(|mapping| end > mapping.start && start < mapping.end())
-        {
+        let keys = overlapping_keys(&self.mm.device_buffer_mappings, start, end, |_, m| m.end());
+        if keys.is_empty() {
             return;
         }
-        let mut updated = Vec::with_capacity(self.mm.device_buffer_mappings.len() + 1);
-        for mapping in self.mm.device_buffer_mappings.drain(..) {
-            let mapping_end = mapping.end();
-            if end <= mapping.start || start >= mapping_end {
-                updated.push(mapping);
+        for key in keys {
+            let Some(mapping) = self.mm.device_buffer_mappings.remove(&key) else {
                 continue;
-            }
+            };
+            let mapping_end = mapping.end();
             if start > mapping.start {
-                updated.push(DeviceBufferMapping {
-                    start: mapping.start,
-                    len: start - mapping.start,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.device_buffer_mappings.insert(
+                    mapping.start,
+                    DeviceBufferMapping {
+                        start: mapping.start,
+                        len: start - mapping.start,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
             if end < mapping_end {
-                updated.push(DeviceBufferMapping {
-                    start: end,
-                    len: mapping_end - end,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.device_buffer_mappings.insert(
+                    end,
+                    DeviceBufferMapping {
+                        start: end,
+                        len: mapping_end - end,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
         }
-        self.mm.device_buffer_mappings = updated;
         self.sync_mapping_kmem();
     }
 
     pub fn record_external_physical_mapping(&mut self, start: u64, len: u64) {
-        self.mm.external_physical_mappings.push((start, len));
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.release_external_physical_mappings_in_range(start, end);
+        self.mm.external_physical_mappings.insert(start, len);
         self.sync_mapping_kmem();
     }
 
     pub fn external_physical_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.mm
-            .external_physical_mappings
-            .iter()
-            .filter_map(|&(map_start, map_len)| {
-                overlap_segment(map_start, map_start.saturating_add(map_len), start, end)
-            })
-            .collect()
+        overlapping_entries(
+            &self.mm.external_physical_mappings,
+            start,
+            end,
+            |k, &len| k.saturating_add(len),
+        )
+        .filter_map(|(map_start, &map_len)| {
+            overlap_segment(map_start, map_start.saturating_add(map_len), start, end)
+        })
+        .collect()
     }
 
     pub fn release_external_physical_mappings_in_range(&mut self, start: u64, end: u64) {
-        if !self
-            .mm
-            .external_physical_mappings
-            .iter()
-            .any(|&(map_start, map_len)| end > map_start && start < map_start.saturating_add(map_len))
-        {
+        let keys = overlapping_keys(
+            &self.mm.external_physical_mappings,
+            start,
+            end,
+            |k, &len| k.saturating_add(len),
+        );
+        if keys.is_empty() {
             return;
         }
-        let mut updated = Vec::with_capacity(self.mm.external_physical_mappings.len() + 1);
-        for (map_start, map_len) in self.mm.external_physical_mappings.drain(..) {
-            let map_end = map_start.saturating_add(map_len);
-            if end <= map_start || start >= map_end {
-                updated.push((map_start, map_len));
+        for key in keys {
+            let Some(map_len) = self.mm.external_physical_mappings.remove(&key) else {
                 continue;
-            }
+            };
+            let map_start = key;
+            let map_end = map_start.saturating_add(map_len);
             if start > map_start {
-                updated.push((map_start, start - map_start));
+                self.mm
+                    .external_physical_mappings
+                    .insert(map_start, start - map_start);
             }
             if end < map_end {
-                updated.push((end, map_end - end));
+                self.mm
+                    .external_physical_mappings
+                    .insert(end, map_end - end);
             }
         }
-        self.mm.external_physical_mappings = updated;
         self.sync_mapping_kmem();
     }
 
     pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.mm
-            .shared_region_mappings
-            .iter()
-            .filter_map(|mapping| overlap_segment(mapping.start, mapping.end(), start, end))
+        overlapping_entries(&self.mm.shared_region_mappings, start, end, |_, m| m.end())
+            .filter_map(|(_, mapping)| overlap_segment(mapping.start, mapping.end(), start, end))
             .collect()
     }
 
     pub fn release_shared_region_mappings_in_range(&mut self, start: u64, end: u64) {
-        // Every munmap/mprotect-style release lands here; most ranges touch no
-        // shared mapping, so do not rebuild (and reallocate) the list for them.
-        if !self
-            .mm
-            .shared_region_mappings
-            .iter()
-            .any(|mapping| end > mapping.start && start < mapping.end())
-        {
+        let keys = overlapping_keys(&self.mm.shared_region_mappings, start, end, |_, m| m.end());
+        if keys.is_empty() {
             return;
         }
-        let mut updated = Vec::with_capacity(self.mm.shared_region_mappings.len() + 1);
-        for mapping in self.mm.shared_region_mappings.drain(..) {
-            let mapping_end = mapping.end();
-            if end <= mapping.start || start >= mapping_end {
-                updated.push(mapping);
+        for key in keys {
+            let Some(mapping) = self.mm.shared_region_mappings.remove(&key) else {
                 continue;
-            }
-
+            };
+            let mapping_end = mapping.end();
             if start > mapping.start {
-                updated.push(SharedRegionMapping {
-                    start: mapping.start,
-                    len: start - mapping.start,
-                    backing_offset: mapping.backing_offset,
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.shared_region_mappings.insert(
+                    mapping.start,
+                    SharedRegionMapping {
+                        start: mapping.start,
+                        len: start - mapping.start,
+                        backing_offset: mapping.backing_offset,
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
             if end < mapping_end {
-                updated.push(SharedRegionMapping {
-                    start: end,
-                    len: mapping_end - end,
-                    backing_offset: mapping
-                        .backing_offset
-                        .checked_add(end - mapping.start)
-                        .expect("shared region split offset overflow"),
-                    hold: mapping.hold.clone(),
-                });
+                self.mm.shared_region_mappings.insert(
+                    end,
+                    SharedRegionMapping {
+                        start: end,
+                        len: mapping_end - end,
+                        backing_offset: mapping
+                            .backing_offset
+                            .checked_add(end - mapping.start)
+                            .expect("shared region split offset overflow"),
+                        hold: mapping.hold.clone(),
+                    },
+                );
             }
         }
-        self.mm.shared_region_mappings = updated;
         self.sync_mapping_kmem();
     }
 
@@ -1270,10 +1347,15 @@ impl UserProcessState {
     /// is released by its own owner and has no leaf claim a relocation could
     /// re-key, so it must not be moved.
     pub fn has_external_backing_in(&self, start: u64, end: u64) -> bool {
-        !self.shared_memfd_overlap_segments(start, end).is_empty()
-            || !self.shared_region_overlap_segments(start, end).is_empty()
-            || !self.device_buffer_overlap_segments(start, end).is_empty()
-            || !self.external_physical_overlap_segments(start, end).is_empty()
+        has_overlapping_entry(&self.mm.shared_memfd_mappings, start, end, |_, m| m.end())
+            || has_overlapping_entry(&self.mm.shared_region_mappings, start, end, |_, m| m.end())
+            || has_overlapping_entry(&self.mm.device_buffer_mappings, start, end, |_, m| m.end())
+            || has_overlapping_entry(
+                &self.mm.external_physical_mappings,
+                start,
+                end,
+                |k, &len| k.saturating_add(len),
+            )
             || !self.handles().surface_overlap_segments(start, end).is_empty()
     }
 
@@ -1305,38 +1387,37 @@ impl UserProcessState {
             .ok_or(AddressSpaceError::AddressOverflow)?;
         let mut resolved = None;
 
-        for mapping in &self.mm.shared_memfd_mappings {
-            if mapping.start <= address && word_end <= mapping.end() {
-                let key = SharedFutexBackingKey::Memfd {
-                    object_id: mapping.hold.object_id(),
-                    byte_offset: mapping
-                        .backing_offset
-                        .checked_add(address - mapping.start)
-                        .ok_or(AddressSpaceError::AddressOverflow)?,
-                };
-                // Overlapping stable backings would make the rendezvous key
-                // ambiguous. Refuse the wait/wake instead of panicking the
-                // kernel on a process-visible mapping state.
-                if resolved.replace(key).is_some() {
-                    return Err(AddressSpaceError::AlreadyMapped);
-                }
+        if let Some((_, mapping)) = self.mm.shared_memfd_mappings.range(..=address).next_back()
+            && mapping.start <= address
+            && word_end <= mapping.end()
+        {
+            let key = SharedFutexBackingKey::Memfd {
+                object_id: mapping.hold.object_id(),
+                byte_offset: mapping
+                    .backing_offset
+                    .checked_add(address - mapping.start)
+                    .ok_or(AddressSpaceError::AddressOverflow)?,
+            };
+            if resolved.replace(key).is_some() {
+                return Err(AddressSpaceError::AlreadyMapped);
             }
         }
-        for mapping in &self.mm.shared_region_mappings {
-            if mapping.start <= address && word_end <= mapping.end() {
-                let key = SharedFutexBackingKey::SharedRegion {
-                    region_id: mapping.hold.identity(),
-                    byte_offset: mapping
-                        .backing_offset
-                        .checked_add(address - mapping.start)
-                        .ok_or(AddressSpaceError::AddressOverflow)?,
-                };
-                // Overlapping stable backings would make the rendezvous key
-                // ambiguous. Refuse the wait/wake instead of panicking the
-                // kernel on a process-visible mapping state.
-                if resolved.replace(key).is_some() {
-                    return Err(AddressSpaceError::AlreadyMapped);
-                }
+        if let Some((_, mapping)) = self.mm.shared_region_mappings.range(..=address).next_back()
+            && mapping.start <= address
+            && word_end <= mapping.end()
+        {
+            let key = SharedFutexBackingKey::SharedRegion {
+                region_id: mapping.hold.identity(),
+                byte_offset: mapping
+                    .backing_offset
+                    .checked_add(address - mapping.start)
+                    .ok_or(AddressSpaceError::AddressOverflow)?,
+            };
+            // Overlapping stable backings would make the rendezvous key
+            // ambiguous. Refuse the wait/wake instead of panicking the
+            // kernel on a process-visible mapping state.
+            if resolved.replace(key).is_some() {
+                return Err(AddressSpaceError::AlreadyMapped);
             }
         }
         resolved.ok_or(AddressSpaceError::NotMapped)
@@ -1462,7 +1543,7 @@ impl UserProcessState {
             mapping_cursor: self.mm.mapping_cursor,
             shared_memfd_mappings: self.mm.shared_memfd_mappings.clone(),
             shared_region_mappings: self.mm.shared_region_mappings.clone(),
-            device_buffer_mappings: Vec::new(),
+            device_buffer_mappings: BTreeMap::new(),
             external_physical_mappings: self.mm.external_physical_mappings.clone(),
             memlock: MemlockLedger::new(),
             // A fork child is billed when it is published, not when cloned.
@@ -1829,36 +1910,37 @@ mod tests {
         state.update_shared_memfd_page_flags_in_range(0x21000, 0x22000, ro);
 
         assert_eq!(state.mm.shared_memfd_mappings.len(), 3);
+        let entries: alloc::vec::Vec<_> = state.mm.shared_memfd_mappings.values().collect();
         assert_eq!(
             (
-                state.mm.shared_memfd_mappings[0].start,
-                state.mm.shared_memfd_mappings[0].len,
-                state.mm.shared_memfd_mappings[0].backing_offset,
-                state.mm.shared_memfd_mappings[0].page_flags,
+                entries[0].start,
+                entries[0].len,
+                entries[0].backing_offset,
+                entries[0].page_flags,
             ),
             (0x20000, 4096, 0, rw)
         );
         assert_eq!(
             (
-                state.mm.shared_memfd_mappings[1].start,
-                state.mm.shared_memfd_mappings[1].len,
-                state.mm.shared_memfd_mappings[1].backing_offset,
-                state.mm.shared_memfd_mappings[1].page_flags,
+                entries[1].start,
+                entries[1].len,
+                entries[1].backing_offset,
+                entries[1].page_flags,
             ),
             (0x21000, 4096, 4096, ro)
         );
         assert_eq!(
             (
-                state.mm.shared_memfd_mappings[2].start,
-                state.mm.shared_memfd_mappings[2].len,
-                state.mm.shared_memfd_mappings[2].backing_offset,
-                state.mm.shared_memfd_mappings[2].page_flags,
+                entries[2].start,
+                entries[2].len,
+                entries[2].backing_offset,
+                entries[2].page_flags,
             ),
             (0x22000, 4096, 8192, rw)
         );
         let holds = state.shared_memfd_holds();
         assert_eq!(holds.len(), 1);
-        assert_eq!(holds[0].object_id(), state.mm.shared_memfd_mappings[0].hold.object_id());
+        assert_eq!(holds[0].object_id(), entries[0].hold.object_id());
     }
 
     #[test]
@@ -1890,5 +1972,81 @@ mod tests {
         let deferred = state.end_fork_handle_pin();
         assert_eq!(deferred.len(), 1);
         assert!(matches!(deferred[0], KernelHandle::Epoll(ref e) if e.token_id() == 77));
+    }
+
+    #[test]
+    fn btree_mappings_support_ordered_overlap_split_unmap_and_vfork_locals() {
+        use crate::user::memfd::MemfdHandle;
+        use crate::user::process_state::{ProcessStateBundle, UserProcessState};
+        use alloc::string::String;
+        use alloc::vec;
+        use kernel_mm::api::{PageTableFlags, ProcessAddressSpace};
+
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None,
+            None,
+            None,
+            false,
+            "/bin/btree",
+        );
+
+        // External physical mappings: insert out-of-order, query overlaps, middle-split, and release.
+        state.record_external_physical_mapping(0x50000, 0x4000);
+        state.record_external_physical_mapping(0x10000, 0x3000);
+        state.record_external_physical_mapping(0x30000, 0x2000);
+        assert!(!state.has_external_backing_in(0x13000, 0x30000));
+        assert!(state.has_external_backing_in(0x12000, 0x13000));
+        assert_eq!(
+            state.external_physical_overlap_segments(0x11000, 0x51000),
+            vec![(0x11000, 0x2000), (0x30000, 0x2000), (0x50000, 0x1000)]
+        );
+        // Punch a hole in the middle of [0x50000, 0x54000) -> splits into [0x50000, 0x51000) and [0x53000, 0x54000).
+        state.release_external_physical_mappings_in_range(0x51000, 0x53000);
+        assert_eq!(
+            state.external_physical_overlap_segments(0x50000, 0x54000),
+            vec![(0x50000, 0x1000), (0x53000, 0x1000)]
+        );
+        // Unmapping an unmapped gap changes nothing.
+        state.release_external_physical_mappings_in_range(0x51000, 0x53000);
+        assert_eq!(state.mm.external_physical_mappings.len(), 4);
+        // Release spanning across multiple entries trims left & right and removes middle.
+        state.release_external_physical_mappings_in_range(0x12000, 0x50800);
+        assert_eq!(
+            state.external_physical_overlap_segments(0x0, 0x60000),
+            vec![(0x10000, 0x2000), (0x50800, 0x800), (0x53000, 0x1000)]
+        );
+
+        // Shared memfd mappings: read-only write-upgrade guard + partial release.
+        let memfd = MemfdHandle::new(String::from("ro-split"), true, None);
+        memfd.truncate(4 * 4096).unwrap();
+        let (_f, _p, ro_hold) = memfd.acquire_mapping_with_eof_guard(0, 4 * 4096, false).unwrap();
+        let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        state.record_shared_memfd_mapping(0x80000, 4 * 4096, 0, flags, ro_hold);
+        assert!(state.shared_memfd_range_forbids_write_upgrade(0x81000, 0x82000));
+        assert!(!state.shared_memfd_range_forbids_write_upgrade(0x84000, 0x85000));
+        state.release_shared_memfd_mappings_in_range(0x81000, 0x83000);
+        assert!(!state.shared_memfd_range_forbids_write_upgrade(0x81000, 0x83000));
+        assert!(state.shared_memfd_range_forbids_write_upgrade(0x80000, 0x81000));
+        assert!(state.shared_memfd_range_forbids_write_upgrade(0x83000, 0x84000));
+
+        // ProcessStateBundle vfork_locals BTreeMap lookup/replace/remove.
+        let v1 = state.fork_clone_vfork_local(false, Some("/child1"));
+        let v2 = state.fork_clone_vfork_local(false, Some("/child2"));
+        let v1_replaced = state.fork_clone_vfork_local(false, Some("/child1b"));
+        let mut bundle = ProcessStateBundle::new(100, state);
+        bundle.insert_vfork_local(101, v1);
+        bundle.insert_vfork_local(102, v2);
+        bundle.insert_vfork_local(101, v1_replaced);
+        assert_eq!(
+            bundle.with_state_for_pid(101, |s| String::from(s.exec_path())),
+            Some(String::from("/child1b"))
+        );
+        assert_eq!(
+            bundle.remove_vfork_local(102).map(|l| String::from(l.exec_path())),
+            Some(String::from("/child2"))
+        );
+        assert!(bundle.remove_vfork_local(102).is_none());
     }
 }

@@ -264,3 +264,9 @@ kernel/compat/src/user/syscall/linux/library_object_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/mm_request_lease.rs	0	19
 kernel/io-manager/src/io/dvm_display/app_buffer.rs	0	10
 kernel/mm/src/memory/frame_source.rs	0	7
+kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs.rs	0	0
+kernel/mm/src/memory/address_space/huge.rs	0	0
+kernel/mm/src/memory/phys/frame_descriptor_ledger/anon_run.rs	0	0
+kernel/mm/src/memory/phys/free_word_index.rs	0	0
+kernel/nucleus-core/src/debug/deferred.rs	0	0
+services/netd/src/ref_replay.rs	0	0

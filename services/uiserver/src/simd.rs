@@ -34,6 +34,177 @@ pub(crate) fn copy_u32s(src: &[u32], dst: &mut [u32]) {
 }
 
 #[inline]
+pub(crate) fn copy_xrgb_opaque_row_u32(src: &[u32], dst: &mut [u32]) {
+    let len = src.len().min(dst.len());
+    debug_assert_eq!(src.len(), dst.len());
+    if len == 0 {
+        return;
+    }
+    let src = &src[..len];
+    let dst = &mut dst[..len];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ENABLE_UI_SIMD_FAST_PATHS && len >= COPY_U32_AVX2_THRESHOLD && avx2_enabled() {
+            unsafe {
+                copy_xrgb_opaque_row_u32_avx2(src.as_ptr(), dst.as_mut_ptr(), len);
+            }
+            return;
+        }
+        copy_xrgb_opaque_row_u32_sse2(src, dst);
+        return;
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    copy_xrgb_opaque_row_u32_scalar(src, dst);
+}
+
+#[cfg(any(not(target_arch = "x86_64"), test))]
+fn copy_xrgb_opaque_row_u32_scalar(src: &[u32], dst: &mut [u32]) {
+    for (destination, source) in dst.iter_mut().zip(src) {
+        *destination = *source | 0xff00_0000;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn copy_xrgb_opaque_row_u32_sse2(src: &[u32], dst: &mut [u32]) {
+    use core::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32, _mm_storeu_si128,
+    };
+
+    let opaque = unsafe { _mm_set1_epi32(0xff00_0000_u32 as i32) };
+    let mut index = 0;
+    while index + 4 <= dst.len() {
+        unsafe {
+            let pixels = _mm_loadu_si128(src.as_ptr().add(index).cast::<__m128i>());
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(index).cast::<__m128i>(),
+                _mm_or_si128(pixels, opaque),
+            );
+        }
+        index += 4;
+    }
+    for (destination, source) in dst[index..].iter_mut().zip(&src[index..]) {
+        *destination = *source | 0xff00_0000;
+    }
+}
+
+#[cfg(test)]
+#[inline]
+pub(crate) fn row_diff_span_u32(before: &[u32], after: &[u32]) -> Option<(usize, usize)> {
+    let len = before.len().min(after.len());
+    if len == 0 {
+        return None;
+    }
+    let before = &before[..len];
+    let after = &after[..len];
+
+    #[cfg(target_arch = "x86_64")]
+    if ENABLE_UI_SIMD_FAST_PATHS && len >= COPY_U32_AVX2_THRESHOLD && avx2_enabled() {
+        return unsafe { row_diff_span_u32_avx2(before.as_ptr(), after.as_ptr(), len) };
+    }
+
+    row_diff_span_u32_scalar(before, after)
+}
+
+/// Compare every row of a rectangular sub-region without per-row AVX2
+/// transitions, invoking `on_diff(row_index, first_col, last_col)` for each
+/// row that differs.
+pub(crate) fn for_each_diff_row_u32(
+    before: &[u32],
+    after: &[u32],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    mut on_diff: impl FnMut(usize, usize, usize),
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ENABLE_UI_SIMD_FAST_PATHS && width >= COPY_U32_AVX2_THRESHOLD && avx2_enabled() {
+        unsafe {
+            for_each_diff_row_u32_avx2(before, after, x, y, width, height, stride, on_diff);
+        }
+        return;
+    }
+
+    for row_idx in 0..height {
+        let row_start = (y + row_idx) * stride + x;
+        let row_end = (row_start + width).min(before.len()).min(after.len());
+        if row_start >= row_end {
+            break;
+        }
+        if let Some((first, last)) =
+            row_diff_span_u32_scalar(&before[row_start..row_end], &after[row_start..row_end])
+        {
+            on_diff(y + row_idx, x + first, x + last);
+        }
+    }
+}
+
+/// Diff a rectangular sub-region of `scratch` against `atlas`, copying only
+/// the changed span of each row into `atlas` in the same cache-warm pass.
+pub(crate) fn diff_and_commit_rect_u32(
+    atlas: &mut [u32],
+    scratch: &[u32],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    mut on_diff: impl FnMut(usize, usize, usize),
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if ENABLE_UI_SIMD_FAST_PATHS && width >= COPY_U32_AVX2_THRESHOLD && avx2_enabled() {
+        unsafe {
+            diff_and_commit_rect_u32_avx2(atlas, scratch, x, y, width, height, stride, on_diff);
+        }
+        return;
+    }
+
+    for row_idx in 0..height {
+        let row_start = (y + row_idx) * stride + x;
+        let row_end = (row_start + width).min(atlas.len()).min(scratch.len());
+        if row_start >= row_end {
+            break;
+        }
+        if let Some((first, last)) =
+            row_diff_span_u32_scalar(&atlas[row_start..row_end], &scratch[row_start..row_end])
+        {
+            atlas[row_start + first..=row_start + last]
+                .copy_from_slice(&scratch[row_start + first..=row_start + last]);
+            on_diff(y + row_idx, x + first, x + last);
+        }
+    }
+}
+
+fn row_diff_span_u32_scalar(before: &[u32], after: &[u32]) -> Option<(usize, usize)> {
+    let first = before.iter().zip(after).position(|(a, b)| a != b)?;
+    let last = before.iter().zip(after).rposition(|(a, b)| a != b)?;
+    Some((first, last))
+}
+
+#[inline]
+pub(crate) fn all_pixels_opaque_u32(pixels: &[u32]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if ENABLE_UI_SIMD_FAST_PATHS && pixels.len() >= COPY_U32_AVX2_THRESHOLD && avx2_enabled() {
+        return unsafe { all_pixels_opaque_u32_avx2(pixels.as_ptr(), pixels.len()) };
+    }
+
+    all_pixels_opaque_u32_scalar(pixels)
+}
+
+fn all_pixels_opaque_u32_scalar(pixels: &[u32]) -> bool {
+    pixels.iter().all(|pixel| pixel >> 24 == 0xff)
+}
+
+#[inline]
 pub(crate) fn blend_solid_bgr(dst: &mut [u32], src_color: u32, alpha: u8) {
     if dst.is_empty() || alpha == 0 {
         return;
@@ -372,6 +543,306 @@ unsafe fn blend_premultiplied_bgr_avx2(src: *const u32, dst: *mut u32, len: usiz
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_xrgb_opaque_row_u32_avx2(src: *const u32, dst: *mut u32, len: usize) {
+    use core::arch::x86_64::*;
+
+    let opaque = _mm256_set1_epi32(0xff00_0000_u32 as i32);
+    let mut i = 0usize;
+    unsafe {
+        while i + 32 <= len {
+            let v0 = _mm256_or_si256(_mm256_loadu_si256(src.add(i) as *const __m256i), opaque);
+            let v1 = _mm256_or_si256(_mm256_loadu_si256(src.add(i + 8) as *const __m256i), opaque);
+            let v2 = _mm256_or_si256(_mm256_loadu_si256(src.add(i + 16) as *const __m256i), opaque);
+            let v3 = _mm256_or_si256(_mm256_loadu_si256(src.add(i + 24) as *const __m256i), opaque);
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, v0);
+            _mm256_storeu_si256(dst.add(i + 8) as *mut __m256i, v1);
+            _mm256_storeu_si256(dst.add(i + 16) as *mut __m256i, v2);
+            _mm256_storeu_si256(dst.add(i + 24) as *mut __m256i, v3);
+            i += 32;
+        }
+        while i + 8 <= len {
+            let v = _mm256_or_si256(_mm256_loadu_si256(src.add(i) as *const __m256i), opaque);
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, v);
+            i += 8;
+        }
+        while i < len {
+            *dst.add(i) = *src.add(i) | 0xff00_0000;
+            i += 1;
+        }
+        _mm256_zeroupper();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn row_diff_span_u32_avx2_inner(
+    before: *const u32,
+    after: *const u32,
+    len: usize,
+) -> Option<(usize, usize)> {
+    use core::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let mut first = None;
+    unsafe {
+        while i + 32 <= len {
+            let eq0 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(i) as *const __m256i),
+                _mm256_loadu_si256(after.add(i) as *const __m256i),
+            );
+            let eq1 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(i + 8) as *const __m256i),
+                _mm256_loadu_si256(after.add(i + 8) as *const __m256i),
+            );
+            let eq2 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(i + 16) as *const __m256i),
+                _mm256_loadu_si256(after.add(i + 16) as *const __m256i),
+            );
+            let eq3 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(i + 24) as *const __m256i),
+                _mm256_loadu_si256(after.add(i + 24) as *const __m256i),
+            );
+            let all = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            if _mm256_movemask_epi8(all) != -1 {
+                for (offset, eq) in [(0, eq0), (8, eq1), (16, eq2), (24, eq3)] {
+                    let mask = _mm256_movemask_epi8(eq);
+                    if mask != -1 {
+                        let diff_mask = (!mask) as u32;
+                        first = Some(i + offset + (diff_mask.trailing_zeros() as usize / 4));
+                        break;
+                    }
+                }
+                break;
+            }
+            i += 32;
+        }
+        if first.is_none() {
+            while i + 8 <= len {
+                let va = _mm256_loadu_si256(before.add(i) as *const __m256i);
+                let vb = _mm256_loadu_si256(after.add(i) as *const __m256i);
+                let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi32(va, vb));
+                if mask != -1 {
+                    let diff_mask = (!mask) as u32;
+                    first = Some(i + (diff_mask.trailing_zeros() as usize / 4));
+                    break;
+                }
+                i += 8;
+            }
+        }
+        let first = match first {
+            Some(pos) => pos,
+            None => {
+                while i < len {
+                    if *before.add(i) != *after.add(i) {
+                        first = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                first?
+            }
+        };
+
+        let mut end = len;
+        while end >= first + 32 {
+            let base = end - 32;
+            let eq0 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(base) as *const __m256i),
+                _mm256_loadu_si256(after.add(base) as *const __m256i),
+            );
+            let eq1 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(base + 8) as *const __m256i),
+                _mm256_loadu_si256(after.add(base + 8) as *const __m256i),
+            );
+            let eq2 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(base + 16) as *const __m256i),
+                _mm256_loadu_si256(after.add(base + 16) as *const __m256i),
+            );
+            let eq3 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(before.add(base + 24) as *const __m256i),
+                _mm256_loadu_si256(after.add(base + 24) as *const __m256i),
+            );
+            let all = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            if _mm256_movemask_epi8(all) != -1 {
+                for (offset, eq) in [(24, eq3), (16, eq2), (8, eq1), (0, eq0)] {
+                    let mask = _mm256_movemask_epi8(eq);
+                    if mask != -1 {
+                        let diff_mask = (!mask) as u32;
+                        let last_in_chunk = 7 - (diff_mask.leading_zeros() as usize / 4);
+                        return Some((first, base + offset + last_in_chunk));
+                    }
+                }
+            }
+            end = base;
+        }
+        while end >= first + 8 {
+            let base = end - 8;
+            let va = _mm256_loadu_si256(before.add(base) as *const __m256i);
+            let vb = _mm256_loadu_si256(after.add(base) as *const __m256i);
+            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi32(va, vb));
+            if mask != -1 {
+                let diff_mask = (!mask) as u32;
+                let last_in_chunk = 7 - (diff_mask.leading_zeros() as usize / 4);
+                return Some((first, base + last_in_chunk));
+            }
+            end = base;
+        }
+        for j in (first..end).rev() {
+            if *before.add(j) != *after.add(j) {
+                return Some((first, j));
+            }
+        }
+        Some((first, first))
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", test))]
+#[target_feature(enable = "avx2")]
+unsafe fn row_diff_span_u32_avx2(
+    before: *const u32,
+    after: *const u32,
+    len: usize,
+) -> Option<(usize, usize)> {
+    use core::arch::x86_64::_mm256_zeroupper;
+    let span = unsafe { row_diff_span_u32_avx2_inner(before, after, len) };
+    _mm256_zeroupper();
+    span
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn for_each_diff_row_u32_avx2(
+    before: &[u32],
+    after: &[u32],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    mut on_diff: impl FnMut(usize, usize, usize),
+) {
+    use core::arch::x86_64::_mm256_zeroupper;
+    let max_len = before.len().min(after.len());
+    let before_ptr = before.as_ptr();
+    let after_ptr = after.as_ptr();
+    for row_idx in 0..height {
+        let row_start = (y + row_idx) * stride + x;
+        let row_end = (row_start + width).min(max_len);
+        if row_start >= row_end {
+            break;
+        }
+        let row_len = row_end - row_start;
+        let span = unsafe {
+            row_diff_span_u32_avx2_inner(
+                before_ptr.add(row_start),
+                after_ptr.add(row_start),
+                row_len,
+            )
+        };
+        if let Some((first, last)) = span {
+            on_diff(y + row_idx, x + first, x + last);
+        }
+    }
+    _mm256_zeroupper();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn diff_and_commit_rect_u32_avx2(
+    atlas: &mut [u32],
+    scratch: &[u32],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    mut on_diff: impl FnMut(usize, usize, usize),
+) {
+    use core::arch::x86_64::*;
+    let max_len = atlas.len().min(scratch.len());
+    let atlas_ptr = atlas.as_mut_ptr();
+    let scratch_ptr = scratch.as_ptr();
+    unsafe {
+        for row_idx in 0..height {
+            let row_start = (y + row_idx) * stride + x;
+            let row_end = (row_start + width).min(max_len);
+            if row_start >= row_end {
+                break;
+            }
+            let row_len = row_end - row_start;
+            if let Some((first, last)) = row_diff_span_u32_avx2_inner(
+                atlas_ptr.add(row_start),
+                scratch_ptr.add(row_start),
+                row_len,
+            ) {
+                let copy_len = last + 1 - first;
+                let src = scratch_ptr.add(row_start + first);
+                let dst = atlas_ptr.add(row_start + first);
+                let mut i = 0usize;
+                while i + 32 <= copy_len {
+                    let v0 = _mm256_loadu_si256(src.add(i) as *const __m256i);
+                    let v1 = _mm256_loadu_si256(src.add(i + 8) as *const __m256i);
+                    let v2 = _mm256_loadu_si256(src.add(i + 16) as *const __m256i);
+                    let v3 = _mm256_loadu_si256(src.add(i + 24) as *const __m256i);
+                    _mm256_storeu_si256(dst.add(i) as *mut __m256i, v0);
+                    _mm256_storeu_si256(dst.add(i + 8) as *mut __m256i, v1);
+                    _mm256_storeu_si256(dst.add(i + 16) as *mut __m256i, v2);
+                    _mm256_storeu_si256(dst.add(i + 24) as *mut __m256i, v3);
+                    i += 32;
+                }
+                while i + 8 <= copy_len {
+                    let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+                    _mm256_storeu_si256(dst.add(i) as *mut __m256i, v);
+                    i += 8;
+                }
+                if i < copy_len {
+                    ptr::copy_nonoverlapping(src.add(i), dst.add(i), copy_len - i);
+                }
+                on_diff(y + row_idx, x + first, x + last);
+            }
+        }
+        _mm256_zeroupper();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn all_pixels_opaque_u32_avx2(pixels: *const u32, len: usize) -> bool {
+    use core::arch::x86_64::*;
+
+    let alpha_mask = _mm256_set1_epi32(0xff00_0000_u32 as i32);
+    let mut i = 0usize;
+    unsafe {
+        while i + 32 <= len {
+            let v0 = _mm256_loadu_si256(pixels.add(i) as *const __m256i);
+            let v1 = _mm256_loadu_si256(pixels.add(i + 8) as *const __m256i);
+            let v2 = _mm256_loadu_si256(pixels.add(i + 16) as *const __m256i);
+            let v3 = _mm256_loadu_si256(pixels.add(i + 24) as *const __m256i);
+            let combined = _mm256_and_si256(_mm256_and_si256(v0, v1), _mm256_and_si256(v2, v3));
+            let eq = _mm256_cmpeq_epi32(_mm256_and_si256(combined, alpha_mask), alpha_mask);
+            if _mm256_movemask_epi8(eq) != -1 {
+                _mm256_zeroupper();
+                return false;
+            }
+            i += 32;
+        }
+        while i + 8 <= len {
+            let chunk = _mm256_loadu_si256(pixels.add(i) as *const __m256i);
+            let eq = _mm256_cmpeq_epi32(_mm256_and_si256(chunk, alpha_mask), alpha_mask);
+            if _mm256_movemask_epi8(eq) != -1 {
+                _mm256_zeroupper();
+                return false;
+            }
+            i += 8;
+        }
+        _mm256_zeroupper();
+        all_pixels_opaque_u32_scalar(core::slice::from_raw_parts(pixels.add(i), len - i))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +906,92 @@ mod tests {
         blend_premultiplied_bgr(&source, &mut actual);
         blend_premultiplied_bgr_scalar(&source, &mut expected);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn row_diff_span_matches_scalar_across_lengths_and_positions() {
+        for len in [0_usize, 1, 7, 8, 9, 31, 32, 33, 63, 64, 67, 96, 127, 128, 131] {
+            let base: Vec<u32> = (0..len as u32).map(|i| i.wrapping_mul(0x1357_9bdf)).collect();
+            assert_eq!(row_diff_span_u32(&base, &base), None);
+            assert_eq!(row_diff_span_u32_scalar(&base, &base), None);
+            for first in [0, 1, 7, 8, 31, 32, 63, len.saturating_sub(2), len.saturating_sub(1)] {
+                for last in [first, len.saturating_sub(1)] {
+                    if first >= len || last >= len {
+                        continue;
+                    }
+                    let mut modified = base.clone();
+                    modified[first] ^= 1;
+                    modified[last] ^= 0x8000_0000;
+                    assert_eq!(
+                        row_diff_span_u32(&base, &modified),
+                        row_diff_span_u32_scalar(&base, &modified),
+                        "len={len} first={first} last={last}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_pixels_opaque_matches_scalar_across_lengths_and_positions() {
+        for len in [0_usize, 1, 7, 8, 31, 32, 33, 67, 96, 127, 128, 131] {
+            let opaque = vec![0xff12_3456_u32; len];
+            assert!(all_pixels_opaque_u32(&opaque));
+            assert!(all_pixels_opaque_u32_scalar(&opaque));
+            for pos in [0, 1, 7, 8, 31, 32, len / 2, len.saturating_sub(1)] {
+                if pos >= len {
+                    continue;
+                }
+                let mut translucent = opaque.clone();
+                translucent[pos] = 0xfe12_3456;
+                assert_eq!(
+                    all_pixels_opaque_u32(&translucent),
+                    all_pixels_opaque_u32_scalar(&translucent),
+                    "len={len} pos={pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copy_xrgb_opaque_row_matches_scalar_across_lengths() {
+        for len in [0_usize, 1, 3, 4, 7, 8, 31, 32, 33, 63, 64, 99, 131] {
+            let src: Vec<u32> = (0..len as u32)
+                .map(|i| (i.wrapping_mul(0x0103_070b)) & 0x7fff_ffff)
+                .collect();
+            let mut actual = vec![0xdead_beef; len];
+            let mut expected = vec![0xdead_beef; len];
+            copy_xrgb_opaque_row_u32(&src, &mut actual);
+            copy_xrgb_opaque_row_u32_scalar(&src, &mut expected);
+            assert_eq!(actual, expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn diff_and_commit_rect_updates_only_changed_spans_inside_rect() {
+        let (stride, height) = (100_usize, 16_usize);
+        let base: Vec<u32> = (0..stride * height).map(|i| i as u32).collect();
+        let mut scratch = base.clone();
+        // Outside rect: must remain untouched in `atlas` and unreported.
+        scratch[0] ^= 0x1111;
+        scratch[15 * stride + 99] ^= 0x2222;
+        // Inside rect (x=5, y=2, w=71, h=5): spans exercise 32-pixel AVX2 unroll + tail.
+        scratch[2 * stride + 6] ^= 1;
+        scratch[2 * stride + 74] ^= 2;
+        scratch[4 * stride + 40] ^= 4;
+        scratch[6 * stride + 5] ^= 8;
+
+        let mut atlas = base.clone();
+        let mut reported = Vec::new();
+        diff_and_commit_rect_u32(&mut atlas, &scratch, 5, 2, 71, 5, stride, |y, first, last| {
+            reported.push((y, first, last));
+        });
+        assert_eq!(reported, vec![(2, 6, 74), (4, 40, 40), (6, 5, 5)]);
+        assert_eq!(atlas[0], base[0], "outside rect must not be modified");
+        assert_eq!(atlas[15 * stride + 99], base[15 * stride + 99]);
+        for y in 2..7 {
+            let row = y * stride;
+            assert_eq!(&atlas[row + 5..row + 76], &scratch[row + 5..row + 76]);
+        }
     }
 }

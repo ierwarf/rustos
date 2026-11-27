@@ -1501,3 +1501,338 @@ fn policy_ceiling_and_oom_fail_without_touching_existing_mappings() {
         revoke(handle, identity, region.start, region.vma_generation).unwrap();
     }
 }
+
+#[test]
+fn btree_stress_matches_reference_map_and_preserves_invariants() {
+    use alloc::collections::BTreeMap;
+
+    let _guard = guard();
+    let handle = ProcessHandle::new(20, 149);
+    let identity = identity(149, 151);
+    let page = PAGER_PAGE_BYTES;
+    let slots = process_slots(handle).unwrap();
+    let mut reference: BTreeMap<u64, PagerVmRegionWire> = BTreeMap::new();
+
+    // Publish 2048 4-page VMAs in pseudo-random non-monotonic order to exercise
+    // B-tree node splits across multiple levels.
+    let total = 2048_u64;
+    for step in 0..total {
+        // Bijection mod 2048 (step * 733 + 17) & 2047 visits every slot once.
+        let slot_id = (step.wrapping_mul(733).wrapping_add(17)) & (total - 1);
+        let start = 0x100_0000 + slot_id * page * 8;
+        let published = publish(
+            handle,
+            identity,
+            wide_template(start, 4),
+            MAX_PAGER_VMAS_PER_PROCESS,
+        )
+        .unwrap();
+        reference.insert(published.start, published);
+    }
+
+    let (count, height) = slots.index().unwrap().verify_invariants();
+    assert_eq!(count, total as usize);
+    assert!(height <= 4, "2048 VMAs must fit in height <= 4, got {height}");
+
+    // Verify O(log N) lookups match every region and holes between them.
+    for (&start, &expected) in &reference {
+        assert_eq!(lookup(handle, identity, start, VM_ACCESS_READ), Ok(expected));
+        assert_eq!(
+            lookup(handle, identity, start + 3 * page, VM_ACCESS_WRITE),
+            Ok(expected)
+        );
+        assert_eq!(
+            lookup(handle, identity, start + 4 * page, VM_ACCESS_READ),
+            Err(PagerVmaError::Stale)
+        );
+    }
+
+    // Exercise interior mprotect splits (+2 each), partial unmap trims, and
+    // full removals across the B-tree, checking structural invariants throughout.
+    let keys: Vec<u64> = reference.keys().copied().collect();
+    for (i, &start) in keys.iter().enumerate() {
+        match i % 4 {
+            0 => {
+                // Interior protect split: 1 region -> 3 regions.
+                assert_eq!(
+                    rewrite_attenuated_range(
+                        handle,
+                        identity,
+                        start + page,
+                        start + 2 * page,
+                        Some(VM_PROT_READ),
+                        || Ok(()),
+                    ),
+                    Ok(true)
+                );
+                assert_eq!(
+                    lookup(handle, identity, start + page, VM_ACCESS_WRITE),
+                    Err(PagerVmaError::Denied)
+                );
+                assert!(lookup(handle, identity, start + page, VM_ACCESS_READ).is_ok());
+                // Re-protect back to RW -> merges back to 1 region!
+                assert_eq!(
+                    rewrite_attenuated_range(
+                        handle,
+                        identity,
+                        start + page,
+                        start + 2 * page,
+                        Some(VM_PROT_READ | VM_PROT_WRITE),
+                        || Ok(()),
+                    ),
+                    Ok(true)
+                );
+                let merged = lookup(handle, identity, start, VM_ACCESS_WRITE).unwrap();
+                assert_eq!((merged.start, merged.end), (start, start + 4 * page));
+            }
+            1 => {
+                // Interior unmap split: 1 region -> 2 regions.
+                assert_eq!(
+                    rewrite_attenuated_range(
+                        handle,
+                        identity,
+                        start + page,
+                        start + 2 * page,
+                        None,
+                        || Ok(()),
+                    ),
+                    Ok(true)
+                );
+                assert_eq!(
+                    lookup(handle, identity, start + page, VM_ACCESS_READ),
+                    Err(PagerVmaError::Stale)
+                );
+                assert!(lookup(handle, identity, start + 2 * page, VM_ACCESS_WRITE).is_ok());
+            }
+            2 => {
+                // Relocate to high disjoint address.
+                let dest = 0x8000_0000 + (i as u64) * page * 8;
+                assert_eq!(
+                    relocate_range(handle, identity, start, start + 4 * page, dest, || Ok(())),
+                    Ok(1)
+                );
+                assert_eq!(
+                    lookup(handle, identity, start, VM_ACCESS_READ),
+                    Err(PagerVmaError::Stale)
+                );
+                assert!(lookup(handle, identity, dest + 2 * page, VM_ACCESS_WRITE).is_ok());
+            }
+            _ => {
+                // Direct exact revoke.
+                let region = reference[&start];
+                revoke(handle, identity, region.start, region.vma_generation).unwrap();
+                assert_eq!(
+                    lookup(handle, identity, start, VM_ACCESS_READ),
+                    Err(PagerVmaError::Stale)
+                );
+            }
+        }
+    }
+
+    let (mid_count, mid_height) = slots.index().unwrap().verify_invariants();
+    assert_eq!(mid_count, snapshot_regions(handle, identity).unwrap().len());
+    assert!(mid_height <= 4);
+
+    // Clean up every surviving region and verify empty root & zero live count.
+    for region in snapshot_regions(handle, identity).unwrap() {
+        revoke(handle, identity, region.start, region.vma_generation).unwrap();
+    }
+    let (final_count, final_height) = slots.index().unwrap().verify_invariants();
+    assert_eq!((final_count, final_height), (0, 0));
+}
+
+#[test]
+fn scale_65536_vmas_descending_insert_lookup_split_and_revoke() {
+    let _guard = guard();
+    assert_eq!(MAX_PAGER_VMAS_PER_PROCESS, 65_536);
+    let handle = ProcessHandle::new(19, 157);
+    let identity = identity(157, 163);
+    let page = PAGER_PAGE_BYTES;
+    let slots = process_slots(handle).unwrap();
+
+    // Insert all 65,536 VMAs in DESCENDING address order (worst case for flat arrays).
+    let mut published = Vec::new();
+    published
+        .try_reserve_exact(MAX_PAGER_VMAS_PER_PROCESS)
+        .unwrap();
+    for index in (0..MAX_PAGER_VMAS_PER_PROCESS as u64).rev() {
+        let start = 0x100_0000 + index * page * 4;
+        published.push(
+            publish(
+                handle,
+                identity,
+                wide_template(start, 3),
+                MAX_PAGER_VMAS_PER_PROCESS,
+            )
+            .unwrap(),
+        );
+    }
+
+    // 65,537th must be refused with Pressure.
+    assert_eq!(
+        publish(
+            handle,
+            identity,
+            template(0x100_0000 + (MAX_PAGER_VMAS_PER_PROCESS as u64) * page * 4),
+            MAX_PAGER_VMAS_PER_PROCESS,
+        ),
+        Err(PagerVmaError::Pressure)
+    );
+
+    let (tree_count, tree_height) = slots.index().unwrap().verify_invariants();
+    assert_eq!(tree_count, 65_536);
+    assert!(
+        tree_height <= 5,
+        "65,536 VMAs in degree-16 B-tree must have height <= 5, got {tree_height}"
+    );
+
+    // O(log N) lookup verification across all 65,536 VMAs + adjacent holes.
+    for region in &published {
+        assert_eq!(
+            lookup(handle, identity, region.start + page, VM_ACCESS_WRITE),
+            Ok(*region)
+        );
+        assert_eq!(
+            lookup(handle, identity, region.end, VM_ACCESS_READ),
+            Err(PagerVmaError::Stale)
+        );
+    }
+
+    // Free 2 slots, then perform an interior mprotect split (+2 fragments) to
+    // return to exactly 65,536 live VMAs.
+    let freed_a = published.pop().unwrap();
+    let freed_b = published.pop().unwrap();
+    revoke(handle, identity, freed_a.start, freed_a.vma_generation).unwrap();
+    revoke(handle, identity, freed_b.start, freed_b.vma_generation).unwrap();
+
+    let target = published[published.len() / 2];
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            target.start + page,
+            target.start + 2 * page,
+            Some(VM_PROT_READ),
+            || Ok(()),
+        ),
+        Ok(true)
+    );
+    let (after_split_count, _) = slots.index().unwrap().verify_invariants();
+    assert_eq!(after_split_count, 65_536);
+    assert_eq!(
+        lookup(handle, identity, target.start + page, VM_ACCESS_WRITE),
+        Err(PagerVmaError::Denied)
+    );
+    assert!(lookup(handle, identity, target.start + page, VM_ACCESS_READ).is_ok());
+    assert!(lookup(handle, identity, target.start + 2 * page, VM_ACCESS_WRITE).is_ok());
+
+    // Revoke every live VMA in B-tree order and confirm clean reclamation.
+    for region in snapshot_regions(handle, identity).unwrap() {
+        revoke(handle, identity, region.start, region.vma_generation).unwrap();
+    }
+    let (final_count, final_height) = slots.index().unwrap().verify_invariants();
+    assert_eq!((final_count, final_height), (0, 0));
+}
+
+#[test]
+fn concurrent_fault_lookups_during_vma_mutations_never_observe_torn_authority() {
+    use core::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let _guard = guard();
+    let handle = ProcessHandle::new(18, 167);
+    let identity = identity(167, 173);
+    let page = PAGER_PAGE_BYTES;
+
+    // Seed 256 persistent regions that remain valid throughout, plus a churn
+    // window where the writer continuously publishes, splits, and revokes.
+    let mut persistent = Vec::new();
+    for i in 0..256_u64 {
+        let start = 0x200_0000 + i * page * 4;
+        persistent.push(
+            publish(handle, identity, wide_template(start, 2), MAX_PAGER_VMAS_PER_PROCESS).unwrap(),
+        );
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for reader_id in 0..2_u64 {
+        let done = Arc::clone(&done);
+        readers.push(std::thread::spawn(move || {
+            let mut iter = 0_u64;
+            while !done.load(Ordering::Acquire) {
+                // Probe a persistent VMA: must be Ok(exact) or Err(Unstable), NEVER Stale/Denied!
+                let p_idx = ((iter + reader_id * 17) % 256) as usize;
+                let p_start = 0x200_0000 + (p_idx as u64) * page * 4;
+                match lookup(handle, identity, p_start + page, VM_ACCESS_WRITE) {
+                    Ok(region) => {
+                        assert_eq!(region.start, p_start);
+                        assert_eq!(region.end, p_start + 2 * page);
+                        assert_eq!(region.prot, VM_PROT_READ | VM_PROT_WRITE);
+                    }
+                    Err(PagerVmaError::Unstable) => {}
+                    Err(other) => panic!("persistent VMA lookup returned unexpected {other:?}"),
+                }
+                // Probe the churn window: any Ok region must be canonical and contain the address.
+                let c_idx = (iter.wrapping_mul(13) + reader_id) % 128;
+                let c_addr = 0x400_0000 + c_idx * page * 4 + page;
+                match lookup(handle, identity, c_addr, VM_ACCESS_READ) {
+                    Ok(region) => {
+                        assert!(region.is_canonical());
+                        assert!(region.contains(c_addr));
+                        assert!(region.prot & VM_PROT_READ != 0);
+                    }
+                    Err(PagerVmaError::Stale | PagerVmaError::Unstable | PagerVmaError::Denied) => {}
+                    Err(other) => panic!("churn VMA lookup returned unexpected {other:?}"),
+                }
+                iter += 1;
+            }
+        }));
+    }
+
+    for round in 0..16_u64 {
+        let mut batch = Vec::new();
+        for i in 0..128_u64 {
+            let idx = if round & 1 == 0 { i } else { 127 - i };
+            let start = 0x400_0000 + idx * page * 4;
+            batch.push(
+                publish(handle, identity, wide_template(start, 3), MAX_PAGER_VMAS_PER_PROCESS)
+                    .unwrap(),
+            );
+        }
+        for region in batch.iter().step_by(4) {
+            assert_eq!(
+                rewrite_attenuated_range(
+                    handle,
+                    identity,
+                    region.start + page,
+                    region.start + 2 * page,
+                    Some(VM_PROT_READ),
+                    || Ok(()),
+                ),
+                Ok(true)
+            );
+        }
+        for i in 0..128_u64 {
+            let start = 0x400_0000 + i * page * 4;
+            let _ = rewrite_attenuated_range(handle, identity, start, start + 3 * page, None, || {
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    done.store(true, Ordering::Release);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    for region in persistent {
+        revoke(handle, identity, region.start, region.vma_generation).unwrap();
+    }
+    let (final_count, final_height) = process_slots(handle)
+        .unwrap()
+        .index()
+        .unwrap()
+        .verify_invariants();
+    assert_eq!((final_count, final_height), (0, 0));
+}

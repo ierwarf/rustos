@@ -260,6 +260,33 @@ fn broker_dvm_collect(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
             );
         })?;
     }
+    let ready = match block_api::poll_dvm_ready(ticket, byte_len) {
+        Ok(poll) => poll,
+        Err(error @ (DvmBlockError::DeviceFault | DvmBlockError::Unsupported)) => {
+            let _ = block_api::finish_dvm(ticket);
+            return Err(dvm_error_to_linux_errno(error));
+        }
+        Err(error) => {
+            nucleus_core::debug::write_debugcon_only_line(
+                b"dvm-block: collect rejected stage=poll",
+            );
+            return Err(dvm_error_to_linux_errno(error));
+        }
+    };
+    match ready {
+        DvmBlockPoll::Pending => return Err(LINUX_EAGAIN),
+        DvmBlockPoll::Completed(0) => {
+            block_api::finish_dvm(ticket)
+                .map_err(dvm_error_to_linux_errno)
+                .inspect_err(|_| {
+                    nucleus_core::debug::write_debugcon_only_line(
+                        b"dvm-block: collect rejected stage=finish",
+                    );
+                })?;
+            return Ok(0);
+        }
+        DvmBlockPoll::Completed(_) => {}
+    }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(byte_len)

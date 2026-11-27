@@ -11,8 +11,9 @@
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 /// Reads below this stay on the calling thread: a lane wake-up costs more than
-/// the few calls it would overlap.
-pub const PARALLEL_MIN_BYTES: usize = 2 * 1024 * 1024;
+/// the few calls it would overlap. 512 KiB is 8 storaged bulk calls (2 per
+/// lane across 4 lanes), matching `bulk_read_worker`'s 512 KiB window.
+pub const PARALLEL_MIN_BYTES: usize = 512 * 1024;
 
 const EIO: i32 = 5;
 
@@ -81,11 +82,14 @@ impl ChunkCursor {
 
     /// Claims the next unclaimed chunk index.
     pub fn claim(&self) -> Option<usize> {
-        self.next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-                (next < self.chunks).then_some(next + 1)
-            })
-            .ok()
+        if self.next.load(Ordering::Relaxed) >= self.chunks {
+            return None;
+        }
+        // `chunks` is bounded by `u32::MAX` (checked in `new`), so on 64-bit a
+        // single atomic `fetch_add` cannot wrap even under high contention and
+        // avoids CAS retry loops across parallel lanes.
+        let index = self.next.fetch_add(1, Ordering::AcqRel);
+        (index < self.chunks).then_some(index)
     }
 
     /// The first error recorded, or 0.
@@ -203,5 +207,23 @@ mod tests {
         assert_eq!(sorted, (0..1000).collect::<Vec<_>>());
         assert!(cursor.finished());
         assert_eq!(cursor.error(), 0);
+    }
+
+    #[test]
+    fn half_mib_bulk_reads_and_four_mib_snapshot_windows_use_parallel_lanes() {
+        assert!(is_parallel_read(BS, 127, 512 * 1024));
+        assert!(is_parallel_read(BS, 127, 4 * 1024 * 1024));
+        let chunk = chunk_bytes(BS, 127).unwrap();
+        assert_eq!(chunk, 65_024);
+        assert_eq!(chunk_count(512 * 1024, chunk), 9);
+        assert_eq!(chunk_count(4 * 1024 * 1024, chunk), 65);
+        // Repeated claim attempts past exhaustion keep returning None cleanly.
+        let cursor = ChunkCursor::new(4).unwrap();
+        for expected in 0..4 {
+            assert_eq!(cursor.claim(), Some(expected));
+        }
+        for _ in 0..16 {
+            assert_eq!(cursor.claim(), None);
+        }
     }
 }

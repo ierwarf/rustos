@@ -7,7 +7,7 @@ pub(super) mod error_ops;
 mod int_args;
 mod process_termination;
 pub(crate) use process_termination::{record_linux_process_fault_termination, record_linux_process_termination};
-use process_termination::should_record_process_exit;
+use process_termination::{retire_if_current_process_exiting, should_record_process_exit};
 #[cfg(test)]
 use process_termination::linux_fault_wait_status;
 pub(crate) mod ipc_ops;
@@ -82,7 +82,7 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_PROCD, IPC_SERVICE_SESSIOND,
     IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
     IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LINUX_CPUSET_BYTES, LINUX_RLIMIT_SIZE,
-    LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_STAT_SIZE, LINUX_TIMESPEC_SIZE,
+    LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
     LINUX_UTSNAME_SIZE, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_MAX_ARG_COUNT,
     LOADER_SPAWN_MAX_ENV_COUNT, NETD_IPC_ABI_VERSION, NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK,
     NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE,
@@ -163,13 +163,18 @@ pub(super) fn dispatch_register_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
     let entry = match multitask::current_user_ipc_entry() {
         Some((task_id, identity, false)) => Some((task_id, identity)),
         _ => {
+            retire_if_current_process_exiting();
             if deliver_pending_signals_if_needed(frame) {
                 return frame.rax;
             }
             None
         }
     };
-    ipc_ops::dispatch_register_ipc(frame, entry)
+    let result = ipc_ops::dispatch_register_ipc(frame, entry);
+    if (result as i64) < 0 {
+        retire_if_current_process_exiting();
+    }
+    result
 }
 
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
@@ -180,6 +185,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     debug_log_secondary_linux_syscall(frame);
 
     let syscall_nr = frame.rax;
+    if !matches!(syscall_nr, linux_abi::SYS_EXIT | linux_abi::SYS_EXIT_GROUP) {
+        retire_if_current_process_exiting();
+    }
     if syscall_nr != linux_abi::SYS_RT_SIGRETURN && deliver_pending_signals_if_needed(frame) {
         return frame.rax;
     }
@@ -629,6 +637,10 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         _ => dispatch_ext::dispatch(frame)
             .unwrap_or_else(|| error_ops::unimplemented_linux_syscall(frame)),
     };
+    // A sibling thread whose process entered `exit_group` while this syscall
+    // was in flight must retire cleanly here rather than returning a teardown
+    // error (`EIO`/`EFAULT`/`EBADF`) to userspace.
+    retire_if_current_process_exiting();
     if result == linux_errno(LINUX_EBUSY) && syscall_nr < 512 {
         error_ops::record_busy_linux_syscall(frame);
     }
@@ -658,6 +670,11 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
         if should_record_process_exit(exit_group, thread_count) {
             let wait_status = int_args::linux_exit_wait_status(status);
             record_linux_process_termination(process_id, wait_status);
+        } else if multitask::is_user_process_exiting(process_id) {
+            // Another thread already sealed process-wide exit; retire only this
+            // thread without racing procd thread-exit bookkeeping.
+            multitask::yield_now();
+            multitask::exit_current_user_task();
         } else {
             cleanup_proc_broker_exec_state_for_thread(process_id, thread_id);
             // The process lives on, so procd must learn this thread is gone

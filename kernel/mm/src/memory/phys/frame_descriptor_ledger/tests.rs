@@ -1331,3 +1331,191 @@ fn census_rolls_a_failed_fork_back_to_private() {
     ledger.unregister_root(parent);
     ledger.unregister_root(child);
 }
+
+#[test]
+fn lazy_table_count_matches_list_walk_across_publish_cancel_pop_and_concurrent_push() {
+    use std::sync::Barrier;
+    let (ledger, _records, _mappings) = ledger_with_frames(128);
+    let root = PAGE_SIZE;
+    ledger.register_root(root);
+    assert_eq!(ledger.table_count(root), 0);
+    assert_eq!(ledger.walk_table_count(root), 0);
+
+    // Cancelled table claims never increment table_count.
+    let cancelled = PAGE_SIZE * 2;
+    assert_eq!(ledger.claim_table(root, cancelled), TableClaim::Claimed);
+    assert_eq!(ledger.table_count(root), 0);
+    ledger.cancel_table(root, cancelled);
+    assert_eq!(ledger.table_count(root), 0);
+    assert_eq!(ledger.walk_table_count(root), 0);
+
+    // Concurrent multi-thread publish_table keeps head and count atomic.
+    let threads = 4_usize;
+    let per_thread = 16_usize;
+    let barrier = Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let (ledger, barrier) = (&ledger, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                for i in 0..per_thread {
+                    let frame = PAGE_SIZE * (10 + (t * per_thread + i) as u64);
+                    assert_eq!(ledger.claim_table(root, frame), TableClaim::Claimed);
+                    ledger.publish_table(root, frame);
+                }
+            });
+        }
+    });
+    let expected_total = threads * per_thread;
+    assert_eq!(ledger.table_count(root), expected_total);
+    assert_eq!(ledger.walk_table_count(root), expected_total);
+
+    // Binding charge sees the exact O(1) count.
+    crate::memory::kmem_charge::init_group(22, None);
+    assert!(ledger.bind_charge(root, 22));
+    assert_eq!(
+        crate::memory::kmem_charge::usage(crate::memory::kmem_charge::Class::PageTable, 22),
+        (1 + expected_total as u64) * PAGE_SIZE
+    );
+
+    // Popping decrements both the tracked count and walked length identically.
+    for remaining in (0..expected_total).rev() {
+        assert!(ledger.pop_table(root).is_some());
+        assert_eq!(ledger.table_count(root), remaining);
+        assert_eq!(ledger.walk_table_count(root), remaining);
+    }
+    assert_eq!(ledger.pop_table(root), None);
+    assert_eq!(ledger.table_count(root), 0);
+    ledger.unregister_root(root);
+}
+
+#[test]
+fn high_fanout_shared_mapping_avl_supports_add_find_rekey_cancel_and_remove_in_log_depth() {
+    // 256 sequential roots sharing one page at the same VA — the adversarial
+    // sequential-key pattern from Chrome/zygote forks.
+    const FANOUT: usize = 256;
+    let (ledger, _records, _mappings) = ledger_with_frames(FANOUT + 16);
+    let shared_frame = PAGE_SIZE * (FANOUT as u64 + 4);
+    let shared_va = 0x7000_0000_u64;
+
+    let roots: Vec<u64> = (1..=FANOUT as u64).map(|i| i * PAGE_SIZE).collect();
+    for &root in &roots {
+        ledger.register_root(root);
+    }
+
+    // Root 0 owns the frame exclusively, then forks to roots 1..FANOUT.
+    publish_exclusive(&ledger, roots[0], shared_va, shared_frame);
+    for &child in &roots[1..] {
+        let ticket = ledger
+            .prepare_shared_alias(
+                roots[0],
+                shared_va,
+                child,
+                shared_va,
+                shared_frame,
+                CowFrameKind::AnonymousFork,
+                0,
+            )
+            .expect("shared alias should succeed");
+        ledger.publish_shared_alias(ticket);
+    }
+
+    // Strictly balanced AVL tree: for 255 tree nodes, height must be <= 11
+    // (1.44 * log2(257) ≈ 11.5), versus 255 for a singly-linked list.
+    let height = ledger.assert_shared_tree_valid(shared_frame);
+    assert!(height <= 11, "AVL tree unbalanced: height={height}");
+
+    // Every root is owned and has exact COW identity.
+    for &root in &roots {
+        assert!(ledger.data_is_owned(root, shared_va, shared_frame));
+        assert_eq!(
+            ledger.cow_identity(root, shared_va, shared_frame),
+            Some((CowFrameKind::AnonymousFork, 0))
+        );
+    }
+    assert!(!ledger.data_is_owned(roots[0], shared_va + PAGE_SIZE, shared_frame));
+
+    // Rekey a subset of tree members and the inline member; verify tree stays balanced.
+    let rekeyed_va = 0x9000_0000_u64;
+    for &idx in &[0, 1, 63, 127, 200, FANOUT - 1] {
+        assert!(ledger.rekey_data(roots[idx], shared_va, rekeyed_va, shared_frame));
+        assert!(!ledger.data_is_owned(roots[idx], shared_va, shared_frame));
+        assert!(ledger.data_is_owned(roots[idx], rekeyed_va, shared_frame));
+        ledger.assert_shared_tree_valid(shared_frame);
+    }
+
+    // Prepare and cancel a multi-duplicate run on the high-fanout frame.
+    let extra_root = PAGE_SIZE * (FANOUT as u64 + 2);
+    ledger.register_root(extra_root);
+    let cancel_reqs = [
+        SharedAliasRequest {
+            owner_va: rekeyed_va,
+            new_va: 0x5000_0000,
+            frame_phys: shared_frame,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: rekeyed_va,
+            new_va: 0x5000_1000,
+            frame_phys: shared_frame,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: rekeyed_va,
+            new_va: 0x5000_2000,
+            frame_phys: shared_frame,
+            mode: SharedAliasMode::InheritShared,
+        },
+    ];
+    let mut cancel_tickets = [SharedAliasTicket::EMPTY; 3];
+    assert_eq!(
+        ledger.prepare_shared_alias_run(roots[0], extra_root, &cancel_reqs, &mut cancel_tickets),
+        Ok(())
+    );
+    ledger.assert_shared_tree_valid(shared_frame);
+    ledger.cancel_shared_alias_run(&cancel_tickets);
+    ledger.assert_shared_tree_valid(shared_frame);
+    ledger.unregister_root(extra_root);
+
+    // Release the inline owner first (triggers AVL root promotion), then release
+    // remaining roots in pseudo-random order, validating AVL invariants along the way.
+    let va_for = |idx: usize| {
+        if matches!(idx, 0 | 1 | 63 | 127 | 200) || idx == FANOUT - 1 {
+            rekeyed_va
+        } else {
+            shared_va
+        }
+    };
+    assert_eq!(
+        ledger.release_data(roots[0], va_for(0), shared_frame),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    ledger.assert_shared_tree_valid(shared_frame);
+
+    let mut remaining: Vec<usize> = (1..FANOUT).collect();
+    // Stride-based permutation to exercise all deletion cases (0, 1, 2 children + root).
+    let mut order = Vec::with_capacity(remaining.len());
+    let mut cursor = 0_usize;
+    while !remaining.is_empty() {
+        cursor = (cursor + 37) % remaining.len();
+        order.push(remaining.remove(cursor));
+    }
+    for (pos, idx) in order.iter().copied().enumerate() {
+        let is_last = pos + 1 == order.len();
+        let expected = if is_last {
+            DataLeafRelease::FrameReusable
+        } else {
+            DataLeafRelease::FrameRetained
+        };
+        assert_eq!(
+            ledger.release_data(roots[idx], va_for(idx), shared_frame),
+            Some(expected)
+        );
+        if !is_last && pos % 16 == 0 {
+            ledger.assert_shared_tree_valid(shared_frame);
+        }
+    }
+    for &root in &roots {
+        ledger.unregister_root(root);
+    }
+}

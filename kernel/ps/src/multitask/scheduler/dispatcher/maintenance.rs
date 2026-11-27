@@ -34,6 +34,10 @@ impl MigrationFrame<'_> {
 #[cfg(test)]
 pub(in crate::multitask::scheduler) mod tests;
 
+const IDLE_STEAL_MAX_SOURCE_CPUS: usize = 4;
+const IDLE_STEAL_MAX_PROBE_SLOTS: usize = 16;
+const ACTIVE_BALANCE_MAX_PROBE_SLOTS: usize = 16;
+
 fn mobile(slot: usize, source: usize) -> bool {
     slot != ROOT_TASK_SLOT && !runqueue::is_idle_slot(slot)
         && !crate::multitask::task_slot_is_running(slot)
@@ -41,12 +45,32 @@ fn mobile(slot: usize, source: usize) -> bool {
         && runqueue::weight::observe(slot).is_some()
         && current_identity::read_dispatch(slot).is_some_and(|p| p.task_id.is_some() && p.lifecycle_dispatchable())
 }
-fn candidate(slot: usize, source: usize, target: usize) -> Option<(u8, u64, usize, usize)> {
+fn candidate_at(slot: usize, source: usize, target: usize, now_ns: u64) -> Option<(u8, u64, usize, usize)> {
     if !mobile(slot, source)
-        || local_dispatch::published_candidate_admission(slot, target, crate::arch::clock::monotonic_nanos()) != Ok(true) { return None; }
+        || local_dispatch::published_candidate_admission(slot, target, now_ns) != Ok(true) { return None; }
     let weight = runqueue::weight::observe(slot)?;
     let system = weight & SYSTEM_CLASS_WEIGHT_FLAG != 0 || donation_ledger::inherited_system(slot);
     Some((u8::from(!system), runqueue::vruntime(slot), slot, target))
+}
+#[cfg(test)]
+fn candidate(slot: usize, source: usize, target: usize) -> Option<(u8, u64, usize, usize)> {
+    candidate_at(slot, source, target, crate::arch::clock::monotonic_nanos())
+}
+/// Selects the single busiest source CPU from the non-empty bitmask `candidates_mask`.
+/// Breaks runnable-count ties by highest published load word so heavy queues donate first.
+fn busiest_source_cpu(mut candidates_mask: u64) -> Option<usize> {
+    let mut best: Option<(usize, usize, u64)> = None;
+    while candidates_mask != 0 {
+        let source = candidates_mask.trailing_zeros() as usize;
+        candidates_mask &= candidates_mask - 1;
+        let count = runqueue::published_runnable_count(source);
+        if count == 0 { continue; }
+        let load = runqueue::published_load_word(source);
+        if best.is_none_or(|(_, best_count, best_load)| (count, load) > (best_count, best_load)) {
+            best = Some((source, count, load));
+        }
+    }
+    best.map(|(source, _, _)| source)
 }
 fn transfer(turn: &CpuDispatchTurn<'static>, slot: usize, source: usize, target: usize) -> bool {
     let Some(token) = frame_publication::local_frame_token(slot, source) else { return false; };
@@ -88,25 +112,52 @@ pub(super) fn service(turn: &CpuDispatchTurn<'static>, cpu: usize, current: usiz
     let mut selected = None;
     let idle = runqueue::is_idle_slot(current);
     if idle && !local_dispatch::local_fair_competitor_ready(cpu) {
-        for source in 0..MAX_TRACKED_CPUS {
-            if source == cpu || runqueue::published_runnable_count(source) == 0 { continue; }
-            for slot in runqueue::local_runnable_slots(source) {
-                if let Some(key) = candidate(slot, source, cpu) {
+        let mut source_mask = runqueue::nonempty_rq_cpu_mask() & !(1_u64 << cpu);
+        let now_ns = if source_mask != 0 { crate::arch::clock::monotonic_nanos() } else { 0 };
+        for _ in 0..IDLE_STEAL_MAX_SOURCE_CPUS {
+            let Some(source) = busiest_source_cpu(source_mask) else { break; };
+            source_mask &= !(1_u64 << source);
+            for slot in runqueue::local_runnable_slots(source).take(IDLE_STEAL_MAX_PROBE_SLOTS) {
+                if let Some(key) = candidate_at(slot, source, cpu, now_ns) {
                     if selected.is_none_or(|(old, _)| key < old) { selected = Some((key, source)); }
                 }
             }
+            if selected.is_some() { break; }
         }
     } else if !idle && !voluntary && runqueue::published_runnable_count(cpu) >= 2 {
         let previous = OPPORTUNITIES[cpu].fetch_add(1, Ordering::Relaxed);
         if runqueue_policy::active_balance_opportunity_due(previous) {
-            for slot in runqueue::local_runnable_slots(cpu) {
-                if !mobile(slot, cpu) { continue; }
-                let (task_mask, process_mask, _) = runqueue::affinity_payload::affinity_snapshot(slot);
-                if task_mask & process_mask & !(1_u64 << cpu) == 0 { continue; }
-                let target = runqueue::least_loaded_cpu(runqueue_policy::online_affinity_mask(slot), cpu);
-                if target == cpu || !runqueue_policy::runqueue_is_imbalanced(runqueue::published_runnable_count(cpu), runqueue::published_runnable_count(target)) { continue; }
-                if let Some(key) = candidate(slot, cpu, target) {
-                    if selected.is_none_or(|(old, _)| key < old) { selected = Some((key, cpu)); }
+            let online_mask = kernel_hal::api::cpu::online_mask();
+            let source_count = runqueue::published_runnable_count(cpu);
+            let global_target = runqueue::least_loaded_cpu(online_mask, cpu);
+            if global_target != cpu
+                && runqueue_policy::runqueue_is_imbalanced(
+                    source_count,
+                    runqueue::published_runnable_count(global_target),
+                )
+            {
+                let now_ns = crate::arch::clock::monotonic_nanos();
+                for slot in runqueue::local_runnable_slots(cpu).take(ACTIVE_BALANCE_MAX_PROBE_SLOTS) {
+                    if !mobile(slot, cpu) { continue; }
+                    let (task_mask, process_mask, _) = runqueue::affinity_payload::affinity_snapshot(slot);
+                    let eligible = task_mask & process_mask & online_mask;
+                    if eligible & !(1_u64 << cpu) == 0 { continue; }
+                    let target = if eligible & (1_u64 << global_target) != 0 {
+                        global_target
+                    } else {
+                        runqueue::least_loaded_cpu(eligible, cpu)
+                    };
+                    if target == cpu
+                        || !runqueue_policy::runqueue_is_imbalanced(
+                            source_count,
+                            runqueue::published_runnable_count(target),
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(key) = candidate_at(slot, cpu, target, now_ns) {
+                        if selected.is_none_or(|(old, _)| key < old) { selected = Some((key, cpu)); }
+                    }
                 }
             }
         }

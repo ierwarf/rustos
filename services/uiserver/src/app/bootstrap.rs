@@ -515,6 +515,12 @@ impl AppState {
             .is_some_and(GpuCompositorRuntime::admits_cpu_present)
     }
 
+    pub(crate) fn gpu_retry_deadline(&self, now: Instant) -> Option<Instant> {
+        self.gpu_compositor
+            .as_ref()
+            .and_then(|runtime| runtime.next_retry_deadline(now))
+    }
+
     pub(crate) fn poll_gpu_completions(&mut self) -> Result<bool, i32> {
         let mut runtime = self.gpu_compositor.take().ok_or(22)?;
         let result = runtime.poll(self.display_fd.as_raw_fd(), &mut self.display);

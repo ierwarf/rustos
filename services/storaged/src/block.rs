@@ -29,6 +29,11 @@ use rustos_user_abi::syscall::{
 };
 
 const WAIT_SLICE_MILLIS: u64 = 1_000;
+/// Short safety backstop when a bounded pump pass stopped early after
+/// collecting a ready prefix: normal in-order completions wake via IRQ almost
+/// immediately, while a rare out-of-order tail completion is caught by a full
+/// sweep if no further IRQ arrives within this slice.
+const TRUNCATED_WAIT_SLICE_MILLIS: u64 = 2;
 // Windowed read cache, in-flight tracking and stream read-ahead live in
 // `read_engine`; this module is its DVM transport and the write/flush policy.
 static ENGINE: Engine = Engine::new();
@@ -249,6 +254,11 @@ pub(super) fn read_into_with_info(
         })
 }
 
+/// Whether any stream or freed in-flight capacity wants a read-ahead top-up.
+pub(super) fn needs_read_ahead_top_up() -> bool {
+    ENGINE.needs_top_up()
+}
+
 /// Refills stream read-ahead after a reply, so its submit syscalls overlap the
 /// requester's work on its next request.
 pub(super) fn service_read_ahead() {
@@ -261,25 +271,48 @@ pub(super) fn service_read_ahead() {
 
 pub(super) fn run_read_pump() -> ! {
     let mut idle_wakes = 0_u32;
+    let mut force_full_sweep = false;
     let mut scratch = PumpScratch::default();
     loop {
-        let status = ENGINE.pump_once(&DvmTransport, &mut scratch);
+        let allow_early_stop = !force_full_sweep;
+        force_full_sweep = false;
+        let status = ENGINE.pump_once_bounded(&DvmTransport, &mut scratch, allow_early_stop);
+        if status.progressed != 0 {
+            idle_wakes = 0;
+            // Refill read-ahead right after freeing in-flight slots so the DVM
+            // pipeline stays saturated and receive threads can stay on the
+            // fused REPLY_RECV fast path without stalling on top_up.
+            ENGINE.top_up(&DvmTransport);
+        }
         if status.in_flight == 0 {
             idle_wakes = 0;
             ENGINE.park_until_work(Duration::from_millis(WAIT_SLICE_MILLIS));
             continue;
         }
-        if status.progressed != 0 {
-            idle_wakes = 0;
+        if status.truncated && (status.has_waited || status.progressed == 0) {
+            // A reader is still blocked on an in-flight window or a bounded
+            // pass found nothing; sweep every in-flight ticket immediately.
+            force_full_sweep = true;
             continue;
         }
-        let woke =
-            wait_for_transport_event(Instant::now() + Duration::from_millis(WAIT_SLICE_MILLIS));
+        let slice_ms = if status.truncated {
+            TRUNCATED_WAIT_SLICE_MILLIS
+        } else {
+            WAIT_SLICE_MILLIS
+        };
+        let woke = wait_for_transport_event(Instant::now() + Duration::from_millis(slice_ms));
+        if status.truncated && woke == Err(libc::ETIMEDOUT) {
+            // No new IRQ arrived during the short safety window after an
+            // early-stopped pass; force one full sweep to catch any
+            // out-of-order completion that was drained earlier.
+            force_full_sweep = true;
+            continue;
+        }
         // A transport in a terminal state reports an event forever; do not spin.
-        idle_wakes = if woke.is_ok() {
+        idle_wakes = if status.progressed == 0 && woke.is_ok() {
             idle_wakes.saturating_add(1)
         } else {
-            idle_wakes
+            0
         };
         if woke.is_err() || idle_wakes >= 64 {
             std::thread::sleep(Duration::from_millis(1));

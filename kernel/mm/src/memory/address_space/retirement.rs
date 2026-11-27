@@ -82,6 +82,15 @@ pub(super) fn reclaim_root(root: u64) {
     // every comparison is a count or a per-frame descriptor lookup. A table or
     // data frame has exactly one descriptor role, so a frame claimed as both a
     // leaf and a table fails one of the two ownership checks below.
+    //
+    // Pass 1 cannot be collapsed into Pass 2 without violating the fail-closed
+    // invariant ("never release or free a frame from a topology that failed to
+    // validate"): releasing descriptors or flushing frame batches mid-walk
+    // would mutate live shared frames or return frames to the global pool
+    // before detecting corruption or a ledger-count mismatch later in the tree.
+    // Instead, per-leaf checks are kept O(1) for exclusive/inline leaves and
+    // O(log S) via the shared-mapping AVL tree, and `lazy_table_record_count`
+    // is an O(1) atomic read.
     let mut tagged_tables = 0_usize;
     let mut tagged_leaves = 0_u64;
     if let Err(error) = address_space.walk_pager_fault_ownership(
@@ -121,29 +130,32 @@ pub(super) fn reclaim_root(root: u64) {
     );
 
     // Pass 2 settles each frame as it is found. Leaves go first, then tables,
-    // then the root, in bounded allocator batches held on the stack.
+    // then the root, in bounded allocator batches held on the stack. When
+    // Pass 1 proved the root holds zero data leaves, skip the redundant walk.
     let mut frames = RetiredFrameBatcher::new(root_phys);
-    if let Err(error) = address_space.walk_pager_fault_ownership(
-        |_table| {},
-        |leaf| {
-            // The first pass already reconciled the deposit with the root's
-            // table ledger. Detach it before returning a huge head to the
-            // allocator; the ordinary table-list drain below owns its free.
-            if leaf.virtual_address.is_multiple_of(ANON_HUGE_BYTES)
-                && leaf.physical_address.is_multiple_of(ANON_HUGE_BYTES)
-            {
-                let _ = phys::take_anon_huge_table(root_phys, leaf.virtual_address, leaf.physical_address);
-            }
-            match phys::release_data_leaf(root_phys, leaf.virtual_address, leaf.physical_address) {
-                Some(phys::DataLeafRelease::FrameReusable) => frames.push(leaf.physical_address),
-                Some(phys::DataLeafRelease::FrameRetained) => {}
-                None => panic!("retired PTE tag disagrees with its data-frame descriptor"),
-            }
-        },
-    ) {
-        panic!(
-            "process address space: page-table ownership changed during retirement root={root_phys:#x} error={error:?}"
-        );
+    if tagged_leaves != 0 {
+        if let Err(error) = address_space.walk_pager_fault_ownership(
+            |_table| {},
+            |leaf| {
+                // The first pass already reconciled the deposit with the root's
+                // table ledger. Detach it before returning a huge head to the
+                // allocator; the ordinary table-list drain below owns its free.
+                if leaf.virtual_address.is_multiple_of(ANON_HUGE_BYTES)
+                    && leaf.physical_address.is_multiple_of(ANON_HUGE_BYTES)
+                {
+                    let _ = phys::take_anon_huge_table(root_phys, leaf.virtual_address, leaf.physical_address);
+                }
+                match phys::release_data_leaf(root_phys, leaf.virtual_address, leaf.physical_address) {
+                    Some(phys::DataLeafRelease::FrameReusable) => frames.push(leaf.physical_address),
+                    Some(phys::DataLeafRelease::FrameRetained) => {}
+                    None => panic!("retired PTE tag disagrees with its data-frame descriptor"),
+                }
+            },
+        ) {
+            panic!(
+                "process address space: page-table ownership changed during retirement root={root_phys:#x} error={error:?}"
+            );
+        }
     }
     while let Some(table) = phys::pop_lazy_table_record(root_phys) {
         frames.push(table);

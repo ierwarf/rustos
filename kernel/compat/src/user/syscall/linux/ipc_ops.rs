@@ -47,7 +47,7 @@ pub(crate) use service_ownership::*;
 
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
 pub(super) use fast_reply::recv_with_sender_blocking_prepared_after_fast_reply;
@@ -88,7 +88,6 @@ const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 // socket workload consume the CPU needed to recover the UI and its service
 // owners. Counters and milestones retain the aggregate evidence.
 const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;
-const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
 const IPC_FAST_CALL_LIVE: bool = true;
 use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
@@ -140,7 +139,6 @@ static SERVICE_CALL_GRANTS: TrackedSpinLock<
     { LockClass::ServiceCallGrant as u8 },
 > = TrackedSpinLock::new([ServiceCallGrant::empty(); MAX_SERVICE_CALL_GRANTS]);
 // RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
-static IPC_LOG_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_IPC_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[derive(Clone, Copy)]
@@ -3105,7 +3103,16 @@ pub(super) fn call_service_endpoint_with_class(
     request: &[u8],
     class: ServiceIpcClass,
 ) -> Result<Vec<u8>, i64> {
-    call_service_endpoint_with_timeout(service_id, request, class.timeout_ms())
+    call_service_endpoint_with_timeout(service_id, request, class.timeout_ms(), true)
+}
+
+pub(super) fn call_service_endpoint_with_class_with_log(
+    service_id: u64,
+    request: &[u8],
+    class: ServiceIpcClass,
+    log_slow: bool,
+) -> Result<Vec<u8>, i64> {
+    call_service_endpoint_with_timeout(service_id, request, class.timeout_ms(), log_slow)
 }
 
 pub(super) fn call_service_endpoint_with_class_deadline(
@@ -3114,10 +3121,27 @@ pub(super) fn call_service_endpoint_with_class_deadline(
     class: ServiceIpcClass,
     requested_timeout_ms: u64,
 ) -> Result<Vec<u8>, i64> {
+    call_service_endpoint_with_class_deadline_with_log(
+        service_id,
+        request,
+        class,
+        requested_timeout_ms,
+        true,
+    )
+}
+
+pub(super) fn call_service_endpoint_with_class_deadline_with_log(
+    service_id: u64,
+    request: &[u8],
+    class: ServiceIpcClass,
+    requested_timeout_ms: u64,
+    log_slow: bool,
+) -> Result<Vec<u8>, i64> {
     call_service_endpoint_with_timeout(
         service_id,
         request,
         class.cap_timeout_ms(requested_timeout_ms),
+        log_slow,
     )
 }
 
@@ -3125,9 +3149,10 @@ fn call_service_endpoint_with_timeout(
     service_id: u64,
     request: &[u8],
     timeout_ms: u64,
+    log_slow: bool,
 ) -> Result<Vec<u8>, i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
-    call_bound_service_endpoint_with_timeout(service_id, endpoint, request, timeout_ms)
+    call_bound_service_endpoint_with_timeout(service_id, endpoint, request, timeout_ms, log_slow)
 }
 
 /// Reconcile an object only with the exact provider incarnation that owned it.
@@ -3153,7 +3178,11 @@ pub(super) fn call_service_endpoint_at_epoch_with_deadline(
         KernelEndpointHandle::from_raw(raw)
     };
     call_bound_service_endpoint_with_timeout(
-        service_id, endpoint, request, class.cap_timeout_ms(timeout_ms),
+        service_id,
+        endpoint,
+        request,
+        class.cap_timeout_ms(timeout_ms),
+        true,
     )
 }
 
@@ -3162,27 +3191,30 @@ fn call_bound_service_endpoint_with_timeout(
     endpoint: KernelEndpointHandle,
     request: &[u8],
     timeout_ms: u64,
+    log_slow: bool,
 ) -> Result<Vec<u8>, i64> {
-    let start_ticks = crate::arch::rtc::ticks();
+    let start_ticks = log_slow.then(crate::arch::rtc::ticks);
     // One absolute end for the whole call, fixed before transport selection so
     // neither the rendezvous attempt nor its queued fallback renews it.
     let reply_deadline = service_reply_deadline_tick_for_service(service_id, request, timeout_ms);
     if let Some(response) =
         try_service_rendezvous_call(service_id, endpoint, request, reply_deadline, timeout_ms)?
     {
-        let reply_ticks = crate::arch::rtc::ticks();
-        log_slow_ipc_call(
-            "service",
-            endpoint.raw(),
-            start_ticks,
-            start_ticks,
-            start_ticks,
-            start_ticks,
-            reply_ticks,
-            reply_ticks,
-            request.len(),
-            response.len(),
-        );
+        if let Some(start) = start_ticks {
+            let reply_ticks = crate::arch::rtc::ticks();
+            log_slow_ipc_call(
+                "service",
+                endpoint.raw(),
+                start,
+                start,
+                start,
+                start,
+                reply_ticks,
+                reply_ticks,
+                request.len(),
+                response.len(),
+            );
+        }
         return Ok(response);
     }
     let reply = enqueue_call_and_wake_or_wait_queue(
@@ -3192,21 +3224,23 @@ fn call_bound_service_endpoint_with_timeout(
         &[],
         reply_deadline,
     )?;
-    let send_ticks = crate::arch::rtc::ticks();
+    let send_ticks = log_slow.then(crate::arch::rtc::ticks);
     let response = wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms)?;
-    let reply_ticks = crate::arch::rtc::ticks();
-    log_slow_ipc_call(
-        "service",
-        endpoint.raw(),
-        start_ticks,
-        start_ticks,
-        start_ticks,
-        send_ticks,
-        reply_ticks,
-        reply_ticks,
-        request.len(),
-        response.len(),
-    );
+    if let (Some(start), Some(send)) = (start_ticks, send_ticks) {
+        let reply_ticks = crate::arch::rtc::ticks();
+        log_slow_ipc_call(
+            "service",
+            endpoint.raw(),
+            start,
+            start,
+            start,
+            send,
+            reply_ticks,
+            reply_ticks,
+            request.len(),
+            response.len(),
+        );
+    }
     Ok(response)
 }
 
@@ -4221,8 +4255,7 @@ fn maybe_log_slow_ipc<F>(elapsed_ms: u64, log: F)
 where
     F: FnOnce(),
 {
-    let sample_index = IPC_LOG_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if sample_index >= EARLY_IPC_SAMPLE_COUNT && elapsed_ms < SLOW_IPC_THRESHOLD_MS {
+    if !debug::enabled!(compat, info) || elapsed_ms < SLOW_IPC_THRESHOLD_MS {
         return;
     }
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);

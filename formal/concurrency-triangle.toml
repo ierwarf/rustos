@@ -247,7 +247,7 @@ source = "kernel/mm/src/memory/address_space/pager_fault_mapping.rs"
 source_symbol = "publish_user_table_entry"
 source_anchors = [
   "match entry.compare_exchange(0, desired, Ordering::AcqRel, Ordering::Acquire) {",
-  "let observed = entry.load(Ordering::Acquire);",
+  "Err(observed) => classify_user_table_entry(observed).map(|child| (child, false)),",
 ]
 invariant = "exactly one installer publishes an absent directory entry, and every CPU that observes it also observes the zeroed table it names"
 loom_test = "only_one_installer_publishes_a_table_and_its_zeroing_is_never_missed"
@@ -683,7 +683,8 @@ source_symbol = "activate_tagged"
 source_anchors = [
   "ACTIVE_ROOT[logical_index].store(root_raw, Ordering::SeqCst)",
   "let generation = SPACE_GEN[stripe(root_raw)].load(Ordering::SeqCst)",
-  "SPACE_GEN[stripe(root)].fetch_add(1, Ordering::SeqCst) + 1",
+  "SPACE_GEN[stripe(root)]",
+  ".fetch_add(1, Ordering::SeqCst)",
 ]
 invariant = "a mutation either sees the activating CPU as running the space or the activation reads the mutation's generation and flushes its tagged translations"
 loom_test = "tlb_activation_and_generation_bump_cannot_both_miss"

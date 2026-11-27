@@ -614,10 +614,61 @@ impl DvmBlockState {
             Ok(_) => {
                 // ORDERING: Acquire pairs with the DVM's Release store of the completion producer cursor.
                 let producer = load_u64(self.base, COMPLETION_PRODUCER_OFFSET, Ordering::Acquire);
+                // A prior poll of a different ticket can drain completions from the
+                // shared ring into `self.pending[slot].completion`, advancing
+                // `completion_consumer == producer`. Any uncollected non-cancelled
+                // completion still queued in `self.pending` must keep `DVM_WAIT`
+                // immediately ready so callers never sleep for a full wait slice.
                 producer != self.completion_consumer
+                    || self.pending.iter().any(|entry| {
+                        matches!(entry, Some(pending) if !pending.cancelled && pending.completion.is_some())
+                    })
             }
             Err(DvmBlockError::Busy) => false,
             Err(_) => true,
+        }
+    }
+
+    fn poll_ready(
+        &mut self,
+        ticket: DvmBlockTicket,
+        expected_len: usize,
+    ) -> Result<DvmBlockPoll, DvmBlockError> {
+        if ticket.generation != self.geometry.generation
+            || ticket.data_slot >= DVM_BLOCK_QUEUE_DEPTH
+        {
+            return Err(DvmBlockError::Revoked);
+        }
+        self.drain_completions()?;
+        let slot = ticket.data_slot as usize;
+        let Some(pending) = self.pending[slot] else {
+            return Err(DvmBlockError::Revoked);
+        };
+        if pending.request.request_id != ticket.request_id {
+            return Err(DvmBlockError::Revoked);
+        }
+        if pending.cancelled {
+            return Err(DvmBlockError::Cancelled);
+        }
+        let Some(completion) = pending.completion else {
+            return Ok(DvmBlockPoll::Pending);
+        };
+        match completion.status {
+            DvmBlockCompletionStatus::IoError => Err(DvmBlockError::DeviceFault),
+            DvmBlockCompletionStatus::Unsupported => Err(DvmBlockError::Unsupported),
+            DvmBlockCompletionStatus::Success => {
+                if matches!(pending.request.operation, DvmBlockOperation::Read) {
+                    let len = pending.request.data_len as usize;
+                    if expected_len != len {
+                        return Err(DvmBlockError::Invalid);
+                    }
+                    Ok(DvmBlockPoll::Completed(len))
+                } else if expected_len == 0 {
+                    Ok(DvmBlockPoll::Completed(0))
+                } else {
+                    Err(DvmBlockError::Invalid)
+                }
+            }
         }
     }
 
@@ -1150,6 +1201,17 @@ pub(crate) fn submit_flush(expected_generation: u64) -> Result<DvmBlockTicket, D
         .as_mut()
         .ok_or(DvmBlockError::Unavailable)?
         .submit(expected_generation, DvmBlockOperation::Flush, 0, &[], 0, false)
+}
+
+pub(crate) fn poll_ready(
+    ticket: DvmBlockTicket,
+    expected_len: usize,
+) -> Result<DvmBlockPoll, DvmBlockError> {
+    STATE
+        .lock()
+        .as_mut()
+        .ok_or(DvmBlockError::Unavailable)?
+        .poll_ready(ticket, expected_len)
 }
 
 pub(crate) fn poll(ticket: DvmBlockTicket, out: &mut [u8]) -> Result<DvmBlockPoll, DvmBlockError> {

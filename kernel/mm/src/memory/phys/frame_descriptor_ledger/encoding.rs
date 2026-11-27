@@ -55,3 +55,49 @@ pub(super) const fn free_head_generation(packed: u64) -> u32 {
 pub(super) const fn free_head_id(packed: u64) -> u32 {
     packed as u32
 }
+
+/// Packed root lazy-table list header stored in `ROLE_ROOT.owner_or_table_head`:
+/// high 32 bits hold the exact published table count, low 32 bits hold the head
+/// table's frame index (`table_phys / PAGE_SIZE`, 0 when empty).
+pub(super) const fn pack_table_head(count: u32, head_pfn: u32) -> u64 {
+    ((count as u64) << 32) | (head_pfn as u64)
+}
+
+pub(super) const fn table_head_count(packed: u64) -> u32 {
+    (packed >> 32) as u32
+}
+
+pub(super) const fn table_head_pfn(packed: u64) -> u32 {
+    packed as u32
+}
+
+/// Packed AVL child links stored in `CowMappingRecord.next`:
+/// high 32 bits hold the left child id, low 32 bits hold the right child id
+/// (and also the next-free id while the record sits on the lock-free pool stack).
+pub(super) const fn pack_mapping_links(left: u32, right: u32) -> u64 {
+    ((left as u64) << 32) | (right as u64)
+}
+
+pub(super) const fn mapping_left(links: u64) -> u32 {
+    (links >> 32) as u32
+}
+
+pub(super) const fn mapping_right(links: u64) -> u32 {
+    links as u32
+}
+
+/// Packed page-aligned virtual address plus 6-bit AVL subtree height (1..=63)
+/// stored in `CowMappingRecord.virtual_address`.
+const MAPPING_HEIGHT_MASK: u64 = 0x3f;
+
+pub(super) const fn pack_mapping_va(va: u64, height: u8) -> u64 {
+    (va & !(PAGE_SIZE - 1)) | ((height as u64) & MAPPING_HEIGHT_MASK)
+}
+
+pub(super) const fn mapping_va(packed: u64) -> u64 {
+    packed & !(PAGE_SIZE - 1)
+}
+
+pub(super) const fn mapping_height(packed: u64) -> u8 {
+    (packed & MAPPING_HEIGHT_MASK) as u8
+}

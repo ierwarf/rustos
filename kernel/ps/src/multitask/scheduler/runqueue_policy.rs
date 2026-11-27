@@ -108,16 +108,13 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
         last
     } else {
         let online_count = usize::try_from(eligible.count_ones()).unwrap_or(1).max(1);
-        let spread = slot % online_count;
-        (0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS)
-            .filter(|cpu| eligible & (1_u64 << cpu) != 0)
-            .nth(spread)
-            .unwrap_or(current)
+        nth_set_bit(eligible, slot % online_count).unwrap_or(current)
     };
     // A woken task should not queue behind a running one while an eligible CPU
     // sits idle: the preferred CPU keeps the task only when it is idle itself.
-    if !cpu_is_idle(preferred)
-        && let Some(idle) = idle_eligible_cpu(eligible, preferred)
+    let idle_mask = runqueue::idle_cpu_mask();
+    if idle_mask & (1_u64 << preferred) == 0
+        && let Some(idle) = first_bit_after(eligible & idle_mask, preferred)
     {
         return idle;
     }
@@ -130,30 +127,50 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
     )
 }
 
-/// A CPU is idle when nothing is queued or mailboxed for it and the task it runs
-/// is its own idle task. A remote wake lands in the mailbox first, so counting
-/// only the run queue would hand a burst of wakes to the same idle CPU. Both
-/// inputs are published hints; the owner CAS stays the authority.
-fn cpu_is_idle(cpu: usize) -> bool {
-    !runqueue::local_dispatch_work_pending(cpu)
-        && super::super::cpu_local::published_current_slot(cpu).is_some_and(runqueue::is_idle_slot)
+/// Returns the `n`-th set bit index (0-based) in `mask`, iterating only set bits.
+#[inline]
+const fn nth_set_bit(mut mask: u64, mut n: usize) -> Option<usize> {
+    while mask != 0 {
+        let cpu = mask.trailing_zeros() as usize;
+        if n == 0 {
+            return Some(cpu);
+        }
+        n -= 1;
+        mask &= mask - 1;
+    }
+    None
 }
 
-/// First idle eligible CPU after `preferred` in CPU order, wrapping, so a burst
-/// of placements spreads across idle CPUs instead of piling onto the lowest.
-fn idle_eligible_cpu(eligible: u64, preferred: usize) -> Option<usize> {
-    first_idle_after(eligible, preferred, cpu_is_idle)
+/// O(1) bitmask lookup for the first set bit in `candidates` strictly after
+/// `preferred` in CPU order (wrapping modulo 64), so a burst of placements
+/// spreads across idle CPUs without scanning all 64 CPU slots.
+#[inline]
+pub(super) const fn first_bit_after(candidates: u64, preferred: usize) -> Option<usize> {
+    let shift = (preferred + 1) & 63;
+    let without_preferred = candidates.rotate_right(shift as u32) & !(1_u64 << 63);
+    if without_preferred == 0 {
+        None
+    } else {
+        Some((without_preferred.trailing_zeros() as usize + shift) & 63)
+    }
 }
 
+#[cfg(test)]
 fn first_idle_after(
     eligible: u64,
     preferred: usize,
     is_idle: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    let max = nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
-    (1..max)
-        .map(|offset| (preferred + offset) % max)
-        .find(|cpu| eligible & (1_u64 << cpu) != 0 && is_idle(*cpu))
+    let mut idle_eligible = 0_u64;
+    let mut remaining = eligible;
+    while remaining != 0 {
+        let cpu = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
+        if is_idle(cpu) {
+            idle_eligible |= 1_u64 << cpu;
+        }
+    }
+    first_bit_after(idle_eligible, preferred)
 }
 
 #[cfg(not(test))]
@@ -362,5 +379,58 @@ mod tests {
             super::fallback_slot_for(current_slot, idle_slot, false),
             current_slot
         );
+    }
+
+    #[test]
+    fn bitmask_idle_cpu_selection_handles_wrap_bounds_and_bit63() {
+        use super::{first_bit_after, nth_set_bit};
+        assert_eq!(first_bit_after(0, 0), None);
+        assert_eq!(first_bit_after(1 << 63, 63), None);
+        assert_eq!(first_bit_after(1 << 0, 63), Some(0));
+        assert_eq!(first_bit_after((1 << 63) | (1 << 5), 5), Some(63));
+        assert_eq!(first_bit_after((1 << 63) | (1 << 5), 63), Some(5));
+        assert_eq!(first_bit_after(0b1010_0000, 5), Some(7));
+        assert_eq!(first_bit_after(0b1010_0000, 7), Some(5));
+        assert_eq!(nth_set_bit(0b1010_1000, 0), Some(3));
+        assert_eq!(nth_set_bit(0b1010_1000, 1), Some(5));
+        assert_eq!(nth_set_bit(0b1010_1000, 2), Some(7));
+        assert_eq!(nth_set_bit(0b1010_1000, 3), None);
+    }
+
+    #[test]
+    fn idle_and_nonempty_cpu_masks_track_idle_runqueue_and_mailbox_state() {
+        let _queue = super::runqueue::test_serial_guard();
+        super::runqueue::reset_before_publication();
+        assert_eq!(super::runqueue::idle_cpu_mask(), 0);
+        assert_eq!(super::runqueue::nonempty_rq_cpu_mask(), 0);
+
+        super::runqueue::set_cpu_running_idle(2, true);
+        super::runqueue::set_cpu_running_idle(5, true);
+        assert_eq!(super::runqueue::idle_cpu_mask(), (1 << 2) | (1 << 5));
+
+        // Remote wake into CPU 2's mailbox removes CPU 2 from idle mask immediately.
+        let slot = 44;
+        super::runqueue::admit_blocked(slot);
+        assert!(matches!(
+            super::runqueue::publish_remote_wake(slot, 2, 100),
+            super::runqueue::RemoteWakeOutcome::Published { cpu: 2, .. }
+        ));
+        assert_eq!(super::runqueue::idle_cpu_mask(), 1 << 5);
+        assert_eq!(super::runqueue::nonempty_rq_cpu_mask(), 0);
+
+        // Draining moves slot into CPU 2's local runqueue: still not idle, now nonempty.
+        assert_eq!(super::runqueue::drain_remote_wakes(2), 1);
+        assert_eq!(super::runqueue::idle_cpu_mask(), 1 << 5);
+        assert_eq!(super::runqueue::nonempty_rq_cpu_mask(), 1 << 2);
+
+        // Claiming clears CPU 2's runqueue; marking CPU 2 non-idle keeps it out of idle mask.
+        assert!(super::runqueue::claim_dispatch(slot, 2, 100));
+        super::runqueue::set_cpu_running_idle(2, false);
+        assert_eq!(super::runqueue::nonempty_rq_cpu_mask(), 0);
+        assert_eq!(super::runqueue::idle_cpu_mask(), 1 << 5);
+
+        super::runqueue::retire(slot, 100);
+        super::runqueue::release_retired(slot);
+        super::runqueue::reset_before_publication();
     }
 }

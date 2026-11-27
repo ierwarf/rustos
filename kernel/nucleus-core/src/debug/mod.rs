@@ -712,7 +712,8 @@ pub fn record_product_executable_snapshot_evidence(
 
 #[cfg(rustos_debug_print_enabled)]
 fn emit_milestone_debugcon_line(record: MilestoneRecord) {
-    if !compiled_level_enabled(record.category, LogLevel::Info) {
+    let output_class = milestone_output_class(record.name);
+    if !output_class.must_reach_sink() && !compiled_level_enabled(record.category, LogLevel::Info) {
         return;
     }
     if !milestone_debugcon_visible(record.name) {
@@ -726,7 +727,6 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
         }
     }
     let user_context = current_user_context();
-    let output_class = milestone_output_class(record.name);
     // Measurements are one-shot; Required and QualificationCritical keep the
     // bounded retry.
     for _ in 0..output_class.output_attempts() {

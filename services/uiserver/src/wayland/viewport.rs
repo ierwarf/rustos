@@ -155,14 +155,52 @@ pub(super) fn map_buffer(
     map_buffer_for_output(pixels, width, height, mapping, viewport, 1)
 }
 
+/// Whether `(mapping, viewport)` maps a `width x height` buffer 1:1 to
+/// `width x height` physical output pixels with no transform, crop, or scale.
+///
+/// Clients using `wp_viewporter` + `wp_fractional_scale_v1` on a HiDPI output
+/// (e.g. a `2880x1720` buffer at `buffer_scale=1` with `destination=(1440, 860)`
+/// on `output_scale=2`) hit this exact 1:1 identity and need neither a 20 MiB
+/// resample allocation nor full-buffer SHM reads on partial damage.
+pub(super) fn is_identity_output_mapping(
+    width: usize,
+    height: usize,
+    mapping: BufferMapping,
+    viewport: &ViewportState,
+    output_scale: usize,
+) -> bool {
+    let scale = mapping.scale;
+    let output_scale = output_scale.max(1);
+    if mapping.transform != 0 || scale == 0 || width == 0 || height == 0 {
+        return false;
+    }
+    if scale == output_scale && viewport.source.is_none() && viewport.destination.is_none() {
+        return true;
+    }
+    if width % scale != 0 || height % scale != 0 {
+        return false;
+    }
+    let (sw, sh) = (width / scale, height / scale);
+    if let Some(src) = viewport.source {
+        if src.x != 0.0 || src.y != 0.0 || src.width != sw as f64 || src.height != sh as f64 {
+            return false;
+        }
+    }
+    let (logical_dw, logical_dh) = viewport.destination.unwrap_or((sw, sh));
+    logical_dw.checked_mul(output_scale) == Some(width)
+        && logical_dh.checked_mul(output_scale) == Some(height)
+}
+
 /// Interpret a buffer into physical display pixels for an output with integer
 /// scale `output_scale` (e.g. `2` at 200% DPI).
 ///
 /// When `mapping.transform == 0 && mapping.scale == output_scale` and no
-/// viewport crop/destination is active, the client already rendered native
-/// physical pixels and this returns `Ok(None)` (zero-copy 1:1 HiDPI fast path).
-/// Legacy 1x clients (`mapping.scale == 1`) on a 2x output are scaled up to
-/// `2x` physical dimensions so their visual size matches the desktop DPI.
+/// viewport crop/destination is active (or when an active `wp_viewport`
+/// resolves to an exact 1:1 identity at `output_scale`), the client already
+/// rendered native physical pixels and this returns `Ok(None)` (zero-copy 1:1
+/// HiDPI fast path). Legacy 1x clients (`mapping.scale == 1`) on a 2x output
+/// are scaled up to `2x` physical dimensions so their visual size matches the
+/// desktop DPI.
 pub(super) fn map_buffer_for_output(
     pixels: &[u32],
     width: usize,
@@ -183,11 +221,7 @@ pub(super) fn map_buffer_for_output(
     if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
         return Err(ViewportError::OutOfBuffer);
     }
-    if mapping.transform == 0
-        && scale == output_scale
-        && viewport.source.is_none()
-        && viewport.destination.is_none()
-    {
+    if is_identity_output_mapping(width, height, mapping, viewport, output_scale) {
         return Ok(None);
     }
     if mapping.transform == 0 && scale == 1 && output_scale == 1 {
@@ -222,6 +256,34 @@ pub(super) fn map_buffer_for_output(
         logical_dh.checked_mul(output_scale).ok_or(ViewportError::BadSize)?,
     );
     let count = checked_wayland_pixel_count(dw, dh).ok_or(ViewportError::BadSize)?;
+    // Fast path for unrotated integer-aligned 1:1 crops at any output scale.
+    if mapping.transform == 0 {
+        let bx = sx * scale as f64;
+        let by = sy * scale as f64;
+        let bw = cw * scale as f64;
+        let bh = ch * scale as f64;
+        if bx.fract() == 0.0
+            && by.fract() == 0.0
+            && bw == dw as f64
+            && bh == dh as f64
+            && (bx as usize).checked_add(dw).is_some_and(|end| end <= width)
+            && (by as usize).checked_add(dh).is_some_and(|end| end <= height)
+        {
+            let bx = bx as usize;
+            let by = by as usize;
+            if bx == 0 && by == 0 && dw == width && dh == height {
+                return Ok(None);
+            }
+            let mut out = Vec::new();
+            out.try_reserve_exact(count)
+                .map_err(|_| ViewportError::BadSize)?;
+            for row in by..by + dh {
+                let start = row * width + bx;
+                out.extend_from_slice(&pixels[start..start + dw]);
+            }
+            return Ok(Some((out, dw, dh)));
+        }
+    }
     let mut out = Vec::new();
     out.try_reserve_exact(count)
         .map_err(|_| ViewportError::BadSize)?;
@@ -752,5 +814,53 @@ mod tests {
             apply_viewport(&gradient(1, 1), 1, 1, &viewport),
             Err(ViewportError::BadSize)
         );
+    }
+
+    #[test]
+    fn identity_viewport_at_hidpi_scale_is_zero_copy() {
+        // Chrome Ozone/Wayland submits a 2x physical buffer with buffer_scale=1
+        // and wp_viewport.set_destination(logical_w, logical_h) on output_scale=2.
+        let pixels = gradient(8, 6);
+        let vp_dest = ViewportState {
+            source: None,
+            destination: Some((4, 3)),
+        };
+        let scale1 = BufferMapping {
+            transform: 0,
+            scale: 1,
+        };
+        assert!(is_identity_output_mapping(8, 6, scale1, &vp_dest, 2));
+        assert_eq!(
+            map_buffer_for_output(&pixels, 8, 6, scale1, &vp_dest, 2),
+            Ok(None),
+            "1:1 HiDPI viewport must keep the original Arc with zero copy"
+        );
+
+        let scale2 = BufferMapping {
+            transform: 0,
+            scale: 2,
+        };
+        assert!(is_identity_output_mapping(8, 6, scale2, &vp_dest, 2));
+        assert_eq!(
+            map_buffer_for_output(&pixels, 8, 6, scale2, &vp_dest, 2),
+            Ok(None)
+        );
+
+        // Non-identity crop or scale must still resample.
+        let cropped = ViewportState {
+            source: Some(ViewportSource {
+                x: 2.0,
+                y: 0.0,
+                width: 6.0,
+                height: 6.0,
+            }),
+            destination: Some((3, 3)),
+        };
+        assert!(!is_identity_output_mapping(8, 6, scale1, &cropped, 2));
+        let (out, dw, dh) = map_buffer_for_output(&pixels, 8, 6, scale1, &cropped, 2)
+            .unwrap()
+            .expect("cropped viewport produces cropped output");
+        assert_eq!((dw, dh), (6, 6));
+        assert_eq!(&out[..6], &[2, 3, 4, 5, 6, 7]);
     }
 }

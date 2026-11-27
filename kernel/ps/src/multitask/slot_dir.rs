@@ -125,6 +125,7 @@ impl<T, const C: usize, const D: usize> AtomicDir<T, C, D> {
 
     /// Every element of the contiguous prefix of published chunks, stopping at
     /// the first unpublished chunk. Allocation-free.
+    #[cfg(test)]
     pub(crate) fn iter_contiguous(&self) -> impl Iterator<Item = &T> + '_ {
         self.chunks
             .iter()

@@ -3840,7 +3840,7 @@ models = ["physical-frame-lifecycle/PhysicalFrameLifecycle"]
 
 [[risk_surfaces]]
 path = "kernel/nucleus-core/src/debug/deferred.rs"
-severity = "low"
+severity = "high"
 flows = ["smp-ring3-qualification"]
 reason = "Ready-bit publication and bounded draining retain complete records until their sole sink owner emits them; general traffic cannot consume required evidence reserve and overflow remains visible. Models do not establish physical sink delivery or capacity under arbitrary load."
 
@@ -3856,11 +3856,11 @@ reason = "A fixed custody slot must precede initial socket reply binding and con
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs.rs"
-models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
+models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply", "vfs-open-description-recovery/VfsOpenDescriptionRecovery"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs/tests.rs"
-models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
+models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply", "vfs-open-description-recovery/VfsOpenDescriptionRecovery"]
 
 [[risk_surfaces]]
 path = "services/netd/src/ref_replay.rs"

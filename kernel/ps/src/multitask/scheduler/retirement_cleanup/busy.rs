@@ -72,6 +72,15 @@ impl<const CLASS: u8> Drop for StateGuard<'_, CLASS> {
             && state.cleanup == CleanupState::Vacant
             && state.kernel == KernelState::Vacant;
         task_table::set_cleanup_busy(slot, !idle);
+        let reap_candidate = slot >= super::FIRST_DYNAMIC_TASK_SLOT
+            && state.reset_seal.is_none()
+            && state.task_id.is_some()
+            && state.producer.is_none()
+            && !state.producing
+            && state.deferred.is_none()
+            && matches!(state.cleanup, CleanupState::Vacant | CleanupState::Complete)
+            && matches!(state.kernel, KernelState::Vacant | KernelState::Complete);
+        super::super::reaper::set_retired_candidate(slot, reap_candidate);
     }
 }
 

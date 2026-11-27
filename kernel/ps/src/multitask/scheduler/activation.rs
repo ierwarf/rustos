@@ -92,13 +92,25 @@ where
     }
     let mut members = [(0, 0); CAP];
     for (i, &id) in ids.iter().enumerate() {
-        // The directory accelerator is not authority: scan exact published
-        // user identities, then retain the original physical binding and member.
-        let Some(slot) = crate::multitask::task_table::active_dynamic_slots().find(|&slot| {
-            crate::multitask::current_identity::read(slot)
-                .is_some_and(|v| v.user_mode && v.task_id == Some(id))
-        }) else {
-            return false;
+        // The directory accelerator is not authority: revalidate any hint
+        // against exact published user identity, falling back to a dynamic
+        // scan only on miss or collision.
+        let matches_user = |slot: usize| {
+            slot >= super::FIRST_DYNAMIC_TASK_SLOT
+                && crate::multitask::current_identity::read(slot)
+                    .is_some_and(|v| v.user_mode && v.task_id == Some(id))
+        };
+        let slot = match super::task_directory::hint(id).filter(|&slot| matches_user(slot)) {
+            Some(slot) => slot,
+            None => {
+                let Some(slot) = crate::multitask::task_table::active_dynamic_slots()
+                    .find(|&slot| matches_user(slot))
+                else {
+                    return false;
+                };
+                super::task_directory::record(id, slot);
+                slot
+            }
         };
         members[i] = (slot, id);
     }

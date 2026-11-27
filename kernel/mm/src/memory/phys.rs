@@ -140,7 +140,7 @@ mod frame_batch_profile;
 mod frame_cache;
 mod free_word_index;
 use frame_cache::{FRAME_CACHE_SLOTS, PHYS_POOL, frame_cache_params};
-use free_word_index::FreeWordIndex;
+use free_word_index::FreeRunIndex;
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -188,8 +188,8 @@ struct PhysAllocatorState {
     /// Independent scan cursor so a failed huge-page probe does not repeatedly
     /// rescan the same fragmented prefix or move the ordinary-frame cursor.
     huge_next_block: usize,
-    /// Exact non-full-word hierarchy, mutated only with the central bitmap.
-    free_words: FreeWordIndex,
+    /// Exact multi-order free-run hierarchy, mutated only with the central bitmap.
+    free_words: FreeRunIndex,
     /// Diagnostic-only windows, copied by housekeeping without rendering under
     /// the allocator lock. One row per FrameScanKind; no hot-path sink calls.
     scan_profiles: [FrameScanProfile; 3],
@@ -330,10 +330,69 @@ impl Geometry {
         }
     }
 
+    /// Sorts `usable_ranges[..usable_range_count]` by `start_frame` and merges
+    /// overlapping or adjacent intervals so lookup and overlap checks are exact
+    /// `O(log R)` binary searches over strictly disjoint ascending ranges.
+    fn sort_and_merge_usable_ranges(&mut self) {
+        let count = self.usable_range_count;
+        if count == 0 {
+            return;
+        }
+        self.usable_ranges[..count].sort_unstable_by_key(|range| range.start_frame);
+        let mut write = 0_usize;
+        for read in 0..count {
+            let next = self.usable_ranges[read];
+            if next.page_count == 0 {
+                continue;
+            }
+            if write > 0 {
+                let prev = &mut self.usable_ranges[write - 1];
+                let prev_end = prev.end_frame();
+                if next.start_frame <= prev_end {
+                    let merged_end = prev_end.max(next.end_frame());
+                    prev.page_count = merged_end - prev.start_frame;
+                    continue;
+                }
+            }
+            self.usable_ranges[write] = next;
+            write += 1;
+        }
+        for slot in &mut self.usable_ranges[write..count] {
+            *slot = UsableFrameRange::EMPTY;
+        }
+        self.usable_range_count = write;
+    }
+
+    #[inline]
     fn is_boot_usable(&self, frame_index: usize) -> bool {
-        self.usable_ranges[..self.usable_range_count]
-            .iter()
-            .any(|range| range.contains(frame_index))
+        let ranges = &self.usable_ranges[..self.usable_range_count];
+        let idx = ranges.partition_point(|range| range.end_frame() <= frame_index);
+        idx < ranges.len() && ranges[idx].start_frame <= frame_index
+    }
+
+    /// True iff `[start_frame, end_frame)` overlaps any canonical boot-usable range.
+    #[inline]
+    fn overlaps_boot_usable(&self, start_frame: usize, end_frame: usize) -> bool {
+        if start_frame >= end_frame {
+            return false;
+        }
+        let ranges = &self.usable_ranges[..self.usable_range_count];
+        let idx = ranges.partition_point(|range| range.end_frame() <= start_frame);
+        idx < ranges.len() && ranges[idx].start_frame < end_frame
+    }
+
+    /// True iff every frame in `[start_frame, end_frame)` is boot-usable.
+    /// Relies on `usable_ranges` being sorted and coalesced.
+    #[inline]
+    fn contains_boot_usable_range(&self, start_frame: usize, end_frame: usize) -> bool {
+        if start_frame >= end_frame {
+            return true;
+        }
+        let ranges = &self.usable_ranges[..self.usable_range_count];
+        let idx = ranges.partition_point(|range| range.end_frame() <= start_frame);
+        idx < ranges.len()
+            && ranges[idx].start_frame <= start_frame
+            && ranges[idx].end_frame() >= end_frame
     }
 
     /// Every release check that does not depend on allocation state.
@@ -372,9 +431,9 @@ impl UsableFrameRange {
         page_count: 0,
     };
 
-    fn contains(self, frame_index: usize) -> bool {
-        let end = self.start_frame.saturating_add(self.page_count);
-        (self.start_frame..end).contains(&frame_index)
+    #[inline]
+    fn end_frame(self) -> usize {
+        self.start_frame.saturating_add(self.page_count)
     }
 }
 
@@ -388,7 +447,7 @@ impl PhysAllocatorState {
             min_free_frames: 0,
             next_hint: 0,
             huge_next_block: 1,
-            free_words: FreeWordIndex::EMPTY,
+            free_words: FreeRunIndex::EMPTY,
             scan_profiles: [FrameScanProfile::EMPTY; 3],
         }
     }
@@ -406,13 +465,15 @@ impl PhysAllocatorState {
     }
 
     /// All central bitmap writes pass here, including cache refill/drain and
-    /// fixed/huge claims. Higher levels change only on full/non-full edges,
-    /// so consuming another free bit in the same word adds no index traffic.
+    /// fixed/huge claims. Higher levels change only on order-predicate edges,
+    /// so consuming another free bit without changing max run order adds no
+    /// index traffic.
     #[inline]
     fn store_used_word(&mut self, index: usize, before: u64, after: u64) {
         self.geo.used.store_word(index, after);
-        if (before == u64::MAX) != (after == u64::MAX) {
-            self.free_words.set_available(index, after != u64::MAX);
+        if before != after {
+            self.free_words
+                .on_used_word_changed(self.geo.used, index, before, after);
         }
     }
 
@@ -510,7 +571,7 @@ impl PhysAllocatorState {
         let end_frame = start_frame
             .checked_add(page_count)
             .ok_or(FixedRangeClaimError::InvalidRange)?;
-        if !(start_frame..end_frame).all(|frame| frame_is_boot_usable(self, frame)) {
+        if !self.geo.contains_boot_usable_range(start_frame, end_frame) {
             return Err(FixedRangeClaimError::OutsideUsableMemory);
         }
         if (start_frame..end_frame).any(|frame| self.is_used(frame)) {
@@ -720,44 +781,210 @@ impl PhysAllocatorState {
         page_count: usize,
         kind: FrameScanKind,
     ) -> Option<usize> {
+        let mut work = FrameScanWork::default();
+        let mut scanned = 0usize;
+        let found = self.find_contiguous_free_range_with_work(
+            start,
+            end,
+            page_count,
+            &mut scanned,
+            &mut work,
+        );
+        self.record_scan_milestone(scanned, page_count, kind, &work);
+        found
+    }
+
+    fn find_contiguous_free_range_with_work(
+        &self,
+        start: usize,
+        end: usize,
+        page_count: usize,
+        scanned: &mut usize,
+        work: &mut FrameScanWork,
+    ) -> Option<usize> {
         if start >= end || page_count == 0 {
             return None;
         }
 
-        let mut scanned = 0usize;
-        let mut work = FrameScanWork::default();
-        for range_index in 0..self.geo.usable_range_count {
-            let range = self.geo.usable_ranges[range_index];
+        let ranges = &self.geo.usable_ranges[..self.geo.usable_range_count];
+        let first_range = ranges.partition_point(|range| range.end_frame() <= start);
+        for &range in &ranges[first_range..] {
+            if range.start_frame >= end {
+                break;
+            }
             let range_start = range.start_frame.max(start);
-            let range_end = range
-                .start_frame
-                .saturating_add(range.page_count);
+            let range_end = range.end_frame();
             let start_limit_end = end.min(range_end);
             if range_start >= start_limit_end {
                 continue;
             }
 
-            let mut frame = range_start;
-            while let Some(candidate) = self.next_free_frame_in_range(frame, start_limit_end, &mut work) {
-                scanned = scanned.saturating_add(candidate.saturating_sub(frame) + 1);
-                // The search already proved this bit free. Single-frame
-                // allocation and cache refill need no second bitmap load.
-                if page_count == 1 {
-                    self.record_scan_milestone(scanned, page_count, kind, &work);
-                    return Some(candidate);
-                }
-                let run_len = self.free_run_len_from(candidate, range_end, page_count, &mut work);
-
-                if run_len == page_count {
-                    self.record_scan_milestone(scanned, page_count, kind, &work);
-                    return Some(candidate);
-                }
-
-                frame = candidate.saturating_add(run_len).saturating_add(1);
+            let found = if page_count == 1 {
+                self.next_free_frame_in_range(range_start, start_limit_end, work)
+                    .inspect(|&candidate| {
+                        *scanned = scanned.saturating_add(candidate.saturating_sub(range_start) + 1);
+                    })
+            } else if page_count <= 2 * BITS_PER_WORD - 2 {
+                self.find_contiguous_medium_in_range(
+                    range_start,
+                    start_limit_end,
+                    range_end,
+                    page_count,
+                    scanned,
+                    work,
+                )
+            } else {
+                self.find_contiguous_large_in_range(
+                    range_start,
+                    start_limit_end,
+                    range_end,
+                    page_count,
+                    scanned,
+                    work,
+                )
+            };
+            if found.is_some() {
+                return found;
             }
         }
 
-        self.record_scan_milestone(scanned, page_count, kind, &work);
+        None
+    }
+
+    /// Finds the earliest contiguous free run of length `2 <= page_count <= 126`
+    /// starting in `[frame, start_limit_end)` and contained in `range_end`.
+    /// Uses the order-`floor(log2(page_count))` summary tree so fragmented words
+    /// without a qualifying run start are skipped in `O(log N)`.
+    fn find_contiguous_medium_in_range(
+        &self,
+        mut frame: usize,
+        start_limit_end: usize,
+        range_end: usize,
+        page_count: usize,
+        scanned: &mut usize,
+        work: &mut FrameScanWork,
+    ) -> Option<usize> {
+        let order = (page_count.ilog2() as usize).min(free_word_index::MAX_RUN_ORDER);
+        let min_len = 1_usize << order;
+        let words = self.geo.used.words;
+        while frame < start_limit_end {
+            let first_word = frame / BITS_PER_WORD;
+            let Some(word_index) =
+                self.free_words
+                    .next_word_with_run_order(order, first_word, &mut work.index_words)
+            else {
+                return None;
+            };
+            if word_index * BITS_PER_WORD >= start_limit_end {
+                return None;
+            }
+            let search_frame = frame.max(word_index * BITS_PER_WORD);
+            *scanned = scanned.saturating_add(search_frame.saturating_sub(frame) + 1);
+            work.bitmap_words += 1;
+            let free_w = !self.geo.used.load_word(word_index);
+            let free_next = if word_index + 1 < words {
+                work.bitmap_words += 1;
+                !self.geo.used.load_word(word_index + 1)
+            } else {
+                0
+            };
+            let start_bit = search_frame % BITS_PER_WORD;
+            if page_count <= BITS_PER_WORD {
+                let starts = free_word_index::exact_run_starts_in_word(free_w, free_next, page_count)
+                    & (u64::MAX << start_bit);
+                if starts == 0 {
+                    frame = (word_index + 1) * BITS_PER_WORD;
+                    continue;
+                }
+                let candidate = word_index * BITS_PER_WORD + starts.trailing_zeros() as usize;
+                if candidate >= start_limit_end || candidate.saturating_add(page_count) > range_end {
+                    return None;
+                }
+                return Some(candidate);
+            }
+            // `65 <= page_count <= 126`: `min_len == 64`; locate the earliest
+            // 64-frame start in `word_index` and verify the remaining tail.
+            let starts = free_word_index::exact_run_starts_in_word(free_w, free_next, min_len)
+                & (u64::MAX << start_bit);
+            if starts == 0 {
+                frame = (word_index + 1) * BITS_PER_WORD;
+                continue;
+            }
+            let candidate = word_index * BITS_PER_WORD + starts.trailing_zeros() as usize;
+            if candidate >= start_limit_end {
+                return None;
+            }
+            let extra = self.free_run_len_from(
+                candidate + min_len,
+                range_end,
+                page_count - min_len,
+                work,
+            );
+            if min_len + extra == page_count {
+                return Some(candidate);
+            }
+            frame = candidate.saturating_add(min_len + extra).saturating_add(1);
+        }
+        None
+    }
+
+    /// Finds the earliest contiguous free run of length `page_count >= 127`.
+    /// Any such run must contain at least `(page_count - 126).div_ceil(64)`
+    /// consecutive all-free central words, so non-qualifying islands are skipped
+    /// directly via the all-free-run summary index.
+    fn find_contiguous_large_in_range(
+        &self,
+        mut frame: usize,
+        start_limit_end: usize,
+        range_end: usize,
+        page_count: usize,
+        scanned: &mut usize,
+        work: &mut FrameScanWork,
+    ) -> Option<usize> {
+        let min_full_words = (page_count - (2 * BITS_PER_WORD - 2)).div_ceil(BITS_PER_WORD);
+        let (af_order, threshold_words) = free_word_index::all_free_order_for(min_full_words);
+        while frame < start_limit_end {
+            let min_w_all = frame.div_ceil(BITS_PER_WORD);
+            let Some(w_all) =
+                self.free_words
+                    .next_all_free_run(af_order, min_w_all, &mut work.index_words)
+            else {
+                return None;
+            };
+            let w_all_frame = w_all * BITS_PER_WORD;
+            if w_all_frame >= range_end {
+                return None;
+            }
+            let candidate = if w_all > 0 && w_all_frame > frame {
+                work.bitmap_words += 1;
+                let prev_used = self.geo.used.load_word(w_all - 1);
+                let leading_free = prev_used.leading_zeros() as usize;
+                (w_all_frame - leading_free).max(frame)
+            } else {
+                frame
+            };
+            if candidate >= start_limit_end {
+                return None;
+            }
+            *scanned = scanned.saturating_add(candidate.saturating_sub(frame) + 1);
+            let prefix = w_all_frame.saturating_sub(candidate);
+            let known_full = (threshold_words * BITS_PER_WORD)
+                .min(range_end.saturating_sub(w_all_frame));
+            let verified = prefix + known_full;
+            if verified >= page_count {
+                return Some(candidate);
+            }
+            let extra = self.free_run_len_from(
+                w_all_frame + known_full,
+                range_end,
+                page_count - verified,
+                work,
+            );
+            if verified + extra == page_count {
+                return Some(candidate);
+            }
+            frame = candidate.saturating_add(verified + extra).saturating_add(1);
+        }
         None
     }
 
@@ -931,8 +1158,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         let used_bitmap_bytes = bitmap_words
             .checked_mul(core::mem::size_of::<u64>())
             .expect("physical allocator bitmap size overflow");
-        // `used`, `cached`, then the exact hierarchy of non-full `used` words.
-        let free_index_words = FreeWordIndex::backing_words(bitmap_words)
+        // `used`, `cached`, then the multi-order free-run hierarchy.
+        let free_index_words = FreeRunIndex::backing_words(bitmap_words)
             .expect("physical free-word index exceeds direct-map geometry");
         let free_index_bytes = free_index_words
             .checked_mul(core::mem::size_of::<u64>())
@@ -1065,7 +1292,7 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         new_state.geo.cached =
             BitmapView::from_raw(unsafe { bitmap_ptr.add(bitmap_words) }, bitmap_words);
         new_state.free_words = unsafe {
-            FreeWordIndex::from_raw(bitmap_ptr.add(bitmap_words * 2), bitmap_words)
+            FreeRunIndex::from_raw(bitmap_ptr.add(bitmap_words * 2), bitmap_words)
         };
         new_state.geo.bitmap_phys_start = bitmap_phys;
         new_state.geo.bitmap_page_count = bitmap_pages;
@@ -1080,14 +1307,18 @@ pub fn init(boot_info_ptr: *const BootInfo) {
                 page_count,
             };
             new_state.geo.usable_range_count += 1;
-            new_state.mark_range_free(start_frame, page_count);
+        }
+        new_state.geo.sort_and_merge_usable_ranges();
+        for range_index in 0..new_state.geo.usable_range_count {
+            let range = new_state.geo.usable_ranges[range_index];
+            new_state.mark_range_free(range.start_frame, range.page_count);
             new_state.usable_frames = new_state
                 .usable_frames
-                .checked_add(page_count)
+                .checked_add(range.page_count)
                 .expect("usable frame count overflow");
             new_state.free_frames = new_state
                 .free_frames
-                .checked_add(page_count)
+                .checked_add(range.page_count)
                 .expect("free frame count overflow");
         }
 
@@ -1199,7 +1430,10 @@ fn range_overlaps_boot_usable_locked(state: &PhysAllocatorState, phys_start: u64
     let first = phys_start / PAGE_SIZE;
     let last = end / PAGE_SIZE;
     let limit = (state.geo.frame_count as u64).min(last);
-    (first..limit).any(|frame| frame_is_boot_usable(state, frame as usize))
+    if first >= limit {
+        return false;
+    }
+    state.geo.overlaps_boot_usable(first as usize, limit as usize)
 }
 
 /// The cache slot of the calling CPU. Any slot is correct - slots are locked -
@@ -1551,10 +1785,10 @@ mod tests {
         state.geo.frame_count = page_count;
         state.geo.used = BitmapView::from_raw(bitmap.as_mut_ptr(), bitmap.len());
         let summary = alloc::boxed::Box::leak(
-            alloc::vec![0_u64; FreeWordIndex::backing_words(bitmap.len()).unwrap()].into_boxed_slice(),
+            alloc::vec![0_u64; FreeRunIndex::backing_words(bitmap.len()).unwrap()].into_boxed_slice(),
         );
         // SAFETY: leaked zeroed test backing is exclusively owned by this state.
-        state.free_words = unsafe { FreeWordIndex::from_raw(summary.as_mut_ptr(), bitmap.len()) };
+        state.free_words = unsafe { FreeRunIndex::from_raw(summary.as_mut_ptr(), bitmap.len()) };
         state.usable_frames = page_count;
         state.free_frames = page_count;
         state.next_hint = next_hint;
@@ -1568,13 +1802,7 @@ mod tests {
     }
 
     pub(super) fn assert_index_matches_bitmap(state: &PhysAllocatorState) {
-        for first in 0..=state.geo.used.words {
-            let expected = (first..state.geo.used.words)
-                .find(|word| state.geo.used.load_word(*word) != u64::MAX);
-            let mut reads = 0;
-            assert_eq!(state.free_words.next_available(first, &mut reads), expected);
-            assert!(reads <= 7);
-        }
+        state.free_words.assert_matches_bitmap(state.geo.used);
     }
 
     #[test]
@@ -2136,5 +2364,180 @@ mod tests {
             state.claim_fixed_range_locked(start, bytes),
             Err(FixedRangeClaimError::AlreadyOwned)
         );
+    }
+
+    #[test]
+    fn usable_ranges_sort_merge_and_binary_search_match_linear_oracle() {
+        let mut geo = Geometry::new();
+        // Insert unsorted, overlapping, adjacent, and gapped ranges (up to MAX_USABLE_RANGES).
+        let raw = [
+            (500, 40),
+            (10, 20),
+            (30, 15),   // adjacent to [10, 30) -> merges to [10, 45)
+            (25, 30),   // overlaps [10, 45) -> merges to [10, 55)
+            (1000, 1),
+            (100, 10),
+            (510, 50),  // overlaps [500, 540) -> merges to [500, 560)
+            (500, 0),   // empty ignored
+        ];
+        for (idx, &(start_frame, page_count)) in raw.iter().enumerate() {
+            geo.usable_ranges[idx] = UsableFrameRange {
+                start_frame,
+                page_count,
+            };
+        }
+        geo.usable_range_count = raw.len();
+        geo.sort_and_merge_usable_ranges();
+
+        assert_eq!(geo.usable_range_count, 4);
+        let merged = &geo.usable_ranges[..geo.usable_range_count];
+        assert_eq!(
+            merged.iter().map(|r| (r.start_frame, r.page_count)).collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![(10, 45), (100, 10), (500, 60), (1000, 1)]
+        );
+
+        let oracle_usable = |f: usize| {
+            raw.iter()
+                .any(|&(s, n)| n > 0 && (s..s + n).contains(&f))
+        };
+        for f in 0..1024 {
+            assert_eq!(geo.is_boot_usable(f), oracle_usable(f), "frame {f}");
+        }
+        for start in [0, 9, 10, 54, 55, 99, 100, 109, 110, 499, 500, 559, 560, 999, 1000, 1001] {
+            for len in [0, 1, 2, 10, 50, 200] {
+                let end = start + len;
+                let expected_overlap = (start..end).any(oracle_usable);
+                let expected_contains = (start..end).all(oracle_usable);
+                assert_eq!(
+                    geo.overlaps_boot_usable(start, end),
+                    expected_overlap,
+                    "overlap [{start}, {end})"
+                );
+                assert_eq!(
+                    geo.contains_boot_usable_range(start, end),
+                    expected_contains,
+                    "contains [{start}, {end})"
+                );
+            }
+        }
+
+        // Stress MAX_USABLE_RANGES disjoint ranges inserted in reverse order.
+        let mut many = Geometry::new();
+        for i in 0..MAX_USABLE_RANGES {
+            let rev = MAX_USABLE_RANGES - 1 - i;
+            many.usable_ranges[i] = UsableFrameRange {
+                start_frame: rev * 16 + 4,
+                page_count: 8,
+            };
+        }
+        many.usable_range_count = MAX_USABLE_RANGES;
+        many.sort_and_merge_usable_ranges();
+        assert_eq!(many.usable_range_count, MAX_USABLE_RANGES);
+        for f in 0..(MAX_USABLE_RANGES * 16 + 16) {
+            let expected = (f % 16) >= 4 && (f % 16) < 12 && f < MAX_USABLE_RANGES * 16;
+            assert_eq!(many.is_boot_usable(f), expected, "128-range frame {f}");
+        }
+    }
+
+    #[test]
+    fn fragmented_multi_page_contiguous_search_skips_islands_with_bounded_reads() {
+        const FRAMES: usize = 400_128;
+        let words = FRAMES.div_ceil(BITS_PER_WORD);
+        let mut bitmap = alloc::vec![u64::MAX; words];
+        let mut state = test_state(&mut bitmap, FRAMES, 0);
+
+        // Fill the first 380,000 frames with alternating used/free single frames
+        // (190,000 isolated 1-frame free islands — the worst case for linear hopping).
+        for w in 0..(380_000 / BITS_PER_WORD) {
+            let before = state.geo.used.load_word(w);
+            state.store_used_word(w, before, 0x5555_5555_5555_5555);
+        }
+        // Leave one qualifying 512-page run starting at an unaligned boundary (380,003).
+        let target_start = 380_003;
+        let target_len = 512;
+        state.mark_range_used(380_000, FRAMES - 380_000);
+        state.mark_range_free(target_start, target_len);
+        // Also place sub-threshold 256-page and 63-page islands before target_start
+        // (starting at odd frames so the preceding even frame in 0x5555.. is used,
+        // and sealing the trailing frame so island lengths are exact).
+        state.mark_range_free(64_001, 63);
+        state.set_used(64_001 + 63);
+        state.mark_range_free(128_001, 256);
+        state.set_used(128_001 + 256);
+
+        for (pages, expected, max_bitmap_reads, max_index_reads) in [
+            (2, 64_001, 4, 16),
+            (3, 64_001, 4, 16),
+            (4, 64_001, 4, 16),
+            (16, 64_001, 4, 16),
+            (32, 64_001, 4, 16),
+            (63, 64_001, 4, 16),
+            (64, 128_001, 4, 16),
+            (127, 128_001, 4, 16),
+            (256, 128_001, 8, 16),
+            (257, target_start, 16, 32),
+            (512, target_start, 16, 32),
+        ] {
+            let mut work = FrameScanWork::default();
+            let mut scanned = 0;
+            let found = state.find_contiguous_free_range_with_work(
+                0,
+                FRAMES - pages + 1,
+                pages,
+                &mut scanned,
+                &mut work,
+            );
+            assert_eq!(found, Some(expected), "pages={pages}");
+            assert!(
+                work.bitmap_words <= max_bitmap_reads,
+                "pages={pages} read too many bitmap words: {}",
+                work.bitmap_words
+            );
+            assert!(
+                work.index_words <= max_index_reads,
+                "pages={pages} read too many index words: {}",
+                work.index_words
+            );
+        }
+    }
+
+    #[test]
+    fn multi_page_contiguous_search_matches_oracle_across_large_and_unaligned_runs() {
+        const FRAMES: usize = 1600;
+        let words = FRAMES.div_ceil(BITS_PER_WORD);
+        let mut bitmap = alloc::vec![u64::MAX; words];
+        let mut state = test_state(&mut bitmap, FRAMES, 0);
+        // Carve non-trivial runs spanning word boundaries, including unaligned
+        // 63, 64, 65, 126, 127, 128, 255, 256, 512-page runs.
+        state.mark_range_used(0, FRAMES);
+        for (start, len) in [
+            (3, 2),
+            (62, 5),      // crosses word 0 -> 1
+            (129, 64),    // crosses word 2 -> 3
+            (255, 126),   // crosses word 3 -> 5 (max without guaranteed full word)
+            (449, 127),   // crosses word 7 -> 9 (1 full word)
+            (703, 256),   // unaligned 256-page run
+            (1027, 512),  // unaligned 512-page run (exactly 7 full words + edges)
+        ] {
+            state.mark_range_free(start, len);
+        }
+        state.free_frames = (0..FRAMES).filter(|&f| !state.is_used(f)).count();
+        assert_index_matches_bitmap(&state);
+
+        for hint in [0, 1, 63, 64, 256, 450, 704, 1028, 1500] {
+            state.next_hint = hint;
+            for pages in [1, 2, 3, 4, 5, 7, 16, 32, 63, 64, 65, 126, 127, 128, 190, 191, 255, 256, 319, 511, 512, 513] {
+                let last = FRAMES - pages + 1;
+                let clamped = hint.min(last - 1);
+                let expected = (clamped..last)
+                    .chain(0..clamped)
+                    .find(|start| (*start..*start + pages).all(|frame| !state.is_used(frame)));
+                assert_eq!(
+                    state.find_alloc_start_locked(pages, FrameScanKind::Contiguous),
+                    expected,
+                    "hint={hint} pages={pages}"
+                );
+            }
+        }
     }
 }

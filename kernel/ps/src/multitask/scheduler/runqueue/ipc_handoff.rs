@@ -252,6 +252,7 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
                 // ORDERING: clearing under the mailbox owner closes the race with
                 // a producer that publishes the next 0-to-1 notification edge.
                 MAILBOX_PENDING[cpu].store(0, Ordering::Release);
+                update_cpu_mask_bit(&MAILBOX_PENDING_CPU_MASK, cpu, false);
             }
             popped
         })() else {

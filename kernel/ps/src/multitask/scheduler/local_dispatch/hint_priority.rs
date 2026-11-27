@@ -39,7 +39,10 @@ pub(in crate::multitask::scheduler) fn user_hint_blocked_by_system(
     }
     let hinted_user = observed_class(hint_slot)? == LocalClass::User;
     let mut system_ready = false;
-    if hinted_user {
+    if hinted_user
+        && !(donation_ledger::live_inherited_system_count() == 0
+            && runqueue::has_no_system_runnable(cpu, queue_epoch))
+    {
         for peer in runqueue::local_runnable_slots(cpu) {
             if runqueue::is_idle_slot(peer) { continue; }
             if observed_class(peer)? != LocalClass::System {

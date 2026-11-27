@@ -10,7 +10,7 @@
 //! dependency is satisfied. Nothing in this file waits on a client fd.
 
 use super::snapshot::{blit_damage, Completion, JobId, Refused};
-use super::viewport::{map_buffer_for_output, ViewportError};
+use super::viewport::{is_identity_output_mapping, map_buffer_for_output, ViewportError};
 use super::*;
 
 /// The state a `wl_surface.commit` carries, captured at request time.
@@ -121,9 +121,18 @@ impl WaylandState {
             let buffer_damage = surface.pending_buffer_damage;
             surface.pending_surface_damage = Rect::empty();
             surface.pending_buffer_damage = Rect::empty();
+            let surface_damage_scale = if surface.pending_viewport.destination.is_some() {
+                // Surface-local damage is expressed in logical destination
+                // coordinates. On a 1:1 HiDPI identity viewport (buffer size
+                // equals destination * output_scale), each logical unit spans
+                // `output_scale` physical buffer pixels.
+                self.output_scale.max(1) as usize
+            } else {
+                surface.pending_buffer_mapping.scale
+            };
             let damage = buffer_damage.union(scale_damage_rect(
                 surface_damage,
-                surface.pending_buffer_mapping.scale,
+                surface_damage_scale,
             ));
             let offset = std::mem::take(&mut surface.pending_offset);
             let pending_buffer = surface.pending_buffer.take();
@@ -398,16 +407,21 @@ impl WaylandState {
             return Planned::Done;
         }
         let output_scale = self.output_scale.max(1) as usize;
-        let viewport_active = shared.lock().is_ok_and(|surface| {
-            surface.viewport.is_active()
-                || surface.buffer_mapping.transform != 0
-                || surface.buffer_mapping.scale != output_scale
+        let identity_mapping = shared.lock().is_ok_and(|surface| {
+            is_identity_output_mapping(
+                source.shared.width,
+                source.shared.height,
+                surface.buffer_mapping,
+                &surface.viewport,
+                output_scale,
+            )
         });
-        // `damage` is in buffer coordinates; when the client renders at native
-        // `output_scale` without a transform or wp_viewport resample, buffer
-        // coordinates map 1:1 to retained physical pixels and partial blits are
-        // exact. Under any transform, viewport, or scale mismatch, read full.
-        if has_damage && !viewport_active {
+        // `damage` is in buffer coordinates; when the mapping resolves to a
+        // 1:1 physical identity (including HiDPI `wp_viewport` destinations
+        // whose physical size matches the buffer), buffer coordinates map 1:1
+        // to retained physical pixels and partial blits are exact. Under any
+        // transform, crop, or scale mismatch, read full.
+        if has_damage && identity_mapping {
             let (width, height, stride, len) = shared.lock().map_or((0, 0, 0, 0), |surface| {
                 (
                     surface.width,

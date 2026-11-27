@@ -606,6 +606,12 @@ impl WaylandCompositor {
         self.state.pending_frame_callback_rect()
     }
 
+    pub(crate) fn next_pointer_motion_flush(&self) -> Option<Instant> {
+        self.state
+            .pointer_motion_pending
+            .then_some(self.state.next_pointer_motion_flush)
+    }
+
     pub(crate) fn window_snapshots(&self) -> Vec<WaylandWindowSnapshot> {
         self.state.window_snapshots()
     }

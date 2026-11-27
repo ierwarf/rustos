@@ -92,6 +92,7 @@ pub(in crate::multitask) fn ready_since_ticks(slot: usize) -> u64 {
 pub(in crate::multitask) fn set_ready_since_ticks(slot: usize, ticks: u64) {
     // ORDERING: publish advisory ready timing after admitted producer effects.
     task_table::get(slot).wait_ready_since.store(ticks, Ordering::Release);
+    super::note_slot_resync_if_local(slot);
 }
 
 #[inline]

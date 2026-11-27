@@ -20,7 +20,7 @@ use super::{
     DonationLedger, DonationNamespace, FundingBasis, IpcDonationTarget, IpcPriorityDonation,
     LedgerEntry,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const IDLE: u64 = 0;
 const RESERVED: u64 = 1;
@@ -51,10 +51,36 @@ impl Edge {
 fn edge_for(slot: usize) -> Option<&'static Edge> {
     task_table::try_get(slot).map(|task| &*task.lazy_edge)
 }
-/// True while some slot may be non-idle. Set after the slot word, cleared only by
-/// `settle`, which then re-scans, so a reader that sees it clear linearizes before the
-/// reserve that raced it.
-static PENDING: AtomicBool = AtomicBool::new(false);
+/// 3-level lock-free radix-64 dirty-donor bitmap covering all `MAX_TASK_SLOTS`
+/// (262,144 slots = 4096 L1 words = 64 L0 words = 1 root word).
+///
+/// Writers (`reserve`, or `settle` re-marking a busy slot) set bits bottom-up
+/// with SeqCst (`L1 -> L0 -> ROOT`); `settle` drains top-down with SeqCst
+/// swaps (`ROOT -> L0 -> L1`). By the total SeqCst order, a concurrent writer
+/// either sets `L1` before `settle`'s `L1.swap(0)` (so `settle` visits it) or
+/// sets `L0`/`ROOT` after `settle`'s swaps (leaving the path set for the next
+/// `settle`). `settle` therefore visits only `O(dirty)` slots under the global
+/// IRQ-off `DONATION_LEDGER` lock.
+const L1_WORDS: usize = task_table::MAX_TASK_SLOTS / 64;
+const L0_WORDS: usize = L1_WORDS / 64;
+
+static DIRTY_ROOT: AtomicU64 = AtomicU64::new(0);
+static DIRTY_L0: [AtomicU64; L0_WORDS] = [const { AtomicU64::new(0) }; L0_WORDS];
+static DIRTY_L1: [AtomicU64; L1_WORDS] = [const { AtomicU64::new(0) }; L1_WORDS];
+
+#[inline]
+fn mark_dirty(slot: usize) {
+    debug_assert!(slot < task_table::MAX_TASK_SLOTS);
+    let l1_idx = slot >> 6;
+    let l1_bit = 1_u64 << (slot & 63);
+    let l0_idx = l1_idx >> 6;
+    let l0_bit = 1_u64 << (l1_idx & 63);
+    let root_bit = 1_u64 << l0_idx;
+    // ORDERING: SeqCst bottom-up pairs with top-down SeqCst drain in `settle`.
+    DIRTY_L1[l1_idx].fetch_or(l1_bit, Ordering::SeqCst);
+    DIRTY_L0[l0_idx].fetch_or(l0_bit, Ordering::SeqCst);
+    DIRTY_ROOT.fetch_or(root_bit, Ordering::SeqCst);
+}
 
 fn own_basis(slot: usize, id: u64) -> FundingBasis {
     FundingBasis { donor_slot: slot, donor_id: id, root_slot: slot, root_id: id, source: None }
@@ -72,9 +98,9 @@ pub(in super::super) fn reserve(slot: usize, id: u64) -> bool {
     if edge.state.compare_exchange(IDLE, RESERVED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return false;
     }
-    // ORDERING: the slot word is published before the hint, so a settle that
-    // clears the hint and re-scans cannot miss it.
-    PENDING.store(true, Ordering::Release);
+    // ORDERING: the slot word is published before the dirty path so `settle`
+    // draining the path always observes `RESERVED` (or a later state).
+    mark_dirty(slot);
     true
 }
 
@@ -150,75 +176,100 @@ fn clear_token(receiver_slot: usize, owner_slot: usize, reply: u64) {
 
 /// Make every lazy edge a ledger entry. Called with the ledger leaf held by every
 /// ledger operation, so the operation sees exactly the entries the eager protocol
-/// would have produced up to now.
+/// would have produced up to now. Visits only dirty donor slots (`O(dirty)`).
 pub(super) fn settle(ledger: &mut DonationLedger) {
-    // ORDERING: Acquire checks whether any lazy edge was published since last settle.
-    if !PENDING.load(Ordering::Acquire) {
+    // ORDERING: Acquire fast-path check avoids locked RMW when no lazy edges exist.
+    if DIRTY_ROOT.load(Ordering::Acquire) == 0 {
         return;
     }
-    PENDING.store(false, Ordering::Relaxed);
-    // ORDERING: SeqCst separates the hint clear from the slot scan (Dekker with `reserve`).
-    fence(Ordering::SeqCst);
-    let mut busy = false;
-    for slot in task_table::allocated_slots() {
-        let Some(edge) = edge_for(slot) else { continue; };
-        for _ in 0..4 {
-            match edge.state.load(Ordering::Acquire) {
-                IDLE => break,
-                RESERVED => {
-                    if edge
-                        .state
-                        .compare_exchange(RESERVED, SETTLING, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_err()
-                    {
-                        continue;
+    // ORDERING: SeqCst top-down drain pairs with bottom-up SeqCst `mark_dirty`.
+    let mut root = DIRTY_ROOT.swap(0, Ordering::SeqCst);
+    while root != 0 {
+        let l0_idx = root.trailing_zeros() as usize;
+        root &= root - 1;
+        let mut l0 = DIRTY_L0[l0_idx].swap(0, Ordering::SeqCst);
+        while l0 != 0 {
+            let l1_off = l0.trailing_zeros() as usize;
+            l0 &= l0 - 1;
+            let l1_idx = l0_idx * 64 + l1_off;
+            let mut l1 = DIRTY_L1[l1_idx].swap(0, Ordering::SeqCst);
+            while l1 != 0 {
+                let bit = l1.trailing_zeros() as usize;
+                l1 &= l1 - 1;
+                let slot = l1_idx * 64 + bit;
+                let Some(edge) = edge_for(slot) else { continue; };
+                for _ in 0..4 {
+                    match edge.state.load(Ordering::Acquire) {
+                        IDLE => break,
+                        RESERVED => {
+                            if edge
+                                .state
+                                .compare_exchange(
+                                    RESERVED,
+                                    SETTLING,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let id = edge.donor_id.load(Ordering::Relaxed);
+                            let reserved = reserve_locked(
+                                ledger,
+                                id,
+                                id,
+                                slot,
+                                false,
+                                Some(own_basis(slot, id)),
+                            );
+                            debug_assert!(reserved, "lazy reservation lost its ledger entry");
+                            edge.state.store(IDLE, Ordering::Release);
+                            break;
+                        }
+                        BOUND => {
+                            if edge
+                                .state
+                                .compare_exchange(
+                                    BOUND,
+                                    SETTLING,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let id = edge.donor_id.load(Ordering::Relaxed);
+                            let receiver_slot = edge.receiver_slot.load(Ordering::Relaxed);
+                            let inserted = ledger.insert(LedgerEntry {
+                                donation: IpcPriorityDonation {
+                                    reply: edge.reply.load(Ordering::Relaxed),
+                                    namespace: DonationNamespace::IpcReply,
+                                    donor_task_id: id,
+                                    context_owner_task_id: id,
+                                    context_owner_slot: slot,
+                                    priority_donated: false,
+                                    custody_active: true,
+                                    target: IpcDonationTarget::BoundWorker(
+                                        edge.receiver_id.load(Ordering::Relaxed),
+                                    ),
+                                },
+                                receiver_slot: Some(receiver_slot),
+                                funding: Some(own_basis(slot, id)),
+                            });
+                            debug_assert!(inserted, "lazy binding lost its ledger entry");
+                            edge.state.store(IDLE, Ordering::Release);
+                            break;
+                        }
+                        _ => break,
                     }
-                    let id = edge.donor_id.load(Ordering::Relaxed);
-                    let reserved = reserve_locked(ledger, id, id, slot, false, Some(own_basis(slot, id)));
-                    debug_assert!(reserved, "lazy reservation lost its ledger entry");
-                    edge.state.store(IDLE, Ordering::Release);
-                    break;
                 }
-                BOUND => {
-                    if edge
-                        .state
-                        .compare_exchange(BOUND, SETTLING, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    let id = edge.donor_id.load(Ordering::Relaxed);
-                    let receiver_slot = edge.receiver_slot.load(Ordering::Relaxed);
-                    let inserted = ledger.insert(LedgerEntry {
-                        donation: IpcPriorityDonation {
-                            reply: edge.reply.load(Ordering::Relaxed),
-                            namespace: DonationNamespace::IpcReply,
-                            donor_task_id: id,
-                            context_owner_task_id: id,
-                            context_owner_slot: slot,
-                            priority_donated: false,
-                            custody_active: true,
-                            target: IpcDonationTarget::BoundWorker(edge.receiver_id.load(Ordering::Relaxed)),
-                        },
-                        receiver_slot: Some(receiver_slot),
-                        funding: Some(own_basis(slot, id)),
-                    });
-                    debug_assert!(inserted, "lazy binding lost its ledger entry");
-                    edge.state.store(IDLE, Ordering::Release);
-                    break;
-                }
-                _ => {
-                    busy = true;
-                    break;
+                if edge.state.load(Ordering::Relaxed) != IDLE {
+                    mark_dirty(slot);
                 }
             }
         }
-        if edge.state.load(Ordering::Relaxed) != IDLE {
-            busy = true;
-        }
-    }
-    if busy {
-        PENDING.store(true, Ordering::Release);
     }
 }
 
@@ -230,8 +281,17 @@ pub(super) fn reset() {
             edge.state.store(IDLE, Ordering::Release);
         }
     }
-    // ORDERING: Release clears pending hint after resetting all allocated edges.
-    PENDING.store(false, Ordering::Release);
+    let mut root = DIRTY_ROOT.swap(0, Ordering::SeqCst);
+    while root != 0 {
+        let l0_idx = root.trailing_zeros() as usize;
+        root &= root - 1;
+        let mut l0 = DIRTY_L0[l0_idx].swap(0, Ordering::SeqCst);
+        while l0 != 0 {
+            let l1_off = l0.trailing_zeros() as usize;
+            l0 &= l0 - 1;
+            DIRTY_L1[l0_idx * 64 + l1_off].store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Whether `slot` currently holds a lazy edge (native witnesses).
@@ -248,5 +308,40 @@ mod tests {
     #[test]
     fn slot_words_are_distinct() {
         assert_eq!([IDLE, RESERVED, BOUND, SETTLING], [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn dirty_donor_bitmap_tracks_sparse_high_and_low_slots_without_full_scan() {
+        let _cpu = crate::multitask::cpu_local::test_publication_lock();
+        let _queue = crate::multitask::scheduler::runqueue::test_serial_guard();
+        reset();
+        assert_eq!(DIRTY_ROOT.load(Ordering::Acquire), 0);
+
+        let slots = [1_usize, 63, 64, 4095, 4096, 65535, task_table::MAX_TASK_SLOTS - 1];
+        for &s in &slots {
+            mark_dirty(s);
+        }
+        assert_ne!(DIRTY_ROOT.load(Ordering::Acquire), 0);
+
+        let mut drained = alloc::vec::Vec::new();
+        let mut root = DIRTY_ROOT.swap(0, Ordering::SeqCst);
+        while root != 0 {
+            let l0_idx = root.trailing_zeros() as usize;
+            root &= root - 1;
+            let mut l0 = DIRTY_L0[l0_idx].swap(0, Ordering::SeqCst);
+            while l0 != 0 {
+                let l1_off = l0.trailing_zeros() as usize;
+                l0 &= l0 - 1;
+                let l1_idx = l0_idx * 64 + l1_off;
+                let mut l1 = DIRTY_L1[l1_idx].swap(0, Ordering::SeqCst);
+                while l1 != 0 {
+                    let bit = l1.trailing_zeros() as usize;
+                    l1 &= l1 - 1;
+                    drained.push(l1_idx * 64 + bit);
+                }
+            }
+        }
+        assert_eq!(drained, slots);
+        assert_eq!(DIRTY_ROOT.load(Ordering::Acquire), 0);
     }
 }

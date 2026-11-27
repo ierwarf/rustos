@@ -31,24 +31,34 @@ pub(in crate::multitask) fn with_fork_held_regions<R>(
         return Err(PagerVmaError::Stale);
     }
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    let allocated_slots = slots.capacity();
     let mut regions = Vec::new();
-    regions
-        .try_reserve_exact(allocated_slots)
-        .map_err(|_| PagerVmaError::Pressure)?;
     let mut slot_indices = Vec::new();
-    slot_indices
-        .try_reserve_exact(allocated_slots)
-        .map_err(|_| PagerVmaError::Pressure)?;
-    for (slot_index, slot) in slots.iter().enumerate() {
-        let Some(region) = slot.snapshot()? else {
-            continue;
-        };
-        if region_matches_identity(region, process.slot(), identity) {
-            regions.push(region);
-            slot_indices.push(slot_index);
+    if writer.live_count > 0
+        && writer.matches_owner(process.slot(), identity)
+        && let Some(index) = slots.index()
+    {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(writer.live_count)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        index.collect_all(&mut entries)?;
+        regions
+            .try_reserve_exact(entries.len())
+            .map_err(|_| PagerVmaError::Pressure)?;
+        slot_indices
+            .try_reserve_exact(entries.len())
+            .map_err(|_| PagerVmaError::Pressure)?;
+        for entry in entries {
+            let slot_index = entry.slot as usize;
+            let Some(region) = slots[slot_index].snapshot()? else {
+                continue;
+            };
+            if region_matches_identity(region, process.slot(), identity) {
+                regions.push(region);
+                slot_indices.push(slot_index);
+            }
         }
     }
 

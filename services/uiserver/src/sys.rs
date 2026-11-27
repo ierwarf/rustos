@@ -519,6 +519,7 @@ pub(crate) fn diag_line(message: impl Into<String>) {
             "uiserver-diagnostics",
             move || {
                 while let Ok(message) = receiver.recv() {
+                    let _ = &message;
                     observability_client::info!("uiserver", service, "{}", message);
                 }
             },

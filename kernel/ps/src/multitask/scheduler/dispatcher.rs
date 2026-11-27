@@ -472,6 +472,7 @@ fn complete(outgoing: &CurrentReturn<'_>, urgency: Urgency) -> SchedulerDispatch
     }
     runqueue::affinity_payload::record_last_cpu(next, cpu as u8);
     crate::multitask::cpu_local::set_scheduler_current_task_scratch_for_cpu(cpu, next);
+    runqueue::set_cpu_running_idle(cpu, runqueue::is_idle_slot(next));
     nucleus_core::util::lockdep::record_scheduler_dispatch(cpu, outgoing.id(), receipt.id, previous, next,
         receipt.token.saved_rsp, runqueue::is_idle_slot(next), matches!(urgency, Urgency::Atomic));
     nucleus_core::util::lockdep::set_current_task_owner(receipt.id.checked_add(1).expect("task lock owner exhausted"));

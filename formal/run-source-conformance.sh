@@ -2287,7 +2287,8 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::transferred_input_description_keeps_the_waitset_service_reference
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::fork_service_refs_come_from_the_frozen_child_handle_snapshot
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_mutation_owns_the_complete_state_mutation_lease
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::netd_refs::tests::local_socket_dup_releases_only_the_last_reference_to_the_provider
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::netd_refs::tests::final_close_and_ack_keep_initial_capacity_even_while_in_flight
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::netd_reference_mutations_use_state_mutation_lease
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::diagnostics::tests::terminal_failure_diagnostic_has_an_independent_bounded_lane
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::vfs_timeout_diagnostic_identifies_the_exact_epoll_control_operation

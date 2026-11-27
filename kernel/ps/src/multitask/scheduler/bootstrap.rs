@@ -244,6 +244,7 @@ impl InitialCpu<'_> {
         self.begin_publication(owner.generation)
             .expect("initial bank producer spent twice");
         crate::multitask::cpu_local::publish_cpu_current_task(self);
+        runqueue::set_cpu_running_idle(self.cpu, runqueue::is_idle_slot(self.slot));
         self.complete_publication();
     }
     fn begin_publication(&self, owner: u64) -> Option<()> {

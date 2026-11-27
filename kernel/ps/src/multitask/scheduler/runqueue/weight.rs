@@ -6,15 +6,26 @@
 //! therefore do not need `Scheduler::contexts` merely to preserve CFS share or
 //! the trusted System-class admission bit.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{RunOwnerState, owner};
 use crate::multitask::task_table;
+
+/// Monotonic epoch bumped whenever any live task's base weight/class changes
+/// (`replace` or live `clear`). Read-only during steady-state dispatch.
+static BASE_WEIGHT_CLASS_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(super) fn base_class_epoch() -> u64 {
+    // ORDERING: Acquire pairs with AcqRel bumps in `replace`/`clear`.
+    BASE_WEIGHT_CLASS_EPOCH.load(Ordering::Acquire)
+}
 
 pub(in crate::multitask) fn reset_before_publication() {
     for slot in task_table::allocated_slots() {
         task_table::get(slot).weight.store(0, Ordering::Release);
     }
+    BASE_WEIGHT_CLASS_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 pub(in crate::multitask) fn initialize(slot: usize, value: u32) {
@@ -48,9 +59,18 @@ pub(in crate::multitask) fn replace(slot: usize, value: u32) {
     assert_ne!(value, 0, "scheduler weight is zero");
     super::super::donation_ledger::publish_base_class(|| {
         task_table::get(slot).weight.store(value, Ordering::Release);
+        BASE_WEIGHT_CLASS_EPOCH.fetch_add(1, Ordering::AcqRel);
     });
+    super::note_slot_resync_if_local(slot);
 }
 
 pub(in crate::multitask) fn clear(slot: usize) {
     task_table::get(slot).weight.store(0, Ordering::Release);
+    let snap = owner(slot);
+    if snap.state != RunOwnerState::Dormant && !snap.state.is_terminal() {
+        BASE_WEIGHT_CLASS_EPOCH.fetch_add(1, Ordering::AcqRel);
+        if let Some(cpu) = snap.cpu {
+            super::note_overdue_resync_needed(cpu);
+        }
+    }
 }

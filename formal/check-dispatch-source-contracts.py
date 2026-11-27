@@ -70,7 +70,7 @@ ordered(body(current_ipc, 'complete_ipc_reply_wake_handoff_with_custody'), [
 # observations only, not a new process/frame grant or an IRQ-off spinning lock.
 pager_vma = Path('kernel/ps/src/multitask/pager_vma.rs').read_text()
 ordered(body(pager_vma, 'lookup_slot'), ['read_rewrite_epoch(handle, ||',
-    'for (index, slot)', 'slot.may_cover(address)', 'slot.snapshot()?',
+    'index_tree.find_containing(address)?', 'slot.may_cover(address)', 'slot.snapshot()?',
     'region_matches_identity(', 'admit_access(region, access)'],
     'complete VMA scan is enclosed by one whole-rewrite observation')
 rewrite_epoch = Path('kernel/ps/src/multitask/pager_vma/rewrite_epoch.rs').read_text()
@@ -354,7 +354,7 @@ ordered(body(maintenance, 'service'), ['turn.owns_priority_choice()',
     'OPPORTUNITIES[cpu].fetch_add(1, Ordering::Relaxed)',
     'runqueue_policy::active_balance_opportunity_due(previous)',
     'if !mobile(slot, cpu)', 'runqueue::least_loaded_cpu(',
-    'candidate(slot, cpu, target)', 'transfer(turn, slot, source, target)'],
+    'candidate_at(slot, cpu, target, now_ns)', 'transfer(turn, slot, source, target)'],
     'loaded-opportunity balance, never RTC residue')
 ordered(body(maintenance, 'transfer'), ['frame_publication::pin_for_identity(token, id)',
     'frame_readers::acquire(&pin, cpu)', 'context_validation::validate_published_saved_context(',

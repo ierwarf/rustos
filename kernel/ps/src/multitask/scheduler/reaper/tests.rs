@@ -394,3 +394,41 @@ fn physical_all_cpu_policy_withdrawal_removes_only_the_owned_slot_before_externa
         }
     });
 }
+
+#[test]
+fn retired_candidate_bitmap_tracks_lifecycle_and_sibling_slot_clearing() {
+    fixture(|| {
+        // Test low-level bitmap hierarchy across sibling and distant high slots.
+        let (a, b, high) = (FIRST_DYNAMIC_TASK_SLOT + 1, FIRST_DYNAMIC_TASK_SLOT + 2, 65_540);
+        set_retired_candidate(a, true);
+        set_retired_candidate(b, true);
+        set_retired_candidate(high, true);
+        let snap: std::vec::Vec<usize> = RetiredCandidates::snapshot().collect();
+        assert!(snap.contains(&a) && snap.contains(&b) && snap.contains(&high));
+
+        // Clearing one sibling preserves the other in the same L1 word.
+        set_retired_candidate(a, false);
+        let snap: std::vec::Vec<usize> = RetiredCandidates::snapshot().collect();
+        assert!(!snap.contains(&a) && snap.contains(&b) && snap.contains(&high));
+
+        set_retired_candidate(b, false);
+        set_retired_candidate(high, false);
+        let snap: std::vec::Vec<usize> = RetiredCandidates::snapshot().collect();
+        assert!(!snap.contains(&b) && !snap.contains(&high));
+
+        // End-to-end integration with real retirement row transitions.
+        prepare(SLOT, ID);
+        assert!(!RetiredCandidates::snapshot().any(|s| s == SLOT));
+        stop(SLOT, ID, false);
+        // Kernel ACK still pending -> not yet a reap candidate.
+        assert!(!RetiredCandidates::snapshot().any(|s| s == SLOT));
+        retirement_cleanup::ack_kernel_fixture(SLOT);
+        // After ACK -> appears in O(1) retired bitmap!
+        assert!(RetiredCandidates::snapshot().any(|s| s == SLOT));
+        let grant = Grant::capture(SLOT, None).unwrap();
+        // Once ResetSeal is acquired -> removed from retired bitmap.
+        assert!(!RetiredCandidates::snapshot().any(|s| s == SLOT));
+        complete(grant);
+        assert!(!RetiredCandidates::snapshot().any(|s| s == SLOT));
+    });
+}

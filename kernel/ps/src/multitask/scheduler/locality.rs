@@ -35,6 +35,22 @@ static PICK_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 static HANDOFF_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDOFF_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+#[cfg(rustos_scheduler_phase_profile)]
+#[inline]
+pub(super) fn record_pick_scan(ns: u64) {
+    // ORDERING: Relaxed; diagnostic counters drained once per second.
+    PICK_SCAN_NS.fetch_add(ns, core::sync::atomic::Ordering::Relaxed);
+    PICK_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(rustos_scheduler_phase_profile)]
+#[inline]
+pub(super) fn record_handoff_scan(ns: u64) {
+    // ORDERING: Relaxed; diagnostic counters drained once per second.
+    HANDOFF_SCAN_NS.fetch_add(ns, core::sync::atomic::Ordering::Relaxed);
+    HANDOFF_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Takes the window's handoff-scan cost, clearing it for the next window.
 pub(in crate::multitask) fn take_handoff_scan_window() -> (u64, u64) {
     (

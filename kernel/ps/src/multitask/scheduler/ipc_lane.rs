@@ -456,6 +456,7 @@ fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_r
     runtime_profile::owner::lane_dispatch(cpu, to, new_root);
     runqueue::affinity_payload::record_last_cpu(to, cpu as u8);
     cpu_local::set_scheduler_current_task_scratch_for_cpu(cpu, to);
+    runqueue::set_cpu_running_idle(cpu, runqueue::is_idle_slot(to));
     nucleus_core::util::lockdep::record_scheduler_dispatch(
         cpu, from_id, to_id, from, to, next_rsp, false, false);
     nucleus_core::util::lockdep::set_current_task_owner(to_id.checked_add(1).expect("task lock owner exhausted"));

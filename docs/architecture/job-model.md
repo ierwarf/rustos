@@ -1043,8 +1043,9 @@ reserving concurrently; splitting a shared mapping by unmap
 is charged without a limit check because unmap must not fail; pager VMA
 publication slots are not billed to a Job as a per-VMA allocation: each process
 slot owns a `ProcessVmaTable` directory (cap `PAGER_MAX_VMAS_PER_PROCESS` =
-4096), built in 32-slot `ProcessVmaTable` entries when the process table grows
-and growing its per-process VMA slot chunks lazily in 32-slot chunks on demand
+65536), built in `ProcessVmaTable` entries when the process table grows
+and growing its per-process VMA slot chunks (128-slot chunks x 512 directory
+entries) and lock-free-readable O(log N) B-tree index nodes lazily on demand
 (never freed, bounded by policy ceiling and directory ceiling); the leaf page
 table size, which the Job process-object quota in turn bounds; the leaf page
 tables behind those mappings are billed as `Class::PageTable`. A boot-time

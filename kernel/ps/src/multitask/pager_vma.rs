@@ -15,8 +15,10 @@
 //! - **Evidence:** Focused unit tests plus the `pager-vma-publication-*` formal
 //!   and implementation mutations.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::pager::{
@@ -38,14 +40,15 @@ use rewrite_epoch::{RangeRewrite, read_rewrite_epoch};
 
 /// Hard per-process directory ceiling for pager VMAs, taken from the shared ABI.
 ///
-/// This used to size a fixed preallocated array per process (`64` -> `256`).
-/// Each process's VMA slots now grow lazily in `VMA_SLOT_CHUNK`-slot chunks up
-/// to this directory ceiling (narrowed by Ring3 policy `ceiling`), while
+/// Matches Linux `vm.max_map_count` (`65536`). Each process's VMA slots grow
+/// lazily in `VMA_SLOT_CHUNK`-slot chunks up to this directory ceiling
+/// (narrowed by Ring3 policy `ceiling`), indexed by a lock-free-readable
+/// per-process B-tree for O(log N) fault lookup and O(log N + K) range edits.
 /// `PAGER_MIN_FULLY_TRACKED_PROCESSES` in the ABI remains the cross-process
 /// relation with pagerd.
 const MAX_PAGER_VMAS_PER_PROCESS: usize = PAGER_MAX_VMAS_PER_PROCESS;
-const VMA_SLOT_CHUNK: usize = crate::multitask::slot_dir::SLOT_CHUNK;
-const VMA_SLOT_DIR: usize = crate::multitask::slot_dir::SLOT_DIR;
+const VMA_SLOT_CHUNK: usize = 128;
+const VMA_SLOT_DIR: usize = 512;
 const _: () = assert!(
     VMA_SLOT_CHUNK * VMA_SLOT_DIR == MAX_PAGER_VMAS_PER_PROCESS,
     "chunked per-process VMA directory must match the ABI per-process ceiling"
@@ -199,6 +202,7 @@ impl PublishedPagerVma {
         })
     }
 
+    #[cfg(test)]
     fn may_overlap_or_touch(&self, start: u64, end: u64) -> bool {
         self.stable_extent().is_none_or(|(slot_start, slot_end)| {
             slot_start != 0 && start <= slot_end && slot_start <= end
@@ -486,23 +490,759 @@ fn build_default_vma_chunk() -> Option<VmaChunkBox> {
     AtomicDir::<PublishedPagerVma, VMA_SLOT_CHUNK, VMA_SLOT_DIR>::build_chunk(|| EMPTY_PAGER_VMA)
 }
 
-/// One process's chunked publication slots.
+/// All-atomic B-tree indexing non-overlapping VMA intervals sorted by `start`.
 ///
-/// Starts with zero allocated slot chunks; normal-context writers append
-/// `VMA_SLOT_CHUNK`-slot chunks on demand up to the effective policy/directory
-/// ceiling, and chunks are never moved or freed so exception-time readers scan
-/// and borrow `&'static PublishedPagerVma` without allocating or locking.
+/// - Nodes live in a grow-only `AtomicDir`, so they never move or free and
+///   exception-time readers never experience use-after-free or plain-data
+///   seqlock races.
+/// - Writers mutate nodes only while holding the per-process writer spinlock
+///   AND an active `RangeRewrite` (odd `REWRITE_EPOCHS`).
+/// - Exception-time readers traverse under `read_rewrite_epoch`: every atomic
+///   read is bounds-checked and step-bounded (`BTREE_MAX_WALK_STEPS`), so a
+///   concurrent writer can never cause a panic or loop and is caught as
+///   `PagerVmaError::Unstable` by the enclosing epoch check.
+mod btree {
+    use super::*;
+
+    pub(super) const BTREE_DEGREE: usize = 16;
+    pub(super) const BTREE_MIN_KEYS: usize = BTREE_DEGREE - 1; // 15
+    pub(super) const BTREE_MAX_KEYS: usize = 2 * BTREE_DEGREE - 1; // 31
+    pub(super) const BTREE_MAX_CHILDREN: usize = 2 * BTREE_DEGREE; // 32
+    pub(super) const BTREE_NODE_CHUNK: usize = 32;
+    pub(super) const BTREE_NODE_DIR: usize = 256;
+    pub(super) const BTREE_MAX_NODES: usize = BTREE_NODE_CHUNK * BTREE_NODE_DIR; // 8192
+    pub(super) const BTREE_NO_NODE: u32 = u32::MAX;
+    /// Mathematical max height for 65,536 keys at degree 16 is 5; 8 gives
+    /// headroom while bounding torn concurrent walks to O(1) steps.
+    pub(super) const BTREE_MAX_WALK_STEPS: usize = 8;
+
+    const _: () = assert!(
+        BTREE_MAX_NODES >= 2 + (MAX_PAGER_VMAS_PER_PROCESS / BTREE_MIN_KEYS) + BTREE_MAX_WALK_STEPS,
+        "B-tree node directory must cover worst-case minimum fill at full VMA ceiling"
+    );
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct BTreeEntry {
+        pub start: u64,
+        pub end: u64,
+        pub slot: u32,
+    }
+
+    pub(super) struct BTreeNode {
+        /// Low 16 bits: key count `0..=BTREE_MAX_KEYS`. Bit 16: `1` if leaf.
+        header: AtomicU32,
+        starts: [AtomicU64; BTREE_MAX_KEYS],
+        ends: [AtomicU64; BTREE_MAX_KEYS],
+        slots: [AtomicU32; BTREE_MAX_KEYS],
+        children: [AtomicU32; BTREE_MAX_CHILDREN],
+    }
+
+    impl BTreeNode {
+        const fn empty() -> Self {
+            Self {
+                header: AtomicU32::new(1 << 16),
+                starts: [const { AtomicU64::new(0) }; BTREE_MAX_KEYS],
+                ends: [const { AtomicU64::new(0) }; BTREE_MAX_KEYS],
+                slots: [const { AtomicU32::new(0) }; BTREE_MAX_KEYS],
+                children: [const { AtomicU32::new(BTREE_NO_NODE) }; BTREE_MAX_CHILDREN],
+            }
+        }
+
+        #[inline]
+        const fn decode_header(header: u32) -> (usize, bool) {
+            ((header & 0xFFFF) as usize, (header >> 16) != 0)
+        }
+
+        #[inline]
+        const fn encode_header(len: usize, is_leaf: bool) -> u32 {
+            (len as u32) | ((is_leaf as u32) << 16)
+        }
+
+        #[inline]
+        fn len(&self) -> usize {
+            Self::decode_header(self.header.load(Ordering::Relaxed)).0
+        }
+
+        #[inline]
+        fn is_leaf(&self) -> bool {
+            Self::decode_header(self.header.load(Ordering::Relaxed)).1
+        }
+
+        #[inline]
+        fn set_header(&self, len: usize, is_leaf: bool) {
+            debug_assert!(len <= BTREE_MAX_KEYS);
+            self.header
+                .store(Self::encode_header(len, is_leaf), Ordering::Relaxed);
+        }
+
+        #[inline]
+        fn key(&self, idx: usize) -> BTreeEntry {
+            BTreeEntry {
+                start: self.starts[idx].load(Ordering::Relaxed),
+                end: self.ends[idx].load(Ordering::Relaxed),
+                slot: self.slots[idx].load(Ordering::Relaxed),
+            }
+        }
+
+        #[inline]
+        fn set_key(&self, idx: usize, entry: BTreeEntry) {
+            self.starts[idx].store(entry.start, Ordering::Relaxed);
+            self.ends[idx].store(entry.end, Ordering::Relaxed);
+            self.slots[idx].store(entry.slot, Ordering::Relaxed);
+        }
+
+        #[inline]
+        fn child(&self, idx: usize) -> u32 {
+            self.children[idx].load(Ordering::Relaxed)
+        }
+
+        #[inline]
+        fn set_child(&self, idx: usize, child: u32) {
+            self.children[idx].store(child, Ordering::Relaxed);
+        }
+
+        /// First index in `0..len` with `starts[idx] >= target`.
+        #[inline]
+        fn lower_bound_start(&self, target: u64, len: usize) -> usize {
+            let mut lo = 0_usize;
+            let mut hi = len;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.starts[mid].load(Ordering::Relaxed) < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        }
+
+        /// First index in `0..len` with `ends[idx] > target` (or `>= target` if `inclusive`).
+        #[inline]
+        fn lower_bound_end(&self, target: u64, len: usize, inclusive: bool) -> usize {
+            let mut lo = 0_usize;
+            let mut hi = len;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let end = self.ends[mid].load(Ordering::Relaxed);
+                let skip = if inclusive {
+                    end < target
+                } else {
+                    end <= target
+                };
+                if skip {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        }
+    }
+
+    #[expect(
+        clippy::declare_interior_mutable_const,
+        reason = "initializer for lazily allocated all-atomic B-tree node chunks"
+    )]
+    const EMPTY_BTREE_NODE: BTreeNode = BTreeNode::empty();
+
+    pub(super) struct VmaIndex {
+        root: AtomicU32,
+        nodes: AtomicDir<BTreeNode, BTREE_NODE_CHUNK, BTREE_NODE_DIR>,
+    }
+
+    impl VmaIndex {
+        pub(super) const fn empty() -> Self {
+            Self {
+                root: AtomicU32::new(BTREE_NO_NODE),
+                nodes: AtomicDir::new(),
+            }
+        }
+
+        #[inline]
+        fn node(&self, idx: u32) -> &BTreeNode {
+            &self.nodes[idx as usize]
+        }
+
+        /// Ensures enough B-tree node chunks exist so subsequent mutations up
+        /// to `peak_live` keys are infallible inside `RangeRewrite`.
+        pub(super) fn ensure_node_headroom(
+            &self,
+            writer: &mut VmaWriterState,
+            peak_live: usize,
+        ) -> Result<(), PagerVmaError> {
+            let needed_for_peak = if peak_live == 0 {
+                0
+            } else {
+                2 + (peak_live / BTREE_MIN_KEYS) + BTREE_MAX_WALK_STEPS
+            };
+            let used = writer.nodes_initialized.saturating_sub(writer.free_nodes.len());
+            let target = needed_for_peak
+                .max(used.saturating_add(BTREE_MAX_WALK_STEPS + 2))
+                .min(BTREE_MAX_NODES);
+            if writer.nodes_initialized >= target {
+                return Ok(());
+            }
+            let extra_chunks = (target - writer.nodes_initialized).div_ceil(BTREE_NODE_CHUNK);
+            let base_chunk = writer.nodes_initialized / BTREE_NODE_CHUNK;
+            if base_chunk.checked_add(extra_chunks).is_none_or(|end| end > BTREE_NODE_DIR) {
+                return Err(PagerVmaError::Pressure);
+            }
+            writer
+                .free_nodes
+                .try_reserve(extra_chunks * BTREE_NODE_CHUNK)
+                .map_err(|_| PagerVmaError::Pressure)?;
+            let mut built = Vec::new();
+            built
+                .try_reserve_exact(extra_chunks)
+                .map_err(|_| PagerVmaError::Pressure)?;
+            for _ in 0..extra_chunks {
+                let chunk = AtomicDir::<BTreeNode, BTREE_NODE_CHUNK, BTREE_NODE_DIR>::build_chunk(
+                    || EMPTY_BTREE_NODE,
+                )
+                .ok_or(PagerVmaError::Pressure)?;
+                built.push(chunk);
+            }
+            for (offset, chunk) in built.into_iter().enumerate() {
+                if self.nodes.publish_chunk(base_chunk + offset, chunk).is_err() {
+                    return Err(PagerVmaError::Pressure);
+                }
+            }
+            let first = writer.nodes_initialized;
+            let count = extra_chunks * BTREE_NODE_CHUNK;
+            for node_idx in (first..first + count).rev() {
+                writer.free_nodes.push(node_idx as u32);
+            }
+            writer.nodes_initialized += count;
+            Ok(())
+        }
+
+        /// Lock-free O(log N) lookup of the slot index whose interval covers
+        /// `address`. Must be enclosed in `read_rewrite_epoch`.
+        pub(super) fn find_containing(&self, address: u64) -> Result<Option<usize>, PagerVmaError> {
+            // ORDERING: Acquire pairs with the writer's Release commit on
+            // `REWRITE_EPOCHS` (checked by `read_rewrite_epoch`) before
+            // traversing any B-tree node reachable from `root`.
+            let mut node_idx = self.root.load(Ordering::Acquire);
+            if node_idx == BTREE_NO_NODE {
+                return Ok(None);
+            }
+            for _ in 0..BTREE_MAX_WALK_STEPS {
+                let Some(node) = self.nodes.get(node_idx as usize) else {
+                    return Err(PagerVmaError::Unstable);
+                };
+                // ORDERING: Acquire observes the node header published prior
+                // to the enclosing rewrite epoch's Release before reading
+                // Relaxed key/child arrays; a concurrent mutation is rejected
+                // by `read_rewrite_epoch`.
+                let (len, is_leaf) = BTreeNode::decode_header(node.header.load(Ordering::Acquire));
+                if len > BTREE_MAX_KEYS {
+                    return Err(PagerVmaError::Unstable);
+                }
+                let mut lo = 0_usize;
+                let mut hi = len;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if node.starts[mid].load(Ordering::Relaxed) <= address {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo > 0 {
+                    let end = node.ends[lo - 1].load(Ordering::Relaxed);
+                    if address < end {
+                        return Ok(Some(node.slots[lo - 1].load(Ordering::Relaxed) as usize));
+                    }
+                }
+                if is_leaf {
+                    return Ok(None);
+                }
+                let child = node.children[lo].load(Ordering::Relaxed);
+                if child == BTREE_NO_NODE {
+                    return Err(PagerVmaError::Unstable);
+                }
+                node_idx = child;
+            }
+            Err(PagerVmaError::Unstable)
+        }
+
+        /// Writer-locked O(log N) lookup for an exact `start` address.
+        pub(super) fn find_exact(&self, start: u64) -> Option<BTreeEntry> {
+            let mut node_idx = self.root.load(Ordering::Relaxed);
+            while node_idx != BTREE_NO_NODE {
+                let node = self.node(node_idx);
+                let len = node.len();
+                let pos = node.lower_bound_start(start, len);
+                if pos < len && node.starts[pos].load(Ordering::Relaxed) == start {
+                    return Some(node.key(pos));
+                }
+                if node.is_leaf() {
+                    return None;
+                }
+                node_idx = node.child(pos);
+            }
+            None
+        }
+
+        /// Writer-locked O(log N) lookup of the minimum-`start` entry whose
+        /// `end > query_start`. Because intervals are non-overlapping, `end`
+        /// is strictly increasing in in-order traversal, so a single root-to-
+        /// leaf descent finds the unique earliest candidate.
+        pub(super) fn first_ending_after(&self, query_start: u64) -> Option<BTreeEntry> {
+            let mut best = None;
+            let mut node_idx = self.root.load(Ordering::Relaxed);
+            while node_idx != BTREE_NO_NODE {
+                let node = self.node(node_idx);
+                let len = node.len();
+                let pos = node.lower_bound_end(query_start, len, false);
+                if pos < len {
+                    best = Some(node.key(pos));
+                }
+                if node.is_leaf() {
+                    break;
+                }
+                node_idx = node.child(pos);
+            }
+            best
+        }
+
+        /// Writer-locked O(log N + K) in-order collection of all entries
+        /// intersecting `[start, end)` (`inclusive == false`) or intersecting
+        /// or touching `[start, end]` (`inclusive == true`).
+        pub(super) fn collect_range(
+            &self,
+            start: u64,
+            end: u64,
+            inclusive: bool,
+            out: &mut Vec<BTreeEntry>,
+        ) -> Result<(), PagerVmaError> {
+            let root = self.root.load(Ordering::Relaxed);
+            if root != BTREE_NO_NODE {
+                self.collect_range_node(root, start, end, inclusive, out)?;
+            }
+            Ok(())
+        }
+
+        fn collect_range_node(
+            &self,
+            node_idx: u32,
+            start: u64,
+            end: u64,
+            inclusive: bool,
+            out: &mut Vec<BTreeEntry>,
+        ) -> Result<(), PagerVmaError> {
+            let node = self.node(node_idx);
+            let len = node.len();
+            let is_leaf = node.is_leaf();
+            let first = node.lower_bound_end(start, len, inclusive);
+            for i in first..len {
+                if !is_leaf {
+                    self.collect_range_node(node.child(i), start, end, inclusive, out)?;
+                }
+                let entry = node.key(i);
+                let past = if inclusive {
+                    entry.start > end
+                } else {
+                    entry.start >= end
+                };
+                if past {
+                    return Ok(());
+                }
+                out.try_reserve(1).map_err(|_| PagerVmaError::Pressure)?;
+                out.push(entry);
+            }
+            if !is_leaf {
+                self.collect_range_node(node.child(len), start, end, inclusive, out)?;
+            }
+            Ok(())
+        }
+
+        /// Writer-locked O(L) in-order collection of every live entry.
+        pub(super) fn collect_all(&self, out: &mut Vec<BTreeEntry>) -> Result<(), PagerVmaError> {
+            let root = self.root.load(Ordering::Relaxed);
+            if root != BTREE_NO_NODE {
+                self.collect_all_node(root, out)?;
+            }
+            Ok(())
+        }
+
+        fn collect_all_node(
+            &self,
+            node_idx: u32,
+            out: &mut Vec<BTreeEntry>,
+        ) -> Result<(), PagerVmaError> {
+            let node = self.node(node_idx);
+            let len = node.len();
+            let is_leaf = node.is_leaf();
+            for i in 0..len {
+                if !is_leaf {
+                    self.collect_all_node(node.child(i), out)?;
+                }
+                out.try_reserve(1).map_err(|_| PagerVmaError::Pressure)?;
+                out.push(node.key(i));
+            }
+            if !is_leaf {
+                self.collect_all_node(node.child(len), out)?;
+            }
+            Ok(())
+        }
+
+        /// Writer-locked O(log N) top-down B-tree insert (infallible once
+        /// `ensure_node_headroom` has run).
+        pub(super) fn insert(&self, writer: &mut VmaWriterState, entry: BTreeEntry) {
+            let root_idx = self.root.load(Ordering::Relaxed);
+            if root_idx == BTREE_NO_NODE {
+                let new_root = writer.pop_free_node();
+                let node = self.node(new_root);
+                node.set_key(0, entry);
+                node.set_child(0, BTREE_NO_NODE);
+                node.set_header(1, true);
+                self.root.store(new_root, Ordering::Relaxed);
+                return;
+            }
+            if self.node(root_idx).len() == BTREE_MAX_KEYS {
+                let new_root = writer.pop_free_node();
+                let root_node = self.node(new_root);
+                root_node.set_child(0, root_idx);
+                root_node.set_header(0, false);
+                self.root.store(new_root, Ordering::Relaxed);
+                self.split_child(writer, new_root, 0);
+                self.insert_non_full(writer, new_root, entry);
+            } else {
+                self.insert_non_full(writer, root_idx, entry);
+            }
+        }
+
+        fn split_child(&self, writer: &mut VmaWriterState, parent_idx: u32, child_pos: usize) {
+            let parent = self.node(parent_idx);
+            let parent_len = parent.len();
+            let child_idx = parent.child(child_pos);
+            let child = self.node(child_idx);
+            let child_is_leaf = child.is_leaf();
+            let right_idx = writer.pop_free_node();
+            let right = self.node(right_idx);
+
+            let mid = BTREE_MIN_KEYS;
+            for j in 0..BTREE_MIN_KEYS {
+                right.set_key(j, child.key(mid + 1 + j));
+            }
+            if !child_is_leaf {
+                for j in 0..=BTREE_MIN_KEYS {
+                    right.set_child(j, child.child(mid + 1 + j));
+                    child.set_child(mid + 1 + j, BTREE_NO_NODE);
+                }
+            }
+            right.set_header(BTREE_MIN_KEYS, child_is_leaf);
+            let median = child.key(mid);
+            child.set_header(BTREE_MIN_KEYS, child_is_leaf);
+
+            for j in (child_pos + 1..=parent_len).rev() {
+                parent.set_child(j + 1, parent.child(j));
+            }
+            parent.set_child(child_pos + 1, right_idx);
+            for j in (child_pos..parent_len).rev() {
+                parent.set_key(j + 1, parent.key(j));
+            }
+            parent.set_key(child_pos, median);
+            parent.set_header(parent_len + 1, false);
+        }
+
+        fn insert_non_full(
+            &self,
+            writer: &mut VmaWriterState,
+            mut node_idx: u32,
+            entry: BTreeEntry,
+        ) {
+            loop {
+                let node = self.node(node_idx);
+                let len = node.len();
+                let is_leaf = node.is_leaf();
+                let mut pos = node.lower_bound_start(entry.start, len);
+                if is_leaf {
+                    for j in (pos..len).rev() {
+                        node.set_key(j + 1, node.key(j));
+                    }
+                    node.set_key(pos, entry);
+                    node.set_header(len + 1, true);
+                    return;
+                }
+                let child_idx = node.child(pos);
+                if self.node(child_idx).len() == BTREE_MAX_KEYS {
+                    self.split_child(writer, node_idx, pos);
+                    if entry.start > node.key(pos).start {
+                        pos += 1;
+                    }
+                }
+                node_idx = node.child(pos);
+            }
+        }
+
+        /// Writer-locked O(log N) top-down B-tree deletion with borrow/merge
+        /// rebalancing so every non-root node keeps at least `BTREE_MIN_KEYS`.
+        pub(super) fn remove(&self, writer: &mut VmaWriterState, start: u64) -> Option<BTreeEntry> {
+            let root_idx = self.root.load(Ordering::Relaxed);
+            if root_idx == BTREE_NO_NODE {
+                return None;
+            }
+            let removed = self.remove_from_node(writer, root_idx, start);
+            let root_node = self.node(root_idx);
+            if root_node.len() == 0 {
+                if root_node.is_leaf() {
+                    self.root.store(BTREE_NO_NODE, Ordering::Relaxed);
+                } else {
+                    self.root.store(root_node.child(0), Ordering::Relaxed);
+                }
+                writer.push_free_node(root_idx);
+            }
+            removed
+        }
+
+        fn remove_from_node(
+            &self,
+            writer: &mut VmaWriterState,
+            node_idx: u32,
+            start: u64,
+        ) -> Option<BTreeEntry> {
+            let node = self.node(node_idx);
+            let len = node.len();
+            let is_leaf = node.is_leaf();
+            let mut idx = node.lower_bound_start(start, len);
+
+            if idx < len && node.starts[idx].load(Ordering::Relaxed) == start {
+                let target = node.key(idx);
+                if is_leaf {
+                    for j in idx + 1..len {
+                        node.set_key(j - 1, node.key(j));
+                    }
+                    node.set_header(len - 1, true);
+                    return Some(target);
+                }
+                let left_idx = node.child(idx);
+                let right_idx = node.child(idx + 1);
+                if self.node(left_idx).len() >= BTREE_DEGREE {
+                    let pred = self.max_key(left_idx);
+                    node.set_key(idx, pred);
+                    let _ = self.remove_from_node(writer, left_idx, pred.start);
+                    return Some(target);
+                }
+                if self.node(right_idx).len() >= BTREE_DEGREE {
+                    let succ = self.min_key(right_idx);
+                    node.set_key(idx, succ);
+                    let _ = self.remove_from_node(writer, right_idx, succ.start);
+                    return Some(target);
+                }
+                self.merge_children(writer, node_idx, idx);
+                let _ = self.remove_from_node(writer, left_idx, start);
+                return Some(target);
+            }
+
+            if is_leaf {
+                return None;
+            }
+
+            if self.node(node.child(idx)).len() < BTREE_DEGREE {
+                if idx > 0 && self.node(node.child(idx - 1)).len() >= BTREE_DEGREE {
+                    self.borrow_from_prev(node_idx, idx);
+                } else if idx < len && self.node(node.child(idx + 1)).len() >= BTREE_DEGREE {
+                    self.borrow_from_next(node_idx, idx);
+                } else if idx < len {
+                    self.merge_children(writer, node_idx, idx);
+                } else {
+                    self.merge_children(writer, node_idx, idx - 1);
+                    idx -= 1;
+                }
+            }
+            self.remove_from_node(writer, node.child(idx), start)
+        }
+
+        fn min_key(&self, mut node_idx: u32) -> BTreeEntry {
+            loop {
+                let node = self.node(node_idx);
+                if node.is_leaf() {
+                    return node.key(0);
+                }
+                node_idx = node.child(0);
+            }
+        }
+
+        fn max_key(&self, mut node_idx: u32) -> BTreeEntry {
+            loop {
+                let node = self.node(node_idx);
+                let len = node.len();
+                if node.is_leaf() {
+                    return node.key(len - 1);
+                }
+                node_idx = node.child(len);
+            }
+        }
+
+        fn borrow_from_prev(&self, parent_idx: u32, idx: usize) {
+            let parent = self.node(parent_idx);
+            let child = self.node(parent.child(idx));
+            let sibling = self.node(parent.child(idx - 1));
+            let child_len = child.len();
+            let child_is_leaf = child.is_leaf();
+            let sib_len = sibling.len();
+            let sib_is_leaf = sibling.is_leaf();
+
+            for j in (0..child_len).rev() {
+                child.set_key(j + 1, child.key(j));
+            }
+            if !child_is_leaf {
+                for j in (0..=child_len).rev() {
+                    child.set_child(j + 1, child.child(j));
+                }
+                child.set_child(0, sibling.child(sib_len));
+                sibling.set_child(sib_len, BTREE_NO_NODE);
+            }
+            child.set_key(0, parent.key(idx - 1));
+            parent.set_key(idx - 1, sibling.key(sib_len - 1));
+            child.set_header(child_len + 1, child_is_leaf);
+            sibling.set_header(sib_len - 1, sib_is_leaf);
+        }
+
+        fn borrow_from_next(&self, parent_idx: u32, idx: usize) {
+            let parent = self.node(parent_idx);
+            let child = self.node(parent.child(idx));
+            let sibling = self.node(parent.child(idx + 1));
+            let child_len = child.len();
+            let child_is_leaf = child.is_leaf();
+            let sib_len = sibling.len();
+            let sib_is_leaf = sibling.is_leaf();
+
+            child.set_key(child_len, parent.key(idx));
+            if !child_is_leaf {
+                child.set_child(child_len + 1, sibling.child(0));
+            }
+            parent.set_key(idx, sibling.key(0));
+            for j in 1..sib_len {
+                sibling.set_key(j - 1, sibling.key(j));
+            }
+            if !child_is_leaf {
+                for j in 1..=sib_len {
+                    sibling.set_child(j - 1, sibling.child(j));
+                }
+                sibling.set_child(sib_len, BTREE_NO_NODE);
+            }
+            child.set_header(child_len + 1, child_is_leaf);
+            sibling.set_header(sib_len - 1, sib_is_leaf);
+        }
+
+        fn merge_children(&self, writer: &mut VmaWriterState, parent_idx: u32, idx: usize) {
+            let parent = self.node(parent_idx);
+            let parent_len = parent.len();
+            let left_idx = parent.child(idx);
+            let right_idx = parent.child(idx + 1);
+            let left = self.node(left_idx);
+            let right = self.node(right_idx);
+            let left_len = left.len();
+            let left_is_leaf = left.is_leaf();
+            let right_len = right.len();
+
+            left.set_key(left_len, parent.key(idx));
+            for j in 0..right_len {
+                left.set_key(left_len + 1 + j, right.key(j));
+            }
+            if !left_is_leaf {
+                for j in 0..=right_len {
+                    left.set_child(left_len + 1 + j, right.child(j));
+                }
+            }
+            left.set_header(left_len + 1 + right_len, left_is_leaf);
+
+            for j in idx + 1..parent_len {
+                parent.set_key(j - 1, parent.key(j));
+            }
+            for j in idx + 2..=parent_len {
+                parent.set_child(j - 1, parent.child(j));
+            }
+            parent.set_child(parent_len, BTREE_NO_NODE);
+            parent.set_header(parent_len - 1, false);
+            writer.push_free_node(right_idx);
+        }
+
+        #[cfg(test)]
+        pub(super) fn verify_invariants(&self) -> (usize, usize) {
+            let root = self.root.load(Ordering::Relaxed);
+            if root == BTREE_NO_NODE {
+                return (0, 0);
+            }
+            let mut count = 0;
+            let mut prev_end = 0_u64;
+            let height = self.verify_node(root, true, &mut prev_end, &mut count);
+            (count, height)
+        }
+
+        #[cfg(test)]
+        fn verify_node(
+            &self,
+            node_idx: u32,
+            is_root: bool,
+            prev_end: &mut u64,
+            count: &mut usize,
+        ) -> usize {
+            let node = self.node(node_idx);
+            let len = node.len();
+            let is_leaf = node.is_leaf();
+            assert!(len <= BTREE_MAX_KEYS);
+            if is_root {
+                assert!(len >= 1);
+            } else {
+                assert!(len >= BTREE_MIN_KEYS);
+            }
+            let mut child_height = None;
+            for i in 0..len {
+                if !is_leaf {
+                    let h = self.verify_node(node.child(i), false, prev_end, count);
+                    if let Some(expected) = child_height {
+                        assert_eq!(h, expected, "B-tree leaves must be at equal depth");
+                    } else {
+                        child_height = Some(h);
+                    }
+                }
+                let entry = node.key(i);
+                assert!(entry.start < entry.end);
+                assert!(*prev_end <= entry.start, "B-tree keys must be strictly non-overlapping");
+                *prev_end = entry.end;
+                *count += 1;
+            }
+            if !is_leaf {
+                let h = self.verify_node(node.child(len), false, prev_end, count);
+                if let Some(expected) = child_height {
+                    assert_eq!(h, expected, "B-tree leaves must be at equal depth");
+                }
+                h + 1
+            } else {
+                1
+            }
+        }
+    }
+}
+
+use btree::{BTreeEntry, VmaIndex};
+
+/// One process's chunked publication slots plus lazily-allocated O(log N) B-tree index.
+///
+/// Starts with zero allocated slot chunks and a null index pointer; normal-context
+/// writers append `VMA_SLOT_CHUNK`-slot chunks and index nodes on demand up to
+/// the effective policy/directory ceiling. Neither slot chunks nor index nodes
+/// are ever moved or freed, so exception-time readers traverse the B-tree and
+/// borrow `&'static PublishedPagerVma` without allocating or locking.
 struct ProcessVmaTable {
     slots: AtomicDir<PublishedPagerVma, VMA_SLOT_CHUNK, VMA_SLOT_DIR>,
+    index: AtomicPtr<VmaIndex>,
 }
 
 impl ProcessVmaTable {
     const fn empty() -> Self {
         Self {
             slots: AtomicDir::new(),
+            index: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
+    #[cfg(test)]
     fn capacity(&self) -> usize {
         self.slots.contiguous_chunks() * VMA_SLOT_CHUNK
     }
@@ -511,8 +1251,52 @@ impl ProcessVmaTable {
         self.slots.get(index)
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &PublishedPagerVma> + '_ {
         self.slots.iter_contiguous()
+    }
+
+    #[inline]
+    fn index(&self) -> Option<&VmaIndex> {
+        // ORDERING: Acquire pairs with the Release CAS in `ensure_index`, so
+        // the initialized `VmaIndex` is visible before its pointer is read.
+        let ptr = self.index.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` comes from a leaked 1-element boxed slice of `VmaIndex`
+        // published via `ensure_index` and never freed or moved.
+        Some(unsafe { &*ptr })
+    }
+
+    fn ensure_index(&self) -> Result<&VmaIndex, PagerVmaError> {
+        if let Some(index) = self.index() {
+            return Ok(index);
+        }
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(1)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        storage.push(VmaIndex::empty());
+        let raw = Box::into_raw(storage.into_boxed_slice()).cast::<VmaIndex>();
+        // ORDERING: AcqRel publishes the initialized `VmaIndex` to all lock-free readers.
+        match self
+            .index
+            .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // SAFETY: `raw` is now leaked permanently in `self.index`.
+                Ok(unsafe { &*raw })
+            }
+            Err(existing) => {
+                // SAFETY: `raw` lost the CAS so nothing else references it.
+                unsafe {
+                    drop(Box::from_raw(ptr::slice_from_raw_parts_mut(raw, 1)));
+                }
+                // SAFETY: `existing` was published by the winning CAS and is never freed.
+                Ok(unsafe { &*existing })
+            }
+        }
     }
 
     /// Allocates and appends `count` slot chunks atomically with respect to
@@ -522,10 +1306,10 @@ impl ProcessVmaTable {
         count: usize,
         mut build: impl FnMut() -> Option<VmaChunkBox>,
     ) -> Result<usize, PagerVmaError> {
-        if count == 0 {
-            return Ok(self.capacity());
-        }
         let base_chunk = self.slots.contiguous_chunks();
+        if count == 0 {
+            return Ok(base_chunk * VMA_SLOT_CHUNK);
+        }
         let Some(end_chunk) = base_chunk.checked_add(count) else {
             return Err(PagerVmaError::Pressure);
         };
@@ -556,8 +1340,87 @@ impl core::ops::Index<usize> for ProcessVmaTable {
     }
 }
 
+/// Writer-private book-keeping guarded by each process's `PAGER_VMA_WRITERS` lock.
+///
+/// Keeping owner identity, live count, and free-lists for both VMA slots and
+/// B-tree nodes here lets every writer perform O(1) slot/node allocation and
+/// O(1) incarnation checks without scanning unused slots or taking unsafe
+/// interior-mutable shortcuts.
+struct VmaWriterState {
+    owner_process_slot: u64,
+    owner_process_generation: u64,
+    owner_mm_generation: u64,
+    live_count: usize,
+    free_slots: Vec<u32>,
+    free_nodes: Vec<u32>,
+    nodes_initialized: usize,
+}
+
+impl VmaWriterState {
+    const fn empty() -> Self {
+        Self {
+            owner_process_slot: 0,
+            owner_process_generation: 0,
+            owner_mm_generation: 0,
+            live_count: 0,
+            free_slots: Vec::new(),
+            free_nodes: Vec::new(),
+            nodes_initialized: 0,
+        }
+    }
+
+    #[inline]
+    fn matches_owner(&self, process_slot: u64, identity: ProcessIdentity) -> bool {
+        self.owner_process_slot == process_slot
+            && self.owner_process_generation == u64::from(identity.process_generation())
+            && self.owner_mm_generation == u64::from(identity.mm_generation())
+    }
+
+    #[inline]
+    fn set_owner(&mut self, process_slot: u64, identity: ProcessIdentity) {
+        self.owner_process_slot = process_slot;
+        self.owner_process_generation = u64::from(identity.process_generation());
+        self.owner_mm_generation = u64::from(identity.mm_generation());
+    }
+
+    #[inline]
+    fn pop_free_node(&mut self) -> u32 {
+        self.free_nodes
+            .pop()
+            .expect("B-tree node headroom pre-reserved before RangeRewrite")
+    }
+
+    #[inline]
+    fn push_free_node(&mut self, node_idx: u32) {
+        self.free_nodes.push(node_idx);
+    }
+
+    fn ensure_free_slots(
+        &mut self,
+        slots: &ProcessVmaTable,
+        needed: usize,
+        build: fn() -> Option<VmaChunkBox>,
+    ) -> Result<(), PagerVmaError> {
+        if self.free_slots.len() >= needed {
+            return Ok(());
+        }
+        let missing = needed - self.free_slots.len();
+        let needed_chunks = missing.div_ceil(VMA_SLOT_CHUNK);
+        let new_count = needed_chunks * VMA_SLOT_CHUNK;
+        self.free_slots
+            .try_reserve(new_count)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        let first_new_slot = slots.append_chunks_with(needed_chunks, build)?;
+        for slot_idx in (first_new_slot..first_new_slot + new_count).rev() {
+            self.free_slots.push(slot_idx as u32);
+        }
+        Ok(())
+    }
+}
+
 static PAGER_VMAS: AtomicDir<ProcessVmaTable> = AtomicDir::new();
-type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication as u8 }>;
+type PagerVmaWriterLock =
+    TrackedSpinLock<VmaWriterState, { LockClass::PagerVmaPublication as u8 }>;
 /// One publication writer lock **per process**, not one for the system.
 ///
 /// Every `mmap`, `munmap`, and `mprotect` that touches a pager VMA takes this.
@@ -574,8 +1437,58 @@ type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication a
     clippy::declare_interior_mutable_const,
     reason = "array initializer for the fixed per-process writer lock table"
 )]
-const EMPTY_PAGER_VMA_WRITER: PagerVmaWriterLock = TrackedSpinLock::new(());
+const EMPTY_PAGER_VMA_WRITER: PagerVmaWriterLock = TrackedSpinLock::new(VmaWriterState::empty());
 static PAGER_VMA_WRITERS: AtomicDir<PagerVmaWriterLock> = AtomicDir::new();
+
+/// Reclaims every published VMA belonging to a previous process or MM
+/// incarnation under the caller's writer lock.
+///
+/// Visits only the `live_count` entries recorded in the B-tree (never scanning
+/// unused chunks). If an installer drain fails mid-reclamation, every already-
+/// cleared slot has also been removed from the B-tree and returned to
+/// `free_slots`, preserving exact consistency.
+fn reclaim_stale_incarnation(
+    handle: ProcessHandle,
+    slots: &ProcessVmaTable,
+    writer: &mut VmaWriterState,
+    process_slot: u64,
+    identity: ProcessIdentity,
+) -> Result<(), PagerVmaError> {
+    if writer.live_count == 0 {
+        writer.set_owner(process_slot, identity);
+        return Ok(());
+    }
+    if writer.matches_owner(process_slot, identity) {
+        return Ok(());
+    }
+    let Some(index) = slots.index() else {
+        writer.live_count = 0;
+        writer.set_owner(process_slot, identity);
+        return Ok(());
+    };
+    let mut stale = Vec::new();
+    stale
+        .try_reserve_exact(writer.live_count)
+        .map_err(|_| PagerVmaError::Pressure)?;
+    index.collect_all(&mut stale)?;
+    writer
+        .free_slots
+        .try_reserve(stale.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    let _reclaim_rewrite = RangeRewrite::begin(handle)?;
+    for entry in stale {
+        let slot = &slots[entry.slot as usize];
+        // A reaped process slot or completed exec may leave an old generation
+        // in this table. The writer lock and installer drain make reclamation
+        // exact before this slot can be reused by the new live identity.
+        slot.publish(None)?;
+        let _ = index.remove(writer, entry.start);
+        writer.free_slots.push(entry.slot);
+        writer.live_count -= 1;
+    }
+    writer.set_owner(process_slot, identity);
+    Ok(())
+}
 
 /// Publishes the VMA tables and writer locks covering `index` before that
 /// process slot can exist.
@@ -715,56 +1628,47 @@ fn publish_with_builder(
     if ceiling == 0 {
         return Err(PagerVmaError::Pressure);
     }
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let mut writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let process_generation = u64::from(identity.process_generation());
-    let mm_generation = u64::from(identity.mm_generation());
-    let mut live = 0_usize;
-    let mut free_slot: Option<&PublishedPagerVma> = None;
-    for slot in slots.iter() {
-        let Some(existing) = slot.snapshot()? else {
-            if free_slot.is_none() {
-                free_slot = Some(slot);
-            }
-            continue;
-        };
-        if existing.process_handle != process.slot()
-            || existing.process_generation != process_generation
-            || existing.mm_generation != mm_generation
-        {
-            // A reaped process slot or completed exec may leave an old
-            // generation in this table. The writer lock and installer drain
-            // make reclamation exact before this slot can be reused by the new
-            // live identity.
-            slot.publish(None)?;
-            if free_slot.is_none() {
-                free_slot = Some(slot);
-            }
-            continue;
-        }
+    reclaim_stale_incarnation(handle, slots, &mut writer, process.slot(), identity)?;
+
+    if let Some(index) = slots.index()
+        && let Some(existing) = index.first_ending_after(template.start)
+    {
         if template.start < existing.end && existing.start < template.end {
             return Err(PagerVmaError::Overlap);
         }
-        live += 1;
     }
-    if live >= ceiling {
+    if writer.live_count >= ceiling {
         return Err(PagerVmaError::Pressure);
     }
-    let slot = match free_slot {
-        Some(slot) => slot,
-        None => {
-            let first_new_slot = slots.append_chunks_with(1, build)?;
-            slots.get(first_new_slot).ok_or(PagerVmaError::Pressure)?
-        }
-    };
+    writer.ensure_free_slots(slots, 1, build)?;
+    let index = slots.ensure_index()?;
+    let next_live = writer.live_count + 1;
+    index.ensure_node_headroom(&mut writer, next_live)?;
+
+    let slot_index = *writer.free_slots.last().ok_or(PagerVmaError::Pressure)? as usize;
+    let slot = slots.get(slot_index).ok_or(PagerVmaError::Pressure)?;
     let sequence = slot.sequence.load(Ordering::Relaxed);
     let generation = sequence
         .checked_div(2)
         .and_then(|value| value.checked_add(1))
         .ok_or(PagerVmaError::Pressure)?;
     let region = stamped_region(handle, identity, template, generation)?;
+
+    let _publish_rewrite = RangeRewrite::begin(handle)?;
     slot.publish(Some(region))?;
+    index.insert(
+        &mut writer,
+        BTreeEntry {
+            start: region.start,
+            end: region.end,
+            slot: slot_index as u32,
+        },
+    );
+    let _ = writer.free_slots.pop();
+    writer.live_count += 1;
     Ok(region)
 }
 
@@ -819,11 +1723,11 @@ pub(super) fn lookup(
 
 /// Finds the publication covering `address`, and reports *which slot* holds it.
 ///
-/// The slot index is the point. A fault used to run this scan, then run it
-/// again to re-find the same slot for its permit, then a third time to clip
-/// its fault-around run - three linear sweeps of a 64-slot table whose every
-/// probe read twenty-one atomics. Returning the index lets the permit go
-/// straight to the one slot that matters.
+/// Uses the per-process lock-free-readable B-tree inside `read_rewrite_epoch`
+/// so fault lookup is O(log N) in the live VMA count (at most 5 node hops at
+/// 65,536 VMAs) and touches only the single candidate slot's atomic payload.
+/// Returning the slot index lets `acquire_fault_install` go straight to that
+/// exact slot for its permit.
 pub(super) fn lookup_slot(
     handle: ProcessHandle,
     identity: ProcessIdentity,
@@ -836,21 +1740,26 @@ pub(super) fn lookup_slot(
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     read_rewrite_epoch(handle, || {
-        for (index, slot) in slots.iter().enumerate() {
-            if !slot.may_cover(address) {
-                continue;
-            }
-            let Some(region) = slot.snapshot()? else {
-                continue;
-            };
-            // Extent filtering is not authority. This candidate still needs
-            // the same exact process/MM, VMA, protection and commit checks.
-            if !region_matches_identity(region, process.slot(), identity) {
-                continue;
-            }
-            if region.contains(address) {
-                return admit_access(region, access).map(|region| (index, region));
-            }
+        let Some(index_tree) = slots.index() else {
+            return Err(PagerVmaError::Stale);
+        };
+        let Some(index) = index_tree.find_containing(address)? else {
+            return Err(PagerVmaError::Stale);
+        };
+        let slot = slots.get(index).ok_or(PagerVmaError::Unstable)?;
+        if !slot.may_cover(address) {
+            return Err(PagerVmaError::Stale);
+        }
+        let Some(region) = slot.snapshot()? else {
+            return Err(PagerVmaError::Stale);
+        };
+        // B-tree index and extent filtering are not authority. The candidate
+        // still needs the exact process/MM, VMA, protection and commit checks.
+        if !region_matches_identity(region, process.slot(), identity) {
+            return Err(PagerVmaError::Stale);
+        }
+        if region.contains(address) {
+            return admit_access(region, access).map(|region| (index, region));
         }
         Err(PagerVmaError::Stale)
     })
@@ -1050,63 +1959,42 @@ where
     }
     let ceiling = ceiling.min(MAX_PAGER_VMAS_PER_PROCESS);
 
-    // Sized to the process's currently allocated slot chunks on the heap,
-    // because these buffers scale with live chunks and the syscall stack does not.
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let mut writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    let candidates = slots
-        .iter()
-        .filter(|slot| slot.may_overlap_or_touch(start, end))
-        .count();
-    if candidates == 0 {
+    let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    reclaim_stale_incarnation(handle, slots, &mut writer, live_process.slot(), identity)?;
+    if writer.live_count == 0 {
         return Ok(false);
     }
-    let allocated_slots = slots.capacity();
-    let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
-    overlapping
-        .try_reserve_exact(candidates)
-        .map_err(|_| PagerVmaError::Pressure)?;
-    let mut empty_slots: Vec<usize> = Vec::new();
-    empty_slots
-        .try_reserve_exact(allocated_slots)
-        .map_err(|_| PagerVmaError::Pressure)?;
-    let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let mut live_total = 0_usize;
-    for (slot_index, slot) in slots.iter().enumerate() {
-        match slot.snapshot()? {
-            // A completed exec or a reaped process slot leaves the previous
-            // incarnation's regions in this table, and a new image maps the
-            // same addresses again. Such a region carries no authority for this
-            // identity, so it is not part of the range being rewritten; reclaim
-            // it exactly as `publish` does under the same writer lock.
-            Some(region) if !region_matches_identity(region, live_process.slot(), identity) => {
-                slot.publish(None)?;
-                empty_slots.push(slot_index);
-            }
-            Some(region) => {
-                live_total += 1;
-                if start < region.end && region.start < end
-                    || region.end == start
-                    || region.start == end
-                {
-                    overlapping.push((slot_index, region));
-                }
-            }
-            None => empty_slots.push(slot_index),
-        }
-    }
-    let overlapping_len = overlapping.len();
-    let empty_len = empty_slots.len();
+    let Some(btree_index) = slots.index() else {
+        return Ok(false);
+    };
+    // O(log N + K) in-order query of overlapping and adjacent (merge-candidate)
+    // regions. Entries arrive sorted by `start`, so no sort is required.
+    let mut candidates: Vec<BTreeEntry> = Vec::new();
+    btree_index.collect_range(start, end, true, &mut candidates)?;
     // Adjacent regions are merge candidates, not authority for the requested
     // interval. Repeating an unmap of an existing hole must not withdraw its
     // neighbors or report a stale process/MM incarnation.
-    if !overlapping
+    if !candidates
         .iter()
-        .any(|(_, region)| start < region.end && region.start < end)
+        .any(|entry| start < entry.end && entry.start < end)
     {
         return Ok(false);
     }
-    overlapping.sort_unstable_by_key(|(_, region)| region.start);
+    let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
+    overlapping
+        .try_reserve_exact(candidates.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for entry in candidates {
+        let slot_index = entry.slot as usize;
+        let Some(region) = slots[slot_index].snapshot()? else {
+            return Err(PagerVmaError::Stale);
+        };
+        overlapping.push((slot_index, region));
+    }
+    let live_total = writer.live_count;
+    let overlapping_len = overlapping.len();
     let removing = replacement_prot.is_none() && replacement_commit_state.is_none();
 
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
@@ -1196,33 +2084,35 @@ where
     if rewritten_len > overlapping_len && new_live > ceiling {
         return Err(PagerVmaError::Pressure);
     }
-    let available = overlapping_len + empty_len;
-    if rewritten_len > available {
-        let needed_extra = rewritten_len - available;
-        let needed_chunks = needed_extra.div_ceil(VMA_SLOT_CHUNK);
-        empty_slots
-            .try_reserve_exact(needed_chunks * VMA_SLOT_CHUNK)
-            .map_err(|_| PagerVmaError::Pressure)?;
-        let first_new_slot = slots.append_chunks_with(needed_chunks, build)?;
-        for offset in 0..(needed_chunks * VMA_SLOT_CHUNK) {
-            empty_slots.push(first_new_slot + offset);
-        }
+    let extra_needed = rewritten_len.saturating_sub(overlapping_len);
+    if extra_needed > 0 {
+        writer.ensure_free_slots(slots, extra_needed, build)?;
     }
+    let freed_on_shrink = overlapping_len.saturating_sub(rewritten_len);
+    if freed_on_shrink > 0 {
+        writer
+            .free_slots
+            .try_reserve(freed_on_shrink)
+            .map_err(|_| PagerVmaError::Pressure)?;
+    }
+    btree_index.ensure_node_headroom(&mut writer, live_total.max(new_live))?;
 
+    let free_len = writer.free_slots.len();
     let mut targets: Vec<usize> = Vec::new();
     targets
         .try_reserve_exact(rewritten_len)
         .map_err(|_| PagerVmaError::Pressure)?;
-    for index in 0..rewritten_len {
-        targets.push(if index < overlapping_len {
-            overlapping[index].0
+    for idx in 0..rewritten_len {
+        let target_slot = if idx < overlapping_len {
+            overlapping[idx].0
         } else {
-            empty_slots[index - overlapping_len]
-        });
-        let sequence = slots[targets[index]].sequence.load(Ordering::Relaxed);
+            writer.free_slots[free_len - 1 - (idx - overlapping_len)] as usize
+        };
+        let sequence = slots[target_slot].sequence.load(Ordering::Relaxed);
         if sequence & 1 != 0 || sequence > MAX_PUBLICATION_SEQUENCE - 2 {
             return Err(PagerVmaError::Pressure);
         }
+        targets.push(target_slot);
     }
 
     // A stable empty per-slot publication during withdrawal is NOT a real
@@ -1260,6 +2150,31 @@ where
     for index in 0..rewritten_len {
         slots[targets[index]].publish(Some(rewritten[index]))?;
     }
+    // Update the O(log N) B-tree index and free-slot list only after `mutate`
+    // and every replacement publication succeeded (still inside `_rewrite`).
+    for (_, old_region) in overlapping.iter().copied() {
+        let _ = btree_index.remove(&mut writer, old_region.start);
+    }
+    for _ in 0..extra_needed {
+        let _ = writer.free_slots.pop();
+    }
+    for (slot_index, _) in overlapping[rewritten_len.min(overlapping_len)..]
+        .iter()
+        .copied()
+    {
+        writer.free_slots.push(slot_index as u32);
+    }
+    for idx in 0..rewritten_len {
+        btree_index.insert(
+            &mut writer,
+            BTreeEntry {
+                start: rewritten[idx].start,
+                end: rewritten[idx].end,
+                slot: targets[idx] as u32,
+            },
+        );
+    }
+    writer.live_count = new_live;
     Ok(true)
 }
 
@@ -1755,49 +2670,39 @@ where
     }
     let ceiling = ceiling.min(MAX_PAGER_VMAS_PER_PROCESS);
 
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let mut writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    let allocated_slots = slots.capacity();
     let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    reclaim_stale_incarnation(handle, slots, &mut writer, live_process.slot(), identity)?;
+
+    // O(log N) destination overlap check and O(log N + K) source range query.
+    let mut source_entries: Vec<BTreeEntry> = Vec::new();
+    if let Some(index) = slots.index() {
+        if let Some(dest) = index.first_ending_after(new_start)
+            && new_start < dest.end
+            && dest.start < new_end
+        {
+            return Err(PagerVmaError::Overlap);
+        }
+        index.collect_range(old_start, old_end, false, &mut source_entries)?;
+    }
     let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
     overlapping
-        .try_reserve_exact(allocated_slots)
+        .try_reserve_exact(source_entries.len())
         .map_err(|_| PagerVmaError::Pressure)?;
-    let mut empty_slots: Vec<usize> = Vec::new();
-    empty_slots
-        .try_reserve_exact(allocated_slots)
-        .map_err(|_| PagerVmaError::Pressure)?;
-    let mut live_total = 0_usize;
-    for (slot_index, slot) in slots.iter().enumerate() {
-        match slot.snapshot()? {
-            // Residue of a previous process/MM incarnation: same reclamation as
-            // every other writer, under the same lock.
-            Some(region) if !region_matches_identity(region, live_process.slot(), identity) => {
-                if let Err(error) = slot.publish(None) {
-                    return Err(error);
-                }
-                empty_slots.push(slot_index);
-            }
-            Some(region) => {
-                live_total += 1;
-                if new_start < region.end && region.start < new_end {
-                    return Err(PagerVmaError::Overlap);
-                }
-                if old_start < region.end && region.start < old_end {
-                    overlapping.push((slot_index, region));
-                }
-            }
-            None => empty_slots.push(slot_index),
-        }
-    }
-    overlapping.sort_unstable_by_key(|(_, region)| region.start);
     let mut regions: Vec<PagerVmRegionWire> = Vec::new();
     regions
-        .try_reserve_exact(overlapping.len())
+        .try_reserve_exact(source_entries.len())
         .map_err(|_| PagerVmaError::Pressure)?;
-    for (_, region) in overlapping.iter() {
-        regions.push(*region);
+    for entry in source_entries {
+        let slot_index = entry.slot as usize;
+        let Some(region) = slots[slot_index].snapshot()? else {
+            return Err(PagerVmaError::Stale);
+        };
+        overlapping.push((slot_index, region));
+        regions.push(region);
     }
+    let live_total = writer.live_count;
     let (remainders, moved) = plan_relocation(&regions, old_start, old_end, new_start)?;
     let publications = remainders.len() + moved.len();
     let new_live = live_total
@@ -1807,27 +2712,32 @@ where
     if publications > overlapping.len() && new_live > ceiling {
         return Err(PagerVmaError::Pressure);
     }
-    let available = overlapping.len() + empty_slots.len();
-    if publications > available {
-        let needed_extra = publications - available;
-        let needed_chunks = needed_extra.div_ceil(VMA_SLOT_CHUNK);
-        empty_slots
-            .try_reserve_exact(needed_chunks * VMA_SLOT_CHUNK)
-            .map_err(|_| PagerVmaError::Pressure)?;
-        let first_new_slot = slots.append_chunks_with(needed_chunks, build)?;
-        for offset in 0..(needed_chunks * VMA_SLOT_CHUNK) {
-            empty_slots.push(first_new_slot + offset);
-        }
+    let extra_needed = publications.saturating_sub(overlapping.len());
+    if extra_needed > 0 {
+        writer.ensure_free_slots(slots, extra_needed, build)?;
     }
+    let freed_on_shrink = overlapping.len().saturating_sub(publications);
+    if freed_on_shrink > 0 {
+        writer
+            .free_slots
+            .try_reserve(freed_on_shrink)
+            .map_err(|_| PagerVmaError::Pressure)?;
+    }
+    if publications > 0 {
+        let index = slots.ensure_index()?;
+        index.ensure_node_headroom(&mut writer, live_total.max(new_live))?;
+    }
+
+    let free_len = writer.free_slots.len();
     let mut targets: Vec<usize> = Vec::new();
     targets
         .try_reserve_exact(publications)
         .map_err(|_| PagerVmaError::Pressure)?;
-    for index in 0..publications {
-        let slot_index = if index < overlapping.len() {
-            overlapping[index].0
+    for idx in 0..publications {
+        let slot_index = if idx < overlapping.len() {
+            overlapping[idx].0
         } else {
-            empty_slots[index - overlapping.len()]
+            writer.free_slots[free_len - 1 - (idx - overlapping.len())] as usize
         };
         let sequence = slots[slot_index].sequence.load(Ordering::Relaxed);
         if sequence & 1 != 0 || sequence > MAX_PUBLICATION_SEQUENCE - 2 {
@@ -1870,11 +2780,46 @@ where
         }
         return Err(error);
     }
-    for (index, region) in remainders.iter().copied().enumerate() {
-        slots[targets[index]].publish(Some(region))?;
+    for (idx, region) in remainders.iter().copied().enumerate() {
+        slots[targets[idx]].publish(Some(region))?;
     }
     for (offset, region) in stamped_moved.iter().copied().enumerate() {
         slots[targets[remainders.len() + offset]].publish(Some(region))?;
+    }
+    if let Some(index) = slots.index() {
+        for (_, old_region) in overlapping.iter().copied() {
+            let _ = index.remove(&mut writer, old_region.start);
+        }
+        for _ in 0..extra_needed {
+            let _ = writer.free_slots.pop();
+        }
+        for (slot_index, _) in overlapping[publications.min(overlapping.len())..]
+            .iter()
+            .copied()
+        {
+            writer.free_slots.push(slot_index as u32);
+        }
+        for (idx, region) in remainders.iter().copied().enumerate() {
+            index.insert(
+                &mut writer,
+                BTreeEntry {
+                    start: region.start,
+                    end: region.end,
+                    slot: targets[idx] as u32,
+                },
+            );
+        }
+        for (offset, region) in stamped_moved.iter().copied().enumerate() {
+            index.insert(
+                &mut writer,
+                BTreeEntry {
+                    start: region.start,
+                    end: region.end,
+                    slot: targets[remainders.len() + offset] as u32,
+                },
+            );
+        }
+        writer.live_count = new_live;
     }
     Ok(stamped_moved.len())
 }
@@ -1902,13 +2847,19 @@ pub fn first_mapping_conflict(
     let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
     let process = vma_handle.object_identity().ok_or(PagerVmaError::Stale)?;
     retained.with_exact_visible_state_mut(identity, |_, state| {
-        let _writer = writer_lock(vma_handle).ok_or(PagerVmaError::Stale)?.lock();
+        let writer = writer_lock(vma_handle).ok_or(PagerVmaError::Stale)?.lock();
+        let slots = process_slots(vma_handle).ok_or(PagerVmaError::Stale)?;
         let mut first: Option<(u64, u64)> = None;
-        for slot in process_slots(vma_handle).ok_or(PagerVmaError::Stale)?.iter() {
-            let Some(region) = slot.snapshot()? else { continue; };
-            if region.start < end && start < region.end
+        if writer.live_count > 0
+            && writer.matches_owner(process.slot(), vma_identity)
+            && let Some(index) = slots.index()
+            && let Some(candidate) = index.first_ending_after(start)
+            && candidate.start < end
+        {
+            if let Some(region) = slots[candidate.slot as usize].snapshot()?
+                && region.start < end
+                && start < region.end
                 && region_matches_identity(region, process.slot(), vma_identity)
-                && first.is_none_or(|old| region.start < old.0)
             {
                 first = Some((region.start, region.end));
             }
@@ -1946,14 +2897,25 @@ pub(super) fn snapshot_regions(
         return Err(PagerVmaError::Stale);
     }
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    if writer.live_count == 0 || !writer.matches_owner(process.slot(), identity) {
+        return Ok(Vec::new());
+    }
+    let Some(index) = slots.index() else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(writer.live_count)
+        .map_err(|_| PagerVmaError::Pressure)?;
+    index.collect_all(&mut entries)?;
     let mut regions = Vec::new();
     regions
-        .try_reserve_exact(slots.capacity())
+        .try_reserve_exact(entries.len())
         .map_err(|_| PagerVmaError::Pressure)?;
-    for slot in slots.iter() {
-        let Some(region) = slot.snapshot()? else {
+    for entry in entries {
+        let Some(region) = slots[entry.slot as usize].snapshot()? else {
             continue;
         };
         if !region_matches_identity(region, process.slot(), identity) {
@@ -1971,23 +2933,39 @@ pub(super) fn revoke(
     vma_generation: u64,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let mut writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    for slot in slots.iter() {
-        let Some(region) = slot.snapshot()? else {
-            continue;
-        };
-        // Through the single identity definition like every other authority
-        // decision here. This also adds the exact process-slot comparison the
-        // open-coded version omitted, so residue left by a previous occupant
-        // of these slots can no longer be revoked through this handle.
-        if region.start == start
-            && region.vma_generation == vma_generation
-            && region_matches_identity(region, process.slot(), identity)
-        {
-            slot.publish(None)?;
-            return Ok(region);
-        }
+    if writer.live_count == 0 || !writer.matches_owner(process.slot(), identity) {
+        return Err(PagerVmaError::Stale);
+    }
+    let Some(index) = slots.index() else {
+        return Err(PagerVmaError::Stale);
+    };
+    let Some(entry) = index.find_exact(start) else {
+        return Err(PagerVmaError::Stale);
+    };
+    let slot = &slots[entry.slot as usize];
+    let Some(region) = slot.snapshot()? else {
+        return Err(PagerVmaError::Stale);
+    };
+    // Through the single identity definition like every other authority
+    // decision here. This also adds the exact process-slot comparison the
+    // open-coded version omitted, so residue left by a previous occupant
+    // of these slots can no longer be revoked through this handle.
+    if region.start == start
+        && region.vma_generation == vma_generation
+        && region_matches_identity(region, process.slot(), identity)
+    {
+        writer
+            .free_slots
+            .try_reserve(1)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        let _revoke_rewrite = RangeRewrite::begin(handle)?;
+        slot.publish(None)?;
+        let _ = index.remove(&mut writer, start);
+        writer.free_slots.push(entry.slot);
+        writer.live_count -= 1;
+        return Ok(region);
     }
     Err(PagerVmaError::Stale)
 }

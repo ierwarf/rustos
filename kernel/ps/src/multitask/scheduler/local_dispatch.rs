@@ -278,6 +278,9 @@ pub(super) fn qualified_local_handoff_generation(
 /// Bitmap entries can outlive a concurrent owner withdrawal, so recheck
 /// runnable Local custody on this CPU and exclude published idle slots.
 pub(super) fn local_fair_competitor_ready(cpu: usize) -> bool {
+    if runqueue::published_runnable_count(cpu) == 0 {
+        return false;
+    }
     runqueue::local_runnable_slots(cpu)
         .any(|slot| !runqueue::is_idle_slot(slot) && runqueue::is_local_dispatchable(slot, cpu))
 }
@@ -370,6 +373,36 @@ pub(super) fn choose_local_next(
         candidate_is_qualified)
 }
 
+#[cfg(rustos_scheduler_phase_profile)]
+struct ScanTimer {
+    started_ns: u64,
+    handoff: bool,
+}
+
+#[cfg(rustos_scheduler_phase_profile)]
+impl ScanTimer {
+    #[inline]
+    fn start(handoff: bool) -> Self {
+        Self {
+            started_ns: crate::arch::clock::monotonic_nanos(),
+            handoff,
+        }
+    }
+}
+
+#[cfg(rustos_scheduler_phase_profile)]
+impl Drop for ScanTimer {
+    #[inline]
+    fn drop(&mut self) {
+        let elapsed = crate::arch::clock::monotonic_nanos().saturating_sub(self.started_ns);
+        if self.handoff {
+            super::locality::record_handoff_scan(elapsed);
+        } else {
+            super::locality::record_pick_scan(elapsed);
+        }
+    }
+}
+
 /// The production consumer retains its winner's actual frame loan through
 /// final claim. Observational callers use the SAME ordering/admission engine
 /// above but discard their scoped reader, never manufacturing execution.
@@ -380,6 +413,8 @@ pub(super) fn choose_local_next_with(
     unresolved: &mut UnresolvedCandidates,
     mut qualify: impl FnMut(usize, usize, u64) -> Result<Option<u64>, LocalFallbackReason>,
 ) -> Result<(usize, u64), LocalFallbackReason> {
+    #[cfg(rustos_scheduler_phase_profile)]
+    let _scan_timer = ScanTimer::start(false);
     if atomic_activation_pending {
         return fallback(LocalFallbackReason::AtomicActivationPending);
     }
@@ -392,6 +427,9 @@ pub(super) fn choose_local_next_with(
         || donation_ledger::class_publication_sequence() != expected_class_sequence
     {
         return fallback(LocalFallbackReason::CustodyUnavailable);
+    }
+    if runqueue::published_runnable_count(cpu) == 0 {
+        return fallback(LocalFallbackReason::NoLocalCandidate);
     }
 
     let reserve_user = user_reservation_due(cpu);
@@ -428,9 +466,15 @@ pub(super) fn choose_local_next_with(
     let mut local_alternate_user = None;
     let mut current_candidate = None;
     let mut first_revalidation_failure = None;
+    #[cfg(rustos_scheduler_phase_profile)]
+    let mut sampled: u64 = 0;
     for slot in runqueue::local_runnable_slots(cpu) {
         if runqueue::is_idle_slot(slot) || unresolved.excludes(slot) {
             continue;
+        }
+        #[cfg(rustos_scheduler_phase_profile)]
+        {
+            sampled = sampled.saturating_add(1);
         }
         // The outgoing slot is still the CPU's live execution frame and must
         // not manufacture a stable saved-frame token. Its current-CPU owner
@@ -442,6 +486,24 @@ pub(super) fn choose_local_next_with(
         // User reservation can pick it outright and keeps the eager order.
         if voluntary_yield && slot == current_slot && !reserve_user {
             yielded_current_deferred = true;
+            continue;
+        }
+        // Check published class first (two atomic loads) before expensive
+        // lifecycle/affinity/budget/frame admission. Once a higher-priority
+        // class already has an admitted winner for this epoch, lower-priority
+        // class slots cannot win and skip admission entirely.
+        let candidate_class = match observed_class(slot) {
+            Ok(class) => class,
+            Err(reason) => {
+                unresolved.record(slot, reason);
+                first_revalidation_failure.get_or_insert(reason);
+                continue;
+            }
+        };
+        if !reserve_user && best_system.is_some() && candidate_class == LocalClass::User {
+            continue;
+        }
+        if reserve_user && reserved_user.is_some() && candidate_class == LocalClass::System {
             continue;
         }
         let qualification = if slot == current_slot && current_is_live!() {
@@ -463,14 +525,6 @@ pub(super) fn choose_local_next_with(
                 continue;
             }
         }
-        let candidate_class = match observed_class(slot) {
-            Ok(class) => class,
-            Err(reason) => {
-                unresolved.record(slot, reason);
-                first_revalidation_failure.get_or_insert(reason);
-                continue;
-            }
-        };
         let vruntime = runqueue::vruntime(slot);
         // Match legacy selection's same-slot turn bias. Voluntary yields omit
         // the current slot above and use circular-distance tie breaking.
@@ -528,6 +582,14 @@ pub(super) fn choose_local_next_with(
                 }
             }
         }
+    }
+
+    #[cfg(rustos_scheduler_phase_profile)]
+    if sampled != 0 {
+        super::runtime_profile::owner::local(|row| {
+            row.runtime_profile_runnable_samples =
+                row.runtime_profile_runnable_samples.saturating_add(sampled);
+        });
     }
 
     if yielded_current_deferred && best_system.is_none() && best_user.is_none()
@@ -681,6 +743,19 @@ pub(super) fn choose_overdue_system(
         return Err(LocalFallbackReason::CustodyUnavailable);
     }
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    if donation_ledger::live_inherited_system_count() == 0
+        && runqueue::overdue_system_short_circuit(
+            cpu,
+            now_ticks,
+            ticks_per_second,
+            super::SYSTEM_READY_LATENCY_BOUND_MS,
+            expected_queue_sequence,
+        )
+    {
+        return Ok(None);
+    }
+    #[cfg(rustos_scheduler_phase_profile)]
+    let _scan_timer = ScanTimer::start(true);
     let mut oldest = None;
     let mut first_failure = None;
     for slot in runqueue::local_runnable_slots(cpu) {
@@ -1012,5 +1087,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn overdue_system_short_circuit_handles_user_only_fresh_system_and_in_place_updates() {
+        let _cpu = crate::multitask::cpu_local::test_publication_lock();
+        let _queue = super::runqueue::test_serial_guard();
+        super::runqueue::reset_before_publication();
+        let (cpu, user_slot, sys_slot) = (2, 48, 49);
+        let tps = 100_u64;
+        let bound_ms = super::super::SYSTEM_READY_LATENCY_BOUND_MS;
+
+        // Empty queue short-circuits immediately.
+        let seq = super::runqueue::local_runnable_sequence(cpu);
+        assert!(super::runqueue::overdue_system_short_circuit(cpu, 1000, tps, bound_ms, seq));
+        assert!(super::runqueue::has_no_system_runnable(cpu, seq));
+
+        // User-only queue short-circuits for both overdue and hint checks.
+        super::runqueue::weight::initialize(user_slot, super::super::NICE_0_LOAD);
+        super::runqueue::wait::set_ready_since_ticks(user_slot, 1);
+        super::runqueue::admit_blocked(user_slot);
+        super::runqueue::publish_local(user_slot, cpu, super::super::NICE_0_LOAD);
+        let seq = super::runqueue::local_runnable_sequence(cpu);
+        assert!(super::runqueue::overdue_system_short_circuit(cpu, 100_000, tps, bound_ms, seq));
+        assert!(super::runqueue::has_no_system_runnable(cpu, seq));
+
+        // Fresh System task short-circuits when elapsed < bound_ms, and stops short-circuiting when overdue.
+        let sys_w = super::super::SYSTEM_CLASS_WEIGHT_FLAG | super::super::NICE_0_LOAD;
+        super::runqueue::weight::initialize(sys_slot, sys_w);
+        super::runqueue::wait::set_ready_since_ticks(sys_slot, 1000);
+        super::runqueue::admit_blocked(sys_slot);
+        super::runqueue::publish_local(sys_slot, cpu, sys_w);
+        let seq = super::runqueue::local_runnable_sequence(cpu);
+        assert!(!super::runqueue::has_no_system_runnable(cpu, seq));
+        assert!(super::runqueue::overdue_system_short_circuit(cpu, 1000, tps, bound_ms, seq));
+        assert!(!super::runqueue::overdue_system_short_circuit(cpu, 100_000, tps, bound_ms, seq));
+
+        // In-place ready_since update on a Local slot invalidates summary so scan observes it.
+        super::runqueue::wait::set_ready_since_ticks(sys_slot, 1);
+        assert!(!super::runqueue::overdue_system_short_circuit(cpu, 1000, tps, bound_ms, seq));
+
+        // Removing the System slot restores User-only O(1) short-circuit.
+        super::runqueue::publish_blocked(sys_slot, cpu, sys_w);
+        let seq = super::runqueue::local_runnable_sequence(cpu);
+        assert!(super::runqueue::overdue_system_short_circuit(cpu, 100_000, tps, bound_ms, seq));
+        assert!(super::runqueue::has_no_system_runnable(cpu, seq));
+
+        // In-place weight::clear on a queued slot forces scan to observe PublicationUnavailable.
+        super::runqueue::weight::clear(user_slot);
+        assert!(!super::runqueue::overdue_system_short_circuit(cpu, 1000, tps, bound_ms, seq));
+        assert!(!super::runqueue::has_no_system_runnable(cpu, seq));
+
+        super::runqueue::retire(user_slot, super::super::NICE_0_LOAD);
+        super::runqueue::release_retired(user_slot);
+        super::runqueue::retire(sys_slot, sys_w);
+        super::runqueue::release_retired(sys_slot);
+        super::runqueue::reset_before_publication();
     }
 }

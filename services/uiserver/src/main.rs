@@ -767,14 +767,20 @@ fn run() -> Result<(), i32> {
         if input.backlog_remaining {
             input_backlog_window = input_backlog_window.saturating_add(1);
         }
+        let input_caused_visual_work = should_arm_input_to_submit(
+            !input.visual_update.is_empty(),
+            cursor_before_input != (state.cursor_x, state.cursor_y),
+        );
         pending_update.absorb(input.visual_update);
-        // MEASUREMENT: input consumption to the next accepted display submit.
-        // This is neither application key-echo nor scanout completion; the GPU
-        // owner records exact completion separately after both receipts arrive.
-        // Only the first input-bearing iteration since the last present arms
-        // this, so a burst of typing reports the age of its oldest unpresented
-        // event rather than resetting the clock on every key.
-        if input.input_events > 0 && input_awaiting_present.is_none() {
+        // MEASUREMENT: input consumption to the next accepted display submit
+        // for inputs that actually produce compositor visual work (cursor
+        // motion, drag/resize, focus/chrome updates, console scroll/reveal).
+        // Non-visual inputs forwarded to clients (e.g. launcher clicks, key
+        // releases, or Wayland client keys whose redraw belongs to the client)
+        // must not stay armed across idle turns and conflate client think time
+        // with compositor submit latency; console key-echo is traced separately
+        // by `keytrace`.
+        if input_caused_visual_work && input_awaiting_present.is_none() {
             input_awaiting_present = Some(input_started);
         }
         phase_timings.input = input_started.elapsed();
@@ -790,9 +796,17 @@ fn run() -> Result<(), i32> {
         let callback_due = display_presented
             && wayland_callback_pending
             && (wayland_frame_permit || now >= next_wayland_callback_pulse);
+        let pointer_motion_due = wayland
+            .next_pointer_motion_flush()
+            .is_some_and(|deadline| now >= deadline);
         let protocol_input = wayland.has_pending_protocol_input();
         if service_wayland
-            && wayland_service_required(protocol_input, input.input_events, callback_due)
+            && wayland_service_required(
+                protocol_input,
+                input.input_events,
+                callback_due,
+                pointer_motion_due,
+            )
         {
             wayland.set_window_cascade_base(state.console_windows.len());
             // Tick may return our pixel aliases while applying completed
@@ -936,6 +950,7 @@ fn run() -> Result<(), i32> {
             false,
         );
         watchdog.enter(UI_PHASE_MAIN_PRESENT);
+        let mut backpressured = false;
         let rendered = match phase_result(
             "main-present",
             present_drawable_update(&mut state, &drawable_update),
@@ -979,12 +994,10 @@ fn run() -> Result<(), i32> {
                 // separating the submission owner from the protocol owner is
                 // the general one.
                 wayland_frame_permit = true;
-                note_present_step(PRESENT_STEP_NONE);
-        watchdog.leave();
                 profile::record_backpressure_retry();
                 profile::maybe_emit();
-                thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
-                continue 'main_loop;
+                backpressured = true;
+                false
             }
             PresentUpdateResult::Idle => {
                 // Nothing to present is the clearest case of all: the client
@@ -1005,6 +1018,7 @@ fn run() -> Result<(), i32> {
                 // audit item, `V5-GPU-UI-OWNER-014`: protocol progress is not
                 // the scene's or the GPU's to withhold.
                 wayland_frame_permit = true;
+                input_awaiting_present = None;
                 false
             }
         };
@@ -1155,11 +1169,15 @@ fn run() -> Result<(), i32> {
 
         let sleep_started = Instant::now();
         let now = sleep_started;
-        if !rendered
+        let callback_permit_ready =
+            wayland_callback_pending && wayland_frame_permit && state.display_has_presented();
+        let idle_wait = !rendered
             && drawable_update.is_empty()
             && pending_update.is_empty()
-            && !input.backlog_remaining
-        {
+            && !input.backlog_remaining;
+        let backpressure_wait =
+            backpressured && !input.backlog_remaining && !callback_permit_ready;
+        if backpressure_wait || idle_wait {
             let mut sleep_deadline = next_runtime_poll
                 .min(next_console_poll)
                 .min(next_cursor_blink)
@@ -1174,8 +1192,17 @@ fn run() -> Result<(), i32> {
                 // clock merely because no input or runtime poll is pending.
                 sleep_deadline = sleep_deadline.min(next_wayland_callback_pulse);
             }
+            if let Some(pointer_flush) = wayland.next_pointer_motion_flush() {
+                sleep_deadline = sleep_deadline.min(pointer_flush);
+            }
             if state.cursor_motion_active() {
                 sleep_deadline = sleep_deadline.min(next_cursor_motion_settle);
+            }
+            if backpressure_wait {
+                let retry_deadline = state
+                    .gpu_retry_deadline(now)
+                    .unwrap_or(now + DISPLAY_BACKPRESSURE_RETRY_DELAY);
+                sleep_deadline = sleep_deadline.min(retry_deadline);
             }
             input_loop::sleep_until_input_or(&input_events, sleep_deadline, |phase| {
                 watchdog.enter(match phase {
@@ -1187,7 +1214,7 @@ fn run() -> Result<(), i32> {
                 });
             });
             note_present_step(PRESENT_STEP_NONE);
-        watchdog.leave();
+            watchdog.leave();
         }
         phase_timings.sleep = sleep_started.elapsed();
 
@@ -1206,16 +1233,25 @@ fn run() -> Result<(), i32> {
     }
 }
 
-fn wayland_service_required(protocol_input: bool, input_events: u64, callback_due: bool) -> bool {
-    protocol_input || input_events != 0 || callback_due
+fn should_arm_input_to_submit(visual_update_non_empty: bool, cursor_moved: bool) -> bool {
+    visual_update_non_empty || cursor_moved
+}
+
+fn wayland_service_required(
+    protocol_input: bool,
+    input_events: u64,
+    callback_due: bool,
+    pointer_motion_due: bool,
+) -> bool {
+    protocol_input || input_events != 0 || callback_due || pointer_motion_due
 }
 
 #[cfg(test)]
 mod main_loop_tests {
     use super::{
-        ui_phase_panic_threshold_ms, wayland_service_required, NETD_STREAM_LEASE_MS,
-        UI_PHASE_INPUT, UI_PHASE_PANIC_THRESHOLD_MS, UI_PHASE_WAYLAND, WAYLAND_STEP_DISPATCH,
-        WAYLAND_STEP_NONE,
+        should_arm_input_to_submit, ui_phase_panic_threshold_ms, wayland_service_required,
+        NETD_STREAM_LEASE_MS, UI_PHASE_INPUT, UI_PHASE_PANIC_THRESHOLD_MS, UI_PHASE_WAYLAND,
+        WAYLAND_STEP_DISPATCH, WAYLAND_STEP_NONE,
     };
 
     #[test]
@@ -1238,10 +1274,19 @@ mod main_loop_tests {
 
     #[test]
     fn wayland_dispatch_requires_protocol_input_server_events_or_due_callback() {
-        assert!(!wayland_service_required(false, 0, false));
-        assert!(wayland_service_required(true, 0, false));
-        assert!(wayland_service_required(false, 1, false));
-        assert!(wayland_service_required(false, 0, true));
+        assert!(!wayland_service_required(false, 0, false, false));
+        assert!(wayland_service_required(true, 0, false, false));
+        assert!(wayland_service_required(false, 1, false, false));
+        assert!(wayland_service_required(false, 0, true, false));
+        assert!(wayland_service_required(false, 0, false, true));
+    }
+
+    #[test]
+    fn input_to_submit_arms_only_when_input_produces_compositor_visual_work() {
+        assert!(!should_arm_input_to_submit(false, false));
+        assert!(should_arm_input_to_submit(true, false));
+        assert!(should_arm_input_to_submit(false, true));
+        assert!(should_arm_input_to_submit(true, true));
     }
 }
 

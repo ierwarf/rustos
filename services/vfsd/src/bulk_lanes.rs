@@ -47,7 +47,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize
 
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    StoragedBulkReadResponse, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK,
+    CommercialMaxProtocolRequest, StoragedBulkReadResponse,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK,
 };
 use vfsd::bulk_plan::{chunk_bytes, chunk_count, chunk_span, is_parallel_read, ChunkCursor};
 use vfsd::snapshot_pipeline::{StageHost, StageToken};
@@ -61,6 +62,11 @@ const JOB_SLOTS: usize = 4;
 const THREAD_STACK_BYTES: usize = 128 * 1024;
 const RESPONSE_WORDS: usize = size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>());
 const HELPER_IDLE_WAIT_NS: i64 = 100_000_000;
+/// Short bounded spin before parking so helpers stay hot across back-to-back
+/// 4 MiB snapshot windows (~15-30 us gap) without futex sleep/wake churn.
+const HELPER_SPIN_BEFORE_PARK: u32 = 512;
+/// Short spin while waiting for a just-completed helper to drop its pin.
+const RETIRE_SPIN_BEFORE_PARK: u32 = 128;
 /// Backstop for every park: a lost wake costs this much latency, never progress.
 const PARK_NS: i64 = 1_000_000;
 
@@ -239,6 +245,13 @@ impl JobSlot {
     /// Unpublishes, waits for every pinned helper to let go, and frees the slot.
     fn retire(&self) {
         self.state.fetch_and(!PUBLISHED, Ordering::AcqRel);
+        for _ in 0..RETIRE_SPIN_BEFORE_PARK {
+            if self.state.load(Ordering::Acquire) == 0 {
+                self.owned.store(false, Ordering::Release);
+                return;
+            }
+            core::hint::spin_loop();
+        }
         loop {
             let state = self.state.load(Ordering::Acquire);
             if state == 0 {
@@ -287,7 +300,8 @@ pub(super) fn read_parallel(
     slot.publish(&job);
     WORK.fetch_add(1, Ordering::Release);
     futex_wake(&WORK, HELPER_LANES);
-    run_lane(&job, caller_response);
+    let mut caller_request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK);
+    run_lane(&job, &mut caller_request, caller_response);
     wait_finished(&job);
     slot.retire();
     let error = job.cursor.error();
@@ -305,10 +319,13 @@ fn wait_finished(job: &LaneJob) {
 }
 
 /// Claims and reads chunks of `job` until none are left.
-fn run_lane(job: &LaneJob, response: &mut [u64]) {
+/// `request` is pre-initialized with the calling thread's PID/TID so each chunk
+/// updates only `arg0..=arg2` instead of zeroing 4 KiB and invoking `gettid`.
+fn run_lane(job: &LaneJob, request: &mut CommercialMaxProtocolRequest, response: &mut [u64]) {
+    request.arg0 = job.generation;
     while let Some(index) = job.cursor.claim() {
         let result = if job.cursor.error() == 0 {
-            read_chunk(job, index, response)
+            read_chunk(job, index, request, response)
         } else {
             // A claimed chunk is always completed, but not read after an error.
             Ok(())
@@ -319,10 +336,13 @@ fn run_lane(job: &LaneJob, response: &mut [u64]) {
     }
 }
 
-fn read_chunk(job: &LaneJob, index: usize, response: &mut [u64]) -> Result<(), i32> {
+fn read_chunk(
+    job: &LaneJob,
+    index: usize,
+    request: &mut CommercialMaxProtocolRequest,
+    response: &mut [u64],
+) -> Result<(), i32> {
     let (offset, len) = chunk_span(index, job.chunk_bytes, job.out_len);
-    let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK);
-    request.arg0 = job.generation;
     request.arg1 = job.base_lba + index as u64 * job.chunk_blocks;
     request.arg2 = (len / job.block_size) as u64;
     // SAFETY: the chunk is a range of the caller's buffer, which stays borrowed
@@ -330,7 +350,7 @@ fn read_chunk(job: &LaneJob, index: usize, response: &mut [u64]) -> Result<(), i
     // and chunk indexes are claimed exactly once so no two lanes hold the same
     // bytes.
     let chunk = unsafe { core::slice::from_raw_parts_mut(job.out_ptr.add(offset), len) };
-    call_storaged_bulk(&request, chunk, response)
+    call_storaged_bulk(request, chunk, response)
 }
 
 fn ensure_helpers() -> bool {
@@ -350,6 +370,9 @@ extern "C" fn lane_entry() -> ! {
     let lane = NEXT_LANE.fetch_add(1, Ordering::AcqRel) % HELPER_LANES;
     // SAFETY: `lane` is unique to this helper (see `LaneResponse`).
     let response = unsafe { &mut *LANE_RESPONSES[lane].0.get() };
+    // Initialize the bulk-read request envelope once for this thread's fixed
+    // PID/TID instead of calling `SYS_GETTID` and zeroing 4 KiB per chunk.
+    let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK);
     let mut demoted = false;
     loop {
         if !demoted && super::SNAPSHOT_WORKER_DEMOTED.load(Ordering::Acquire) {
@@ -361,15 +384,25 @@ extern "C" fn lane_entry() -> ! {
         for slot in &JOB_SLOTS_TABLE {
             if let Some(job) = slot.pin() {
                 if job.cursor.has_unclaimed() {
-                    run_lane(&job, response);
+                    run_lane(&job, &mut request, response);
                     worked = true;
                 }
             }
         }
         if !worked {
-            // A publish after the scan bumps `WORK`, so the wait returns at
-            // once instead of sleeping through it.
-            futex_wait(&WORK, seen, HELPER_IDLE_WAIT_NS);
+            let mut next_published = false;
+            for _ in 0..HELPER_SPIN_BEFORE_PARK {
+                if WORK.load(Ordering::Acquire) != seen {
+                    next_published = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if !next_published {
+                // A publish after the scan bumps `WORK`, so the wait returns at
+                // once instead of sleeping through it.
+                futex_wait(&WORK, seen, HELPER_IDLE_WAIT_NS);
+            }
         }
     }
 }

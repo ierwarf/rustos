@@ -1201,4 +1201,65 @@ mod tests {
         assert_eq!(error.error, TransferError::InvalidWindow);
         assert!(sink.data.is_empty());
     }
+
+    #[test]
+    fn multi_window_snapshot_pipeline_preserves_exact_sha256_and_bytes() {
+        use sha2::{Digest, Sha256};
+
+        struct Sha256WindowDigest(Sha256);
+        impl WindowDigest for Sha256WindowDigest {
+            fn update(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+        }
+
+        // Non-window-aligned multi-window transfer exercising ring wrap-around
+        // with short reads and both helper stages (writer + SHA-256 hasher).
+        let total_len: u64 = 64 * 1024 * 6 + 13_337;
+        let g = RingGeometry::new(total_len, 64 * 1024, 3).unwrap();
+        assert_eq!(g.windows(), 7);
+        let mut buffer = alloc::vec![0u8; g.buffer_bytes().unwrap()];
+
+        let mut expected_sha = Sha256::new();
+        let mut expected_bytes = Vec::with_capacity(total_len as usize);
+        for offset in 0..total_len {
+            expected_bytes.push(pattern(offset));
+        }
+        expected_sha.update(&expected_bytes);
+        let expected_digest = expected_sha.finalize();
+
+        for helpers in [0, 2] {
+            let confirmed = leak_counter();
+            let mut source = Source::new(total_len);
+            source.max_read = 127 * 512; // matches storaged 63.5 KiB bulk chunk
+            let mut sink = Sink {
+                data: Vec::with_capacity(total_len as usize),
+                max_write: usize::MAX,
+                fail_at: None,
+                zero_at: None,
+                confirmed,
+                delay: false,
+            };
+            let mut digest = Sha256WindowDigest(Sha256::new());
+            let host = TestHost::new(helpers);
+            let stats = run(
+                &mut source,
+                &mut sink,
+                Some(&mut digest),
+                &mut buffer,
+                g,
+                &Control::never(),
+                &host,
+            )
+            .expect("multi-window transfer succeeds");
+            assert_eq!(stats.windows, 7);
+            assert_eq!(stats.helper_stages, helpers as u32);
+            assert_eq!(sink.data, expected_bytes);
+            assert_eq!(digest.0.finalize(), expected_digest);
+            assert_eq!(
+                host.started.load(Ordering::Acquire),
+                host.joined.load(Ordering::Acquire)
+            );
+        }
+    }
 }

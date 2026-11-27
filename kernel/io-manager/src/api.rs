@@ -139,6 +139,20 @@ pub mod block {
             .map_err(map_dvm_error)
     }
 
+    pub fn poll_dvm_ready(
+        ticket: DvmBlockTicket,
+        expected_len: usize,
+    ) -> Result<DvmBlockPoll, DvmBlockError> {
+        crate::io::dvm_block::poll_ready(unmap_dvm_ticket(ticket), expected_len)
+            .map(|poll| match poll {
+                crate::io::dvm_block::DvmBlockPoll::Pending => DvmBlockPoll::Pending,
+                crate::io::dvm_block::DvmBlockPoll::Completed(bytes) => {
+                    DvmBlockPoll::Completed(bytes)
+                }
+            })
+            .map_err(map_dvm_error)
+    }
+
     pub fn poll_dvm(ticket: DvmBlockTicket, out: &mut [u8]) -> Result<DvmBlockPoll, DvmBlockError> {
         crate::io::dvm_block::poll(unmap_dvm_ticket(ticket), out)
             .map(|poll| match poll {

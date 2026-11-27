@@ -927,8 +927,9 @@ fn call_checked_service_rpc_boxed<Req, Resp>(
     validate: impl FnOnce(&Resp) -> LinuxResult<i32>,
 ) -> LinuxResult<alloc::boxed::Box<Resp>> {
     let start_ticks = log_slow.then(crate::arch::rtc::ticks);
-    let response: alloc::boxed::Box<Resp> =
-        call_fixed_service_rpc_boxed(service_id, request, class, timeout_ms)?;
+    let response: alloc::boxed::Box<Resp> = call_fixed_service_rpc_boxed_with_log(
+        service_id, request, class, timeout_ms, log_slow,
+    )?;
     if let Some(start) = start_ticks {
         diagnostics::log_slow_service_call(
             service_name,
@@ -1643,7 +1644,7 @@ pub fn console_read_via_sessiond(
             &[],
             ipc_ops::ServiceIpcClass::BulkData,
             None,
-            true,
+            wait_ms == 0,
         ) {
             Ok(response) => response,
             Err(errno) => return if copied > 0 { Ok(copied as u64) } else { Err(errno) },

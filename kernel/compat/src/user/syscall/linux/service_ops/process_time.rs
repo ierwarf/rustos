@@ -232,7 +232,6 @@ pub fn syscall_linux_rt_sigpending(set_ptr: u64, sigset_size: u64) -> u64 {
         if sigset_size != size_of::<u64>() as u64 {
             return Err(LINUX_EINVAL);
         }
-        validate_user_write(set_ptr, 8)?;
         let pending = multitask::current_linux_thread_state()
             .map(|state| state.pending_signals & state.signal_mask)
             .unwrap_or(0);
@@ -469,12 +468,22 @@ pub fn syscall_linux_nanosleep(request_ptr: u64, remaining_ptr: u64) -> u64 {
     })())
 }
 
+fn clock_gettime_with_writer(
+    clock_id: u64,
+    timespec_ptr: u64,
+    write: impl FnOnce(u64, &[u8]) -> LinuxResult<()>,
+) -> LinuxResult<()> {
+    validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)?;
+    let ts = read_clock_timespec(clock_id)?;
+    write(timespec_ptr, as_bytes(&ts))
+}
+
 pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
-    linux_unit_result((|| {
-        validate_user_write(timespec_ptr, LINUX_TIMESPEC_SIZE)?;
-        validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)?;
-        write_clock_timespec_result(clock_id, timespec_ptr)
-    })())
+    linux_unit_result(clock_gettime_with_writer(
+        clock_id,
+        timespec_ptr,
+        write_user_bytes,
+    ))
 }
 
 /// Linux `time(tloc)`: returns wall-clock seconds since the Unix epoch and
@@ -489,13 +498,14 @@ pub fn syscall_linux_time(tloc_ptr: u64) -> u64 {
     })())
 }
 
-fn write_clock_timespec_result(clock_id: u64, timespec_ptr: u64) -> LinuxResult<()> {
-    let ts = if clock_id == CLOCK_THREAD_CPUTIME_ID || clock_id == CLOCK_PROCESS_CPUTIME_ID {
-        timespec_from_nanos(multitask::current_thread_cpu_time_ns().ok_or(LINUX_EINVAL)?)
+fn read_clock_timespec(clock_id: u64) -> LinuxResult<LinuxTimespecWire> {
+    if clock_id == CLOCK_THREAD_CPUTIME_ID || clock_id == CLOCK_PROCESS_CPUTIME_ID {
+        Ok(timespec_from_nanos(
+            multitask::current_thread_cpu_time_ns().ok_or(LINUX_EINVAL)?,
+        ))
     } else {
-        current_clock_timespec_substrate(clock_id)
-    };
-    write_user_bytes(timespec_ptr, as_bytes(&ts))
+        Ok(current_clock_timespec_substrate(clock_id))
+    }
 }
 
 pub fn syscall_linux_clock_getres(clock_id: u64, res_ptr: u64) -> u64 {
@@ -1109,5 +1119,61 @@ mod tests {
         assert_eq!(validate_clone3_args(&args), Err(LINUX_EINVAL));
         args.exit_signal = linux_abi::SIGCHLD;
         assert_eq!(validate_clone3_args(&args), Ok(()));
+    }
+
+    #[test]
+    fn clock_gettime_validates_clock_id_before_copyout_and_writes_directly() {
+        // Invalid clock_id must return EINVAL before touching user memory
+        // (even when timespec_ptr is NULL).
+        assert_eq!(
+            syscall_linux_clock_gettime(u64::MAX, 0),
+            linux_errno(LINUX_EINVAL)
+        );
+        assert_eq!(
+            syscall_linux_clock_gettime(11, 0),
+            linux_errno(LINUX_EINVAL)
+        );
+        let mut called = false;
+        assert_eq!(
+            clock_gettime_with_writer(u64::MAX, 0, |_, _| {
+                called = true;
+                Ok(())
+            }),
+            Err(LINUX_EINVAL)
+        );
+        assert!(!called, "invalid clock_id must fail before copyout");
+
+        // Supported monotonic clocks write a 16-byte LinuxTimespecWire directly
+        // without pre-validating via ProcessStateLock.
+        for id in [
+            linux_abi::CLOCK_MONOTONIC,
+            CLOCK_MONOTONIC_RAW,
+            CLOCK_MONOTONIC_COARSE,
+            CLOCK_BOOTTIME,
+        ] {
+            let mut captured = [0_u8; 16];
+            let mut written_ptr = 0_u64;
+            assert_eq!(
+                clock_gettime_with_writer(id, 0x7fff_0000_1000, |ptr, bytes| {
+                    written_ptr = ptr;
+                    assert_eq!(bytes.len(), size_of::<LinuxTimespecWire>());
+                    captured.copy_from_slice(bytes);
+                    Ok(())
+                }),
+                Ok(())
+            );
+            assert_eq!(written_ptr, 0x7fff_0000_1000);
+            let ts: LinuxTimespecWire = read_unaligned(&captured);
+            assert!(ts.tv_sec >= 0);
+            assert!((0..1_000_000_000).contains(&ts.tv_nsec));
+        }
+
+        // Faulting / NULL output buffer propagates EFAULT from copyout.
+        assert_eq!(
+            clock_gettime_with_writer(linux_abi::CLOCK_MONOTONIC, 0, |ptr, _| {
+                if ptr == 0 { Err(LINUX_EFAULT) } else { Ok(()) }
+            }),
+            Err(LINUX_EFAULT)
+        );
     }
 }

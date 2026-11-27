@@ -1,14 +1,18 @@
 //! Exact index of central bitmap words containing at least one free frame.
 //!
-//! Every bit at level zero names a non-full `used` word. Each higher level
-//! names nonempty words in the level below. The central allocator owns all
-//! updates; this index is never read by lock-free cache release. Its backing
-//! lives after the two reserved frame bitmaps, before the heap exists.
-//!
-//! A freed low-address island can rewind the allocation cursor. Once that
-//! island is consumed, finding the next free word must not reread thousands
-//! of full words while holding the IRQ-off central lock. Lookup ascends and
-//! descends this hierarchy instead, without skipping any allocatable frame.
+//! - **Owner:** `kernel-mm` central physical frame allocator owns the multi-level
+//!   summary bitmaps placed right after the reserved frame bitmaps.
+//! - **Boundary:** Tracks only central `used` bitmap word emptiness/non-emptiness
+//!   for `DIRECT_MAP_PHYS_LIMIT`.
+//! - **Lifecycle:** Initialized before heap startup from central bitmap state
+//!   and updated monotonically as bitmap words transition empty <-> non-empty.
+//! - **Concurrency:** Accessed solely while holding the IRQ-off central frame
+//!   allocator lock; lock-free caches never touch this index.
+//! - **Failure:** Out-of-range word indices are clamped/rejected and empty levels
+//!   return `None` without skipping allocatable low/high words.
+//! - **Forbidden:** Unsynchronized concurrent mutation outside central lock or
+//!   stale set bits pointing at full bitmap words.
+//! - **Evidence:** `kernel-mm` `free_word_index` unit tests and allocator invariants.
 
 use super::{BITS_PER_WORD, BitmapView, DIRECT_MAP_PHYS_LIMIT, PAGE_SIZE};
 
@@ -118,6 +122,397 @@ impl FreeWordIndex {
             depth += 1;
         }
         None
+    }
+}
+
+/// Number of sub-word/cross-word run orders tracked over central bitmap words:
+/// orders 0..=6 correspond to runs of length `>= 1, 2, 4, 8, 16, 32, 64`.
+pub(super) const RUN_ORDERS: usize = 7;
+pub(super) const MAX_RUN_ORDER: usize = RUN_ORDERS - 1;
+
+/// Thresholds of consecutive completely-free central words (`used[w] == 0`)
+/// indexed by `all_free_orders`. Order 3 (`7` words) is the exact minimum
+/// full-word core required by any 512-page (2 MiB) contiguous run.
+const ALL_FREE_THRESHOLDS: [usize; 5] = [1, 2, 4, 7, 16];
+
+/// Returns `(order_index, threshold_words)` for the tightest tracked all-free
+/// threshold `<= min_full_words`. Requires `min_full_words >= 1`.
+#[inline]
+pub(super) const fn all_free_order_for(min_full_words: usize) -> (usize, usize) {
+    if min_full_words >= 16 {
+        (4, 16)
+    } else if min_full_words >= 7 {
+        (3, 7)
+    } else if min_full_words >= 4 {
+        (2, 4)
+    } else if min_full_words >= 2 {
+        (1, 2)
+    } else {
+        (0, 1)
+    }
+}
+
+/// Bitmask of orders `0..RUN_ORDERS` for which at least one free run of length
+/// `>= (1 << order)` starts at some bit `0..64` of the current word.
+#[inline]
+fn run_order_mask(free_w: u64, free_next: u64) -> u8 {
+    if free_w == 0 {
+        return 0;
+    }
+    let r1 = (free_w as u128) | ((free_next as u128) << BITS_PER_WORD);
+    let r2 = r1 & (r1 >> 1);
+    if (r2 as u64) == 0 {
+        return 0b0000_0001;
+    }
+    let r4 = r2 & (r2 >> 2);
+    if (r4 as u64) == 0 {
+        return 0b0000_0011;
+    }
+    let r8 = r4 & (r4 >> 4);
+    if (r8 as u64) == 0 {
+        return 0b0000_0111;
+    }
+    let r16 = r8 & (r8 >> 8);
+    if (r16 as u64) == 0 {
+        return 0b0000_1111;
+    }
+    let r32 = r16 & (r16 >> 16);
+    if (r32 as u64) == 0 {
+        return 0b0001_1111;
+    }
+    let r64 = r32 & (r32 >> 32);
+    if (r64 as u64) == 0 {
+        return 0b0011_1111;
+    }
+    0b0111_1111
+}
+
+/// Bit `i` (for `0 <= i < 64`) of the returned `u64` is 1 iff bits `[i, i + k)`
+/// of `(free_w | (free_next << 64))` are all 1. Requires `1 <= k <= 64`.
+#[inline]
+pub(super) fn exact_run_starts_in_word(free_w: u64, free_next: u64, k: usize) -> u64 {
+    debug_assert!((1..=BITS_PER_WORD).contains(&k));
+    let mut acc = u128::MAX;
+    let mut pow = (free_w as u128) | ((free_next as u128) << BITS_PER_WORD);
+    let mut rem = k;
+    let mut shift = 0_u32;
+    let mut step = 1_u32;
+    while rem != 0 {
+        if rem & 1 != 0 {
+            acc &= pow >> shift;
+            shift += step;
+        }
+        rem >>= 1;
+        if rem != 0 {
+            pow &= pow >> step;
+            step <<= 1;
+        }
+    }
+    acc as u64
+}
+
+/// Bitmask of `ALL_FREE_THRESHOLDS` entries for which at least one run of that
+/// many consecutive all-free central words starts inside `af_w`.
+#[inline]
+fn all_free_order_mask(af_w: u64, af_next: u64) -> u8 {
+    if af_w == 0 {
+        return 0;
+    }
+    let r1 = (af_w as u128) | ((af_next as u128) << BITS_PER_WORD);
+    let r2 = r1 & (r1 >> 1);
+    if (r2 as u64) == 0 {
+        return 0b00001;
+    }
+    let r4 = r2 & (r2 >> 2);
+    if (r4 as u64) == 0 {
+        return 0b00011;
+    }
+    let r7 = r4 & (r2 >> 4) & (r1 >> 6);
+    if (r7 as u64) == 0 {
+        return 0b00111;
+    }
+    let r8 = r4 & (r4 >> 4);
+    let r16 = r8 & (r8 >> 8);
+    if (r16 as u64) == 0 {
+        return 0b01111;
+    }
+    0b11111
+}
+
+/// Bit `i` (for `0 <= i < 64`) is 1 iff at least `ALL_FREE_THRESHOLDS[order]`
+/// consecutive all-free words start at bit `i` of `af_w`.
+#[inline]
+fn all_free_starts_in_word(af_w: u64, af_next: u64, order: usize) -> u64 {
+    let r1 = (af_w as u128) | ((af_next as u128) << BITS_PER_WORD);
+    match order {
+        0 => r1 as u64,
+        1 => (r1 & (r1 >> 1)) as u64,
+        2 => {
+            let r2 = r1 & (r1 >> 1);
+            (r2 & (r2 >> 2)) as u64
+        }
+        3 => {
+            let r2 = r1 & (r1 >> 1);
+            let r4 = r2 & (r2 >> 2);
+            (r4 & (r2 >> 4) & (r1 >> 6)) as u64
+        }
+        4 => {
+            let r2 = r1 & (r1 >> 1);
+            let r4 = r2 & (r2 >> 2);
+            let r8 = r4 & (r4 >> 4);
+            (r8 & (r8 >> 8)) as u64
+        }
+        _ => unreachable!("all-free order out of range"),
+    }
+}
+
+/// Multi-order hierarchical index over the central `used` bitmap.
+///
+/// - `orders[0..=6]` track central bitmap words where a contiguous free run of
+///   length `>= 1, 2, 4, 8, 16, 32, 64` starts (including runs crossing into
+///   the immediately following word). `orders[0]` is the exact non-full-word
+///   index used by single-frame allocation and cache refill.
+/// - `all_free` is a 1-bit-per-word bitmap of completely free central words
+///   (`used[w] == 0`), indexed by `all_free_orders[0..=4]` for consecutive runs
+///   of `1, 2, 4, 7, 16` all-free words so large contiguous searches (including
+///   512-page / 2 MiB runs) skip fragmented islands in `O(log N)`.
+pub(super) struct FreeRunIndex {
+    orders: [FreeWordIndex; RUN_ORDERS],
+    all_free: BitmapView,
+    all_free_orders: [FreeWordIndex; ALL_FREE_THRESHOLDS.len()],
+}
+
+impl FreeRunIndex {
+    pub(super) const EMPTY: Self = Self {
+        orders: [FreeWordIndex::EMPTY; RUN_ORDERS],
+        all_free: BitmapView::EMPTY,
+        all_free_orders: [FreeWordIndex::EMPTY; ALL_FREE_THRESHOLDS.len()],
+    };
+
+    pub(super) fn backing_words(bitmap_words: usize) -> Option<usize> {
+        let per_order = FreeWordIndex::backing_words(bitmap_words)?;
+        let orders_total = per_order.checked_mul(RUN_ORDERS)?;
+        let all_free_words = bitmap_words.div_ceil(BITS_PER_WORD);
+        let per_af_order = FreeWordIndex::backing_words(all_free_words)?;
+        let af_orders_total = per_af_order.checked_mul(ALL_FREE_THRESHOLDS.len())?;
+        orders_total
+            .checked_add(all_free_words)?
+            .checked_add(af_orders_total)
+    }
+
+    /// # Safety
+    /// `backing` names at least `backing_words(bitmap_words)` aligned, zeroed
+    /// words that outlive the allocator and have no other mutable owner.
+    pub(super) unsafe fn from_raw(backing: *mut u64, bitmap_words: usize) -> Self {
+        let required = Self::backing_words(bitmap_words).expect("physical free-run index too large");
+        let per_order = FreeWordIndex::backing_words(bitmap_words)
+            .expect("physical free-word index too large");
+        let all_free_words = bitmap_words.div_ceil(BITS_PER_WORD);
+        let per_af_order = FreeWordIndex::backing_words(all_free_words)
+            .expect("physical all-free index too large");
+        let mut index = Self::EMPTY;
+        let mut offset = 0;
+        for order in 0..RUN_ORDERS {
+            // SAFETY: disjoint prefix of the caller's zeroed backing span.
+            index.orders[order] =
+                unsafe { FreeWordIndex::from_raw(backing.add(offset), bitmap_words) };
+            offset += per_order;
+        }
+        // SAFETY: disjoint prefix of the caller's zeroed backing span.
+        index.all_free = BitmapView::from_raw(unsafe { backing.add(offset) }, all_free_words);
+        offset += all_free_words;
+        for af_order in 0..ALL_FREE_THRESHOLDS.len() {
+            // SAFETY: disjoint prefix of the caller's zeroed backing span.
+            index.all_free_orders[af_order] =
+                unsafe { FreeWordIndex::from_raw(backing.add(offset), all_free_words) };
+            offset += per_af_order;
+        }
+        assert_eq!(offset, required);
+        index
+    }
+
+    /// Updates all summary levels after `used[word_index]` changed from
+    /// `before` to `after`. Only touches higher levels on predicate edges.
+    #[inline]
+    pub(super) fn on_used_word_changed(
+        &mut self,
+        used: BitmapView,
+        word_index: usize,
+        before: u64,
+        after: u64,
+    ) {
+        if before == after {
+            return;
+        }
+        let free_next = if word_index + 1 < used.words {
+            !used.load_word(word_index + 1)
+        } else {
+            0
+        };
+        let old_mask = run_order_mask(!before, free_next);
+        let new_mask = run_order_mask(!after, free_next);
+        self.apply_order_diff(word_index, old_mask, new_mask);
+
+        if word_index > 0 {
+            let prev_used = used.load_word(word_index - 1);
+            if prev_used & (1_u64 << (BITS_PER_WORD - 1)) == 0 {
+                let free_prev = !prev_used;
+                let old_prev = run_order_mask(free_prev, !before);
+                let new_prev = run_order_mask(free_prev, !after);
+                self.apply_order_diff(word_index - 1, old_prev, new_prev);
+            }
+        }
+
+        if (before == 0) != (after == 0) {
+            let af_word = word_index / BITS_PER_WORD;
+            let af_bit = 1_u64 << (word_index % BITS_PER_WORD);
+            let af_before = self.all_free.load_word(af_word);
+            let af_after = if after == 0 {
+                af_before | af_bit
+            } else {
+                af_before & !af_bit
+            };
+            if af_before != af_after {
+                self.all_free.store_word(af_word, af_after);
+                let af_next = if af_word + 1 < self.all_free.words {
+                    self.all_free.load_word(af_word + 1)
+                } else {
+                    0
+                };
+                self.apply_af_diff(
+                    af_word,
+                    all_free_order_mask(af_before, af_next),
+                    all_free_order_mask(af_after, af_next),
+                );
+                if af_word > 0 {
+                    let af_prev = self.all_free.load_word(af_word - 1);
+                    if af_prev & (1_u64 << (BITS_PER_WORD - 1)) != 0 {
+                        self.apply_af_diff(
+                            af_word - 1,
+                            all_free_order_mask(af_prev, af_before),
+                            all_free_order_mask(af_prev, af_after),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn apply_order_diff(&mut self, word_index: usize, old_mask: u8, new_mask: u8) {
+        let mut diff = old_mask ^ new_mask;
+        while diff != 0 {
+            let order = diff.trailing_zeros() as usize;
+            diff &= diff - 1;
+            self.orders[order].set_available(word_index, (new_mask & (1_u8 << order)) != 0);
+        }
+    }
+
+    #[inline]
+    fn apply_af_diff(&mut self, af_word: usize, old_mask: u8, new_mask: u8) {
+        let mut diff = old_mask ^ new_mask;
+        while diff != 0 {
+            let order = diff.trailing_zeros() as usize;
+            diff &= diff - 1;
+            self.all_free_orders[order]
+                .set_available(af_word, (new_mask & (1_u8 << order)) != 0);
+        }
+    }
+
+    /// Returns the first non-full central word at or after `first` (order 0).
+    #[inline]
+    pub(super) fn next_available(&self, first: usize, words_read: &mut usize) -> Option<usize> {
+        self.orders[0].next_available(first, words_read)
+    }
+
+    /// Returns the first central word `>= first` where a free run of length
+    /// `>= (1 << order)` starts.
+    #[inline]
+    pub(super) fn next_word_with_run_order(
+        &self,
+        order: usize,
+        first: usize,
+        words_read: &mut usize,
+    ) -> Option<usize> {
+        self.orders[order].next_available(first, words_read)
+    }
+
+    /// Returns the first central word index `>= first_word` that starts a run
+    /// of at least `ALL_FREE_THRESHOLDS[af_order]` consecutive all-free words.
+    pub(super) fn next_all_free_run(
+        &self,
+        af_order: usize,
+        first_word: usize,
+        words_read: &mut usize,
+    ) -> Option<usize> {
+        let af_word = first_word / BITS_PER_WORD;
+        if af_word >= self.all_free.words {
+            return None;
+        }
+        *words_read += 1;
+        let af_cur = self.all_free.load_word(af_word);
+        let af_next = if af_word + 1 < self.all_free.words {
+            *words_read += 1;
+            self.all_free.load_word(af_word + 1)
+        } else {
+            0
+        };
+        let starts = all_free_starts_in_word(af_cur, af_next, af_order)
+            & (u64::MAX << (first_word % BITS_PER_WORD));
+        if starts != 0 {
+            return Some(af_word * BITS_PER_WORD + starts.trailing_zeros() as usize);
+        }
+        let next_af_word =
+            self.all_free_orders[af_order].next_available(af_word + 1, words_read)?;
+        *words_read += 1;
+        let cur = self.all_free.load_word(next_af_word);
+        let next = if next_af_word + 1 < self.all_free.words {
+            *words_read += 1;
+            self.all_free.load_word(next_af_word + 1)
+        } else {
+            0
+        };
+        let starts = all_free_starts_in_word(cur, next, af_order);
+        assert_ne!(starts, 0, "all-free run index names an empty summary word");
+        Some(next_af_word * BITS_PER_WORD + starts.trailing_zeros() as usize)
+    }
+}
+
+#[cfg(test)]
+impl FreeRunIndex {
+    pub(super) fn assert_matches_bitmap(&self, used: BitmapView) {
+        let words = used.words;
+        for order in 0..RUN_ORDERS {
+            let need = 1_usize << order;
+            for first in 0..=words {
+                let expected = (first..words).find(|&w| {
+                    let free_w = !used.load_word(w);
+                    let free_next = if w + 1 < words { !used.load_word(w + 1) } else { 0 };
+                    exact_run_starts_in_word(free_w, free_next, need) != 0
+                });
+                let mut reads = 0;
+                assert_eq!(
+                    self.orders[order].next_available(first, &mut reads),
+                    expected,
+                    "order {order} mismatch at first={first}"
+                );
+                assert!(reads <= 2 * MAX_LEVELS - 1);
+            }
+        }
+        for (af_order, &threshold) in ALL_FREE_THRESHOLDS.iter().enumerate() {
+            for first in 0..=words {
+                let expected = (first..words).find(|&w| {
+                    w + threshold <= words && (w..w + threshold).all(|k| used.load_word(k) == 0)
+                });
+                let mut reads = 0;
+                assert_eq!(
+                    self.next_all_free_run(af_order, first, &mut reads),
+                    expected,
+                    "all-free order {af_order} (threshold={threshold}) mismatch at first={first}"
+                );
+                assert!(reads <= 2 * MAX_LEVELS + 3);
+            }
+        }
     }
 }
 

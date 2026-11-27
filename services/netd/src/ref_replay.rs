@@ -1,4 +1,19 @@
 //! Reference mutation (dup/close) operation-id replay log and ACK handling.
+//!
+//! - **Owner:** `netd` owns the per-`(pid, operation_hi, operation_lo)` replay
+//!   ledger and reserved capacity for kernel-originated socket custody releases.
+//! - **Boundary:** Validates authenticated IPC sender PID, non-zero 128-bit
+//!   operation ID, operation code, and socket token before replay or ACK.
+//! - **Lifecycle:** Records initial committed DUP/CLOSE outcomes, replays exact
+//!   matches on retry, and retires entries only upon explicit exact ACK/batch.
+//! - **Concurrency:** Serialized under the `ref_replay_log()` mutex across
+//!   dispatcher worker turns.
+//! - **Failure:** Operation aliasing, malformed requests, or unreserved user
+//!   table saturation return explicit errno without evicting unresolved custody.
+//! - **Forbidden:** Evicting un-acknowledged replay records, accepting zero
+//!   operation IDs, or cross-PID alias matches.
+//! - **Evidence:** `service-mutation-recovery/ServiceMutationRecovery` and
+//!   `netd` `ref_replay_tests`.
 
 use super::*;
 

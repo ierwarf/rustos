@@ -40,9 +40,10 @@ use crate::gpu_scene::{
     GpuTextureCapability,
 };
 use crate::render::{
-    ConsoleAtlasBinding, CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene,
-    WaylandAtlasBinding, build_gpu_atlas_scene, gpu_cursor_layer, gpu_dock_reuse_signature,
-    gpu_scene_reuse_signature, update_console_gpu_textures, update_cropped_console_textures,
+    AtlasRegionEntry, AtlasRegionKind, ConsoleAtlasBinding, CroppedConsoleBinding,
+    CroppedWaylandBinding, GpuAtlasScene, WaylandAtlasBinding, build_gpu_atlas_scene,
+    cursor_region_kind, gpu_cursor_layer, gpu_dock_reuse_signature, gpu_scene_reuse_signature,
+    update_console_gpu_textures, update_cropped_console_textures, update_cropped_dock_texture,
     update_cropped_wayland_textures, update_dock_gpu_texture, update_gpu_cursor_texture,
     update_gpu_layer_destinations, update_wayland_gpu_textures,
 };
@@ -167,7 +168,10 @@ pub(crate) struct GpuCompositor {
     atlas_used_height: usize,
     scratch_used_height: usize,
     dock_source_rect: Option<Rect>,
+    cropped_dock_destination: Rect,
+    cropped_dock_fragments: Vec<(Rect, Rect)>,
     retained_dock_signature: u64,
+    retained_regions: Vec<AtlasRegionEntry>,
     layers: Vec<GpuSceneLayer>,
     submission_layers: Vec<GpuSceneLayer>,
     submission_batch: GpuSceneBatch,
@@ -239,6 +243,19 @@ impl GpuCompositorRuntime {
             Self::SoftwareFallback => true,
             Self::Waiting { .. } => false,
             Self::Active(compositor) => compositor.active,
+        }
+    }
+
+    /// Next pacing deadline when an active GPU compositor deferred submission
+    /// solely for its frame interval. Returning `Some(deadline)` lets the UI
+    /// loop park cleanly until either that deadline or an input/Wayland wake
+    /// instead of spin-sleeping on a 1 ms timer.
+    pub(crate) fn next_retry_deadline(&self, now: Instant) -> Option<Instant> {
+        match self {
+            Self::Active(compositor) if compositor.active && compositor.next_submission_at > now => {
+                Some(compositor.next_submission_at)
+            }
+            _ => None,
         }
     }
 
@@ -609,7 +626,10 @@ impl GpuCompositor {
                 atlas_used_height: info.atlas_height as usize,
                 scratch_used_height: info.atlas_height as usize,
                 dock_source_rect: None,
+                cropped_dock_destination: Rect::empty(),
+                cropped_dock_fragments: Vec::new(),
                 retained_dock_signature: 0,
+                retained_regions: Vec::new(),
                 layers: Vec::new(),
                 submission_layers: Vec::new(),
                 submission_batch: GpuSceneBatch::empty(),
@@ -776,34 +796,64 @@ impl GpuCompositor {
                     } else {
                         full_rebuild = true;
                     }
+                } else if self.cropped {
+                    match update_cropped_dock_texture(
+                        state,
+                        self.atlas.as_mut_slice(),
+                        self.info.atlas_width as usize,
+                        self.info.atlas_height as usize,
+                        stride_pixels,
+                        self.cropped_dock_destination,
+                        self.cropped_dock_fragments.as_slice(),
+                    )
+                    .map_err(gpu_scene_errno)?
+                    {
+                        Some(changed) => {
+                            damage.extend(changed.into_iter().map(damage_from_rect));
+                            self.retained_dock_signature = current_dock_signature;
+                        }
+                        None => full_rebuild = true,
+                    }
                 } else {
                     full_rebuild = true;
                 }
             }
-            if full_rebuild {
+            if !full_rebuild {
+                sync_retained_region_versions(
+                    self.retained_regions.as_mut_slice(),
+                    state,
+                    self.retained_dock_signature,
+                );
+            } else {
                 // Earlier patch functions may already have changed the local
                 // atlas before a later binding rejects reuse. A diff against
                 // that partially updated atlas cannot describe the published
                 // predecessor, so carry a full snapshot into the history too.
                 self.force_full_snapshot = true;
+                self.retained_regions.clear();
             }
         }
         if full_rebuild {
             crate::note_present_step(crate::PRESENT_STEP_SCENE);
+            let incremental =
+                self.active && !self.force_full_snapshot && !self.retained_regions.is_empty();
             let allocate_started = Instant::now();
-            let clear_len = self
-                .scratch_used_height
-                .min(self.info.atlas_height as usize)
-                .saturating_mul(stride_pixels)
-                .min(self.scratch_atlas.len());
-            self.scratch_atlas[..clear_len].fill(0);
-            // A rejected build can leave partially placed regions anywhere in
-            // the scratch atlas; only a completed build (below) knows the
-            // true extent, so assume the whole atlas is dirty until then.
-            self.scratch_used_height = self.info.atlas_height as usize;
+            if !incremental {
+                let clear_len = self
+                    .scratch_used_height
+                    .min(self.info.atlas_height as usize)
+                    .saturating_mul(stride_pixels)
+                    .min(self.scratch_atlas.len());
+                self.scratch_atlas[..clear_len].fill(0);
+                // A rejected build can leave partially placed regions anywhere in
+                // the scratch atlas; only a completed build (below) knows the
+                // true extent, so assume the whole atlas is dirty until then.
+                self.scratch_used_height = self.info.atlas_height as usize;
+            }
             rebuild_allocate_elapsed = allocate_started.elapsed();
             let capability = self.capability_for_slot(slot_index, self.next_content_epoch)?;
             let scene_started = Instant::now();
+            let mut used_incremental = incremental;
             let GpuAtlasScene {
                 layers,
                 cursor_source_rect,
@@ -815,6 +865,11 @@ impl GpuCompositor {
                 cropped,
                 used_height: next_used_height,
                 dock_source_rect,
+                cropped_dock_destination,
+                cropped_dock_fragments,
+                regions: next_regions,
+                changed_outer_rects,
+                border_only_rects,
             } = match build_gpu_atlas_scene(
                 state,
                 self.scratch_atlas.as_mut_slice(),
@@ -823,8 +878,12 @@ impl GpuCompositor {
                 stride_pixels,
                 capability,
                 self.cropped && current_scene_signature == self.retained_scene_signature,
+                incremental.then_some(self.retained_regions.as_slice()),
             ) {
-                Ok(scene) => scene,
+                Ok(scene) => {
+                    self.capacity_pressure_logged_at = None;
+                    scene
+                }
                 Err(GpuSceneError::SceneNotReady) if !self.active => {
                     if Instant::now() >= self.activation_deadline {
                         debug_line("uiserver: first GPU frame readiness timed out");
@@ -837,54 +896,82 @@ impl GpuCompositor {
                     return Ok(None);
                 }
                 Err(error @ (GpuSceneError::AtlasFull | GpuSceneError::CommandLimit)) => {
-                    // A capacity rejection is NOT a submitted scene. Keep the
-                    // previous complete front, timeline and damage history;
-                    // retry the coalesced update after the normal frame rail.
-                    // A prior incremental attempt may have touched local
-                    // pixels, so recovery must publish a complete snapshot.
-                    self.force_full_snapshot = true;
-                    self.next_submission_at = Instant::now() + GPU_FRAME_INTERVAL;
+                    used_incremental = false;
                     let now = Instant::now();
                     if self
                         .capacity_pressure_logged_at
                         .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
                     {
                         diag_line(format!(
-                            "uiserver: gpu scene backpressured capacity={error:?}; retaining previous complete frame"
+                            "uiserver: gpu scene capacity={error:?}; falling back to bounded composited scene"
                         ));
                         self.capacity_pressure_logged_at = Some(now);
                     }
-                    return Err(EAGAIN);
+                    self.scratch_atlas.fill(0);
+                    match crate::render::build_composited_gpu_atlas_scene(
+                        state,
+                        self.scratch_atlas.as_mut_slice(),
+                        self.info.atlas_width as usize,
+                        self.info.atlas_height as usize,
+                        stride_pixels,
+                        capability,
+                    ) {
+                        Ok(scene) => scene,
+                        Err(GpuSceneError::AtlasFull | GpuSceneError::CommandLimit) => {
+                            self.force_full_snapshot = true;
+                            self.retained_regions.clear();
+                            self.next_submission_at = Instant::now() + GPU_FRAME_INTERVAL;
+                            return Err(EAGAIN);
+                        }
+                        Err(err) => return Err(gpu_scene_errno(err)),
+                    }
                 }
                 Err(err) => return Err(gpu_scene_errno(err)),
             };
-            self.capacity_pressure_logged_at = None;
             rebuild_scene_elapsed = scene_started.elapsed();
             crate::note_present_step(crate::PRESENT_STEP_DIFF);
             let difference_started = Instant::now();
-            let scan_height = self
-                .atlas_used_height
-                .max(next_used_height)
-                .min(self.info.atlas_height as usize);
             damage.clear();
-            if self.active && !self.force_full_snapshot {
-                difference_damage_into(
-                    self.atlas.as_slice(),
+            if used_incremental {
+                diff_and_commit_incremental_rebuild(
+                    self.atlas.as_mut_slice(),
                     self.scratch_atlas.as_slice(),
                     self.info.atlas_width as usize,
-                    scan_height,
+                    self.info.atlas_height as usize,
                     stride_pixels,
+                    changed_outer_rects.as_slice(),
+                    border_only_rects.as_slice(),
                     &mut damage,
                 )?;
+                self.scratch_used_height = self.info.atlas_height as usize;
+                self.atlas_used_height = self.atlas_used_height.max(next_used_height);
             } else {
-                full_atlas_damage(&mut damage, self.info.atlas_width, self.info.atlas_height);
+                let scan_height = self
+                    .atlas_used_height
+                    .max(next_used_height)
+                    .min(self.info.atlas_height as usize);
+                if self.active && !self.force_full_snapshot {
+                    difference_damage_into(
+                        self.atlas.as_slice(),
+                        self.scratch_atlas.as_slice(),
+                        self.info.atlas_width as usize,
+                        scan_height,
+                        stride_pixels,
+                        &mut damage,
+                    )?;
+                } else {
+                    full_atlas_damage(&mut damage, self.info.atlas_width, self.info.atlas_height);
+                }
+                core::mem::swap(&mut self.atlas, &mut self.scratch_atlas);
+                self.scratch_used_height = self.atlas_used_height;
+                self.atlas_used_height = next_used_height;
             }
             rebuild_difference_elapsed = difference_started.elapsed();
-            core::mem::swap(&mut self.atlas, &mut self.scratch_atlas);
-            self.scratch_used_height = self.atlas_used_height;
-            self.atlas_used_height = next_used_height;
             self.dock_source_rect = dock_source_rect;
+            self.cropped_dock_destination = cropped_dock_destination;
+            self.cropped_dock_fragments = cropped_dock_fragments;
             self.retained_dock_signature = gpu_dock_reuse_signature(state);
+            self.retained_regions = next_regions;
             self.layers = layers;
             self.cursor_source_rect = Some(cursor_source_rect);
             self.cursor_motion = state.cursor_motion;
@@ -909,6 +996,12 @@ impl GpuCompositor {
             .map_err(gpu_scene_errno)?;
             damage.push(damage_from_rect(cursor_source_rect));
             self.cursor_motion = state.cursor_motion;
+            let next_cursor_kind = cursor_region_kind(state.cursor_motion);
+            for entry in &mut self.retained_regions {
+                if matches!(entry.kind, AtlasRegionKind::Cursor { .. }) {
+                    entry.kind = next_cursor_kind;
+                }
+            }
         }
         // An empty changed rectangle carries no pixels; the wire contract
         // rejects it, and one such rectangle would end the whole present.
@@ -1324,6 +1417,177 @@ fn rebind_layers(layers: &mut [GpuSceneLayer], capability: GpuTextureCapability)
     }
 }
 
+fn sync_retained_region_versions(
+    regions: &mut [AtlasRegionEntry],
+    state: &AppState,
+    dock_signature: u64,
+) {
+    for entry in regions {
+        match entry.kind {
+            AtlasRegionKind::WaylandCsd { surface_id }
+            | AtlasRegionKind::WaylandSsd { surface_id, .. } => {
+                if let Some(window) = state
+                    .wayland_windows
+                    .iter()
+                    .find(|window| window.surface_id == surface_id)
+                {
+                    entry.content_version = window.content_version;
+                }
+            }
+            AtlasRegionKind::Console { session_handle, .. } => {
+                if let Some(window) = state
+                    .console_windows
+                    .iter()
+                    .find(|window| window.session_handle == session_handle)
+                {
+                    entry.content_version = window.surface_cache.content_version;
+                }
+            }
+            AtlasRegionKind::Dock => {
+                entry.content_version = dock_signature;
+            }
+            AtlasRegionKind::Desktop | AtlasRegionKind::Cursor { .. } => {}
+        }
+    }
+}
+
+fn push_damage_span(
+    damage: &mut Vec<DvmGpuAtlasDamage>,
+    bounds: &mut Rect,
+    collapsed: &mut bool,
+    y: usize,
+    first: usize,
+    last: usize,
+) {
+    let limit = driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize;
+    let changed = Rect {
+        x: first,
+        y,
+        width: last + 1 - first,
+        height: 1,
+    };
+    *bounds = bounds.union(changed);
+    if *collapsed {
+        damage[0] = damage_from_rect(*bounds);
+        return;
+    }
+    if let Some(band) = damage.last_mut() {
+        if band.x as usize == changed.x
+            && band.width as usize == changed.width
+            && band.y as usize + band.height as usize == y
+        {
+            band.height += 1;
+            return;
+        }
+    }
+    if damage.len() == limit {
+        damage.clear();
+        damage.push(damage_from_rect(*bounds));
+        *collapsed = true;
+    } else {
+        damage.push(damage_from_rect(changed));
+    }
+}
+
+/// Commit only the regions modified during an incremental scene rebuild into
+/// `atlas` and record their exact disjoint damage bands. Regions unchanged from
+/// the retained atlas and unused pixels outside the new layout stay untouched
+/// in `atlas` (and therefore remain identical to every GPU backing slot).
+#[allow(clippy::too_many_arguments)]
+fn diff_and_commit_incremental_rebuild(
+    atlas: &mut [u32],
+    scratch: &[u32],
+    atlas_width: usize,
+    atlas_height: usize,
+    stride: usize,
+    changed_outer_rects: &[Rect],
+    border_only_rects: &[Rect],
+    damage: &mut Vec<DvmGpuAtlasDamage>,
+) -> Result<(), i32> {
+    damage.clear();
+    if atlas.len() != scratch.len()
+        || atlas_width == 0
+        || atlas_height == 0
+        || stride < atlas_width
+        || u32::try_from(atlas_width).is_err()
+        || u32::try_from(atlas_height).is_err()
+        || (atlas_height - 1)
+            .checked_mul(stride)
+            .and_then(|row| row.checked_add(atlas_width))
+            .is_none_or(|required| required > atlas.len())
+    {
+        return Err(EINVAL);
+    }
+    let mut bounds = Rect::empty();
+    let mut collapsed = false;
+    for &outer in changed_outer_rects {
+        if outer.is_empty() {
+            continue;
+        }
+        if outer.x.checked_add(outer.width).is_none_or(|end| end > atlas_width)
+            || outer.y.checked_add(outer.height).is_none_or(|end| end > atlas_height)
+        {
+            return Err(EINVAL);
+        }
+        crate::simd::diff_and_commit_rect_u32(
+            atlas,
+            scratch,
+            outer.x,
+            outer.y,
+            outer.width,
+            outer.height,
+            stride,
+            |y, first, last| push_damage_span(damage, &mut bounds, &mut collapsed, y, first, last),
+        );
+    }
+    for &inner in border_only_rects {
+        if inner.is_empty() {
+            continue;
+        }
+        if inner.x == 0
+            || inner.y == 0
+            || inner.x + inner.width >= atlas_width
+            || inner.y + inner.height >= atlas_height
+        {
+            return Err(EINVAL);
+        }
+        let outer_x = inner.x - 1;
+        let outer_y = inner.y - 1;
+        let outer_w = inner.width + 2;
+        let outer_right = inner.x + inner.width;
+        let outer_bottom = inner.y + inner.height;
+
+        // Top and bottom 1-px padding rows.
+        for row_y in [outer_y, outer_bottom] {
+            let start = row_y * stride + outer_x;
+            let row = &mut atlas[start..start + outer_w];
+            if let Some(first) = row.iter().position(|&p| p != 0) {
+                let last = row.iter().rposition(|&p| p != 0).unwrap_or(first);
+                row[first..=last].fill(0);
+                push_damage_span(
+                    damage,
+                    &mut bounds,
+                    &mut collapsed,
+                    row_y,
+                    outer_x + first,
+                    outer_x + last,
+                );
+            }
+        }
+        // Left and right 1-px padding columns (between top and bottom rows).
+        for col_x in [outer_x, outer_right] {
+            for row_y in inner.y..inner.y + inner.height {
+                let idx = row_y * stride + col_x;
+                if atlas[idx] != 0 {
+                    atlas[idx] = 0;
+                    push_damage_span(damage, &mut bounds, &mut collapsed, row_y, col_x, col_x);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compare owned atlases without turning distant changed rows into one large
 /// upload. Equal horizontal spans merge only across adjacent changed rows;
 /// each resulting band has a disjoint Y range. If fragmentation exceeds the
@@ -1350,53 +1614,16 @@ fn difference_damage_into(
     }
     let mut bounds = Rect::empty();
     let mut collapsed = false;
-    let limit = driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize;
-    for y in 0..height {
-        // The final visible row may be truncated in a comparison slice. Only
-        // present pixels participate, and inter-row stride padding never does.
-        // The largest row offset and end were checked before entering the loop.
-        let row = y * stride;
-        let end = (row + width).min(previous.len());
-        if row >= end {
-            break;
-        }
-        let (before, after) = (&previous[row..end], &next[row..end]);
-        // Unchanged rows, nearly all of them, are one vectorised comparison.
-        if before == after {
-            continue;
-        }
-        let first = before.iter().zip(after).position(|(a, b)| a != b);
-        let last = before.iter().zip(after).rposition(|(a, b)| a != b);
-        if let (Some(first), Some(last)) = (first, last) {
-            let changed = Rect {
-                x: first,
-                y,
-                width: last + 1 - first,
-                height: 1,
-            };
-            bounds = bounds.union(changed);
-            if collapsed {
-                damage[0] = damage_from_rect(bounds);
-                continue;
-            }
-            if let Some(band) = damage.last_mut() {
-                if band.x as usize == changed.x
-                    && band.width as usize == changed.width
-                    && band.y as usize + band.height as usize == y
-                {
-                    band.height += 1;
-                    continue;
-                }
-            }
-            if damage.len() == limit {
-                damage.clear();
-                damage.push(damage_from_rect(bounds));
-                collapsed = true;
-            } else {
-                damage.push(damage_from_rect(changed));
-            }
-        }
-    }
+    crate::simd::for_each_diff_row_u32(
+        previous,
+        next,
+        0,
+        0,
+        width,
+        height,
+        stride,
+        |y, first, last| push_damage_span(damage, &mut bounds, &mut collapsed, y, first, last),
+    );
     Ok(())
 }
 

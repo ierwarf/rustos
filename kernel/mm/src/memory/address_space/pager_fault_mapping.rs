@@ -72,11 +72,10 @@ pub(super) fn with_user_table_entry_atomic<R>(
 ) -> R {
     assert!(index < ENTRIES_PER_TABLE);
     let base = kernel_vm::higher_half_addr(parent_phys.as_u64()) as *mut u64;
-    // SAFETY: the caller pins this live page-aligned table and supplied an
-    // in-range index. Derive the atomic view from the raw direct-map pointer,
-    // without first creating a shared non-atomic PageTableEntry reference to
-    // the storage we are about to mutate. All concurrent software writers use
-    // atomic entry publication while fault permits can coexist.
+    // Derive the atomic view from the raw direct-map pointer without first
+    // creating a shared non-atomic PageTableEntry reference to mutated storage.
+    // SAFETY: caller pins live page-aligned table and in-range index; all
+    // concurrent software writers and fault permits use atomic entry ops.
     let entry = unsafe { AtomicU64::from_ptr(base.add(index)) };
     f(entry)
 }

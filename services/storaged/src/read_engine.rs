@@ -61,17 +61,29 @@ pub(crate) const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const WINDOW_LIMIT: usize = 192;
 /// Read-ahead and demand fetches together stay below the transport's 64 data
 /// slots so writes and flushes are never starved of a slot.
-const IN_FLIGHT_LIMIT: usize = 48;
+const IN_FLIGHT_LIMIT: usize = 54;
 const _: () = assert!(IN_FLIGHT_LIMIT < WINDOW_LIMIT);
 const STREAM_LIMIT: usize = 8;
 const INITIAL_DEPTH: u64 = 4;
-const MAX_DEPTH: u64 = 40;
-/// A request continues a stream when it starts at most this many windows past
-/// the stream's last window, or at most `STREAM_BACKWARD_WINDOWS` before it.
-/// The backward slack absorbs several parallel readers whose adjacent chunks
-/// arrive out of order.
-const STREAM_SLACK_WINDOWS: u64 = 2;
-const STREAM_BACKWARD_WINDOWS: u64 = 4;
+const MAX_DEPTH: u64 = 48;
+/// Parallel lanes reading one multi-megabyte window arrive out of order. A
+/// cold stream only accepts tight reordering; once sequential motion is proven
+/// (`depth > 0`) a lagging lane may fall further behind without splitting into
+/// a phantom stream.
+const STREAM_COLD_BACKWARD_WINDOWS: u64 = 6;
+const STREAM_ACTIVE_BACKWARD_WINDOWS: u64 = 24;
+const STREAM_FORWARD_REORDER_WINDOWS: u64 = 6;
+/// Maximum forward gap beyond `contiguous_end` absorbed as parallel-lane
+/// reordering before treating the stream as genuinely strided and ramping down.
+const STREAM_REORDER_TOLERANCE: u64 = 5;
+/// Bound each `top_up` lock hold so one refill burst never stalls concurrent
+/// readers or the completion pump behind dozens of submit syscalls.
+const TOP_UP_BATCH_LIMIT: usize = 12;
+/// Once a bounded pump pass has collected at least one completion and checked
+/// every waited window, stop after this many consecutive pending speculative
+/// tickets so still-pending read-ahead does not trigger dozens of wasted
+/// kernel collect syscalls per wakeup.
+const EARLY_STOP_CONSECUTIVE_PENDING: usize = 3;
 const FREE_BUFFER_LIMIT: usize = 64;
 const REPORT_INTERVAL_READS: u64 = 1024;
 /// Resolved speculative windows per feedback epoch.
@@ -142,6 +154,11 @@ enum State {
         /// `None` while the pump is collecting into it.
         buf: Option<Vec<u8>>,
         stale: bool,
+        /// Monotonic submission sequence so the pump polls oldest-first
+        /// (matching FIFO DVM completions) and can stop early on pending tails.
+        submitted_seq: u64,
+        /// At least one reader is actively blocked waiting for this window.
+        waited: bool,
     },
     /// Shared so a reader can pin the bytes and copy them out without the
     /// engine lock; eviction or invalidation only drops the cache's reference.
@@ -199,6 +216,9 @@ struct Collection {
     index: u64,
     ticket: DvmBlockTicketWire,
     buf: Vec<u8>,
+    submitted_seq: u64,
+    waited: bool,
+    polled: bool,
     result: Result<bool, i32>,
 }
 
@@ -221,6 +241,11 @@ struct Window {
 
 struct Stream {
     id: u64,
+    /// Highest window index sequentially covered in the current run.
+    contiguous_end: u64,
+    /// Bit `k` (`0 <= k < 64`) marks window `contiguous_end + 1 + k` as
+    /// already observed out-of-order from a parallel lane.
+    seen_ahead: u64,
     last_window: u64,
     ahead_end: u64,
     depth: u64,
@@ -241,6 +266,7 @@ struct Inner {
     free_buffers: Vec<Vec<u8>>,
     in_flight: usize,
     stamp: u64,
+    next_submit_seq: u64,
     next_stream_id: u64,
 }
 
@@ -257,6 +283,8 @@ struct Stats {
 pub(crate) struct PumpStatus {
     pub in_flight: usize,
     pub progressed: usize,
+    pub truncated: bool,
+    pub has_waited: bool,
 }
 
 pub(crate) struct Engine {
@@ -286,6 +314,7 @@ impl Inner {
             free_buffers: Vec::new(),
             in_flight: 0,
             stamp: 0,
+            next_submit_seq: 1,
             next_stream_id: 1,
         }
     }
@@ -293,6 +322,12 @@ impl Inner {
     fn next_stamp(&mut self) -> u64 {
         self.stamp += 1;
         self.stamp
+    }
+
+    fn next_submit_seq(&mut self) -> u64 {
+        let seq = self.next_submit_seq;
+        self.next_submit_seq = self.next_submit_seq.wrapping_add(1).max(1);
+        seq
     }
 
     fn take_buffer(&mut self, len: usize) -> Vec<u8> {
@@ -329,11 +364,19 @@ impl Inner {
         let windows = core::mem::take(&mut self.windows);
         for (index, mut window) in windows {
             match window.state {
-                State::InFlight { ticket, buf, .. } => {
+                State::InFlight {
+                    ticket,
+                    buf,
+                    submitted_seq,
+                    waited,
+                    ..
+                } => {
                     window.state = State::InFlight {
                         ticket,
                         buf,
                         stale: true,
+                        submitted_seq,
+                        waited,
                     };
                     self.windows.insert(index, window);
                 }
@@ -412,24 +455,68 @@ impl Inner {
     fn note_access(&mut self, first: u64, last: u64) -> u64 {
         let stamp = self.next_stamp();
         let cap = self.depth_cap;
-        if let Some(stream) = self.streams.iter_mut().find(|s| {
-            first + STREAM_BACKWARD_WINDOWS >= s.last_window
-                && first <= s.last_window + STREAM_SLACK_WINDOWS
-        }) {
-            let skipped = first > stream.last_window + 1;
-            stream.last_window = last.max(stream.last_window);
+        let matched = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                let backward = if s.depth > 0 {
+                    STREAM_ACTIVE_BACKWARD_WINDOWS
+                } else {
+                    STREAM_COLD_BACKWARD_WINDOWS
+                };
+                first + backward >= s.last_window
+                    && first <= s.last_window + STREAM_FORWARD_REORDER_WINDOWS
+            })
+            .min_by_key(|(_, s)| first.abs_diff(s.last_window))
+            .map(|(index, _)| index);
+        if let Some(index) = matched {
+            let stream = &mut self.streams[index];
             stream.stamp = stamp;
-            if skipped {
-                // Ramp-down: windows were jumped over, so the stream is not
-                // reading what was fetched for it. Halve the depth; below the
-                // initial depth stop reading ahead until order returns.
+            stream.last_window = last.max(stream.last_window);
+            // Record any windows read beyond `contiguous_end` into the reorder
+            // bitmap, advancing `contiguous_end` across contiguous coverage.
+            let advanced_contiguous = if first <= stream.contiguous_end + 1 {
+                if last > stream.contiguous_end {
+                    let shift = last - stream.contiguous_end;
+                    stream.contiguous_end = last;
+                    stream.seen_ahead = if shift >= 64 {
+                        0
+                    } else {
+                        stream.seen_ahead >> shift
+                    };
+                    while stream.seen_ahead & 1 != 0 {
+                        stream.contiguous_end += 1;
+                        stream.seen_ahead >>= 1;
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                for w in first..=last {
+                    let offset = w.saturating_sub(stream.contiguous_end + 1);
+                    if offset < 64 {
+                        stream.seen_ahead |= 1_u64 << offset;
+                    }
+                }
+                false
+            };
+            let gap = stream.last_window.saturating_sub(stream.contiguous_end);
+            if gap > STREAM_REORDER_TOLERANCE {
+                // Ramp-down: windows were genuinely skipped beyond parallel-lane
+                // reorder slack, so the stream is striding rather than reading
+                // sequentially. Halve the depth; below the initial depth stop
+                // reading ahead until sequential order returns.
                 stream.depth /= 2;
                 if stream.depth < INITIAL_DEPTH {
                     stream.depth = 0;
                     stream.run = 1;
                 }
+                stream.contiguous_end = stream.last_window;
+                stream.seen_ahead = 0;
                 stream.ahead_end = stream.ahead_end.min(stream.last_window);
-            } else {
+            } else if advanced_contiguous {
                 stream.run = stream.run.saturating_add(1);
                 if stream.run >= 2 {
                     stream.depth = if stream.depth == 0 {
@@ -457,6 +544,8 @@ impl Inner {
         self.next_stream_id += 1;
         self.streams.push(Stream {
             id,
+            contiguous_end: last,
+            seen_ahead: 0,
             last_window: last,
             ahead_end: last,
             depth: 0,
@@ -506,6 +595,7 @@ impl Engine {
         let ticket = transport.submit_read(geometry.generation, start, blocks, byte_len)?;
         let buf = inner.take_buffer(byte_len);
         let stamp = inner.next_stamp();
+        let submitted_seq = inner.next_submit_seq();
         inner.windows.insert(
             index,
             Window {
@@ -513,6 +603,8 @@ impl Engine {
                     ticket,
                     buf: Some(buf),
                     stale: false,
+                    submitted_seq,
+                    waited: demand,
                 },
                 ahead: !demand,
                 stamp,
@@ -534,41 +626,47 @@ impl Engine {
     }
 
     /// Submits the windows `stream_id` should have in flight ahead of its read
-    /// position. Best effort: any refusal just ends the read-ahead.
+    /// position. Best effort: any refusal just ends the read-ahead. Returns
+    /// `true` if `budget` was reached with more read-ahead still desired.
     fn read_ahead<T: Transport + ?Sized>(
         &self,
         inner: &mut Inner,
         transport: &T,
         stream_id: u64,
         only_when_low: bool,
-    ) {
+        budget: usize,
+    ) -> bool {
         let Some(geometry) = inner.geometry else {
-            return;
+            return false;
         };
         let Some(stream) = inner.streams.iter().find(|s| s.id == stream_id) else {
-            return;
+            return false;
         };
         let depth = stream.depth.min(inner.depth_cap);
         if depth == 0 {
-            return;
+            return false;
         }
         let lead = stream.ahead_end.saturating_sub(stream.last_window);
-        if only_when_low && lead >= depth / 2 {
-            return;
+        let low_watermark = depth.saturating_sub((depth / 4).max(1));
+        if only_when_low && lead >= low_watermark {
+            return false;
         }
         let target = (stream.last_window + depth).min(geometry.last_window());
         let mut next = stream.ahead_end.max(stream.last_window) + 1;
-        while next <= target && inner.in_flight < IN_FLIGHT_LIMIT {
+        let mut submitted = 0usize;
+        while next <= target && inner.in_flight < IN_FLIGHT_LIMIT && submitted < budget {
             if !inner.windows.contains_key(&next) {
                 if !inner.make_room(false) || self.submit(inner, transport, next, false).is_err() {
                     break;
                 }
+                submitted += 1;
             }
             next += 1;
         }
         if let Some(stream) = inner.streams.iter_mut().find(|s| s.id == stream_id) {
             stream.ahead_end = stream.ahead_end.max(next - 1);
         }
+        submitted >= budget && next <= target && inner.in_flight < IN_FLIGHT_LIMIT
     }
 
     /// Reads `block_count` blocks at `lba` into `out`, returning the byte count.
@@ -621,13 +719,24 @@ impl Engine {
                 }
             }
             if fetched {
-                self.read_ahead(&mut inner, transport, stream_id, false);
+                if self.read_ahead(&mut inner, transport, stream_id, false, TOP_UP_BATCH_LIMIT) {
+                    self.topup_hint.store(true, Ordering::Relaxed);
+                }
             }
             if ready {
                 segments = self
                     .pin_segments(&mut inner, geometry, stream_id, lba, end, first, last)
                     .ok_or(libc::EIO)?;
                 break;
+            }
+            for index in first..=last {
+                if let Some(Window {
+                    state: State::InFlight { waited, .. },
+                    ..
+                }) = inner.windows.get_mut(&index)
+                {
+                    *waited = true;
+                }
             }
             let now = Instant::now();
             let Some(remaining) = deadline
@@ -687,9 +796,11 @@ impl Engine {
             .any(|s| s.id == stream_id && s.depth > 0);
         let cap = inner.depth_cap;
         let low = inner.streams.iter().any(|s| {
+            let depth = s.depth.min(cap);
             s.id == stream_id
-                && s.depth > 0
-                && s.ahead_end.saturating_sub(s.last_window) < s.depth.min(cap) / 2
+                && depth > 0
+                && s.ahead_end.saturating_sub(s.last_window)
+                    < depth.saturating_sub((depth / 4).max(1))
         });
         if low {
             // ORDERING: Relaxed; `top_up` re-reads the state under the lock.
@@ -732,8 +843,14 @@ impl Engine {
         (segments.len() == expected).then_some(segments)
     }
 
-    /// Runs after a reply has been sent: refills the read-ahead of streams whose
-    /// lead has run low, so the submit syscalls overlap the requester's own work.
+    /// Whether a stream's read-ahead lead or freed in-flight slots want `top_up`.
+    pub(crate) fn needs_top_up(&self) -> bool {
+        self.topup_hint.load(Ordering::Relaxed)
+    }
+
+    /// Runs after a reply has been sent (or after the pump completes a batch):
+    /// refills the read-ahead of streams whose lead has run low, bounded per
+    /// lock hold so submit syscalls never starve concurrent readers.
     pub(crate) fn top_up<T: Transport + ?Sized>(&self, transport: &T) {
         // ORDERING: Relaxed; the stream state itself is read under the lock.
         if !self.topup_hint.swap(false, Ordering::Relaxed) {
@@ -745,8 +862,14 @@ impl Engine {
         for (slot, stream) in ids.iter_mut().zip(&inner.streams) {
             *slot = stream.id;
         }
+        let mut more_needed = false;
         for &id in &ids[..count] {
-            self.read_ahead(&mut inner, transport, id, true);
+            if self.read_ahead(&mut inner, transport, id, true, TOP_UP_BATCH_LIMIT) {
+                more_needed = true;
+            }
+        }
+        if more_needed {
+            self.topup_hint.store(true, Ordering::Relaxed);
         }
     }
 
@@ -823,20 +946,48 @@ impl Engine {
     }
 
     /// Collects every completed in-flight window and wakes its readers.
+    #[cfg(test)]
     pub(crate) fn pump_once<T: Transport + ?Sized>(
         &self,
         transport: &T,
         scratch: &mut PumpScratch,
     ) -> PumpStatus {
+        self.pump_once_bounded(transport, scratch, false)
+    }
+
+    /// Collects completed in-flight windows, polling waited windows first and
+    /// then oldest-submitted windows in FIFO order. When `allow_early_stop` is
+    /// set and at least one completion was collected, stops after
+    /// `EARLY_STOP_CONSECUTIVE_PENDING` consecutive pending speculative tickets
+    /// so still-pending read-ahead does not pay redundant kernel collect
+    /// syscalls on every wakeup.
+    pub(crate) fn pump_once_bounded<T: Transport + ?Sized>(
+        &self,
+        transport: &T,
+        scratch: &mut PumpScratch,
+        allow_early_stop: bool,
+    ) -> PumpStatus {
         debug_assert!(scratch.batch.is_empty() && scratch.expired.is_empty());
         {
             let mut inner = self.lock();
             if inner.in_flight == 0 {
-                return PumpStatus { in_flight: 0, progressed: 0 };
+                return PumpStatus {
+                    in_flight: 0,
+                    progressed: 0,
+                    truncated: false,
+                    has_waited: false,
+                };
             }
             let now = Instant::now();
             for (index, window) in inner.windows.iter_mut() {
-                let State::InFlight { ticket, buf, .. } = &mut window.state else {
+                let State::InFlight {
+                    ticket,
+                    buf,
+                    submitted_seq,
+                    waited,
+                    ..
+                } = &mut window.state
+                else {
                     continue;
                 };
                 if now.saturating_duration_since(window.submitted) > COMPLETION_TIMEOUT {
@@ -846,16 +997,48 @@ impl Engine {
                         index: *index,
                         ticket: *ticket,
                         buf,
+                        submitted_seq: *submitted_seq,
+                        waited: *waited,
+                        polled: false,
                         result: Ok(false),
                     });
                 }
             }
         }
+        // Poll waited (reader-blocked) tickets first, then oldest-submitted
+        // speculative tickets in FIFO order to match DVM completion order.
+        scratch
+            .batch
+            .sort_unstable_by_key(|c| (!c.waited, c.submitted_seq));
         for (_, ticket) in &scratch.expired {
             transport.timed_out(*ticket);
         }
+        let mut collected = 0usize;
+        let mut consecutive_pending = 0usize;
+        let mut truncated = false;
         for collection in &mut scratch.batch {
-            collection.result = transport.try_collect(collection.ticket, &mut collection.buf);
+            if allow_early_stop
+                && !collection.waited
+                && collected > 0
+                && consecutive_pending >= EARLY_STOP_CONSECUTIVE_PENDING
+            {
+                truncated = true;
+                break;
+            }
+            let res = transport.try_collect(collection.ticket, &mut collection.buf);
+            collection.polled = true;
+            match res {
+                Ok(true) | Err(_) => {
+                    collected += 1;
+                    consecutive_pending = 0;
+                }
+                Ok(false) => {
+                    if !collection.waited {
+                        consecutive_pending += 1;
+                    }
+                }
+            }
+            collection.result = res;
         }
 
         let mut progressed = 0;
@@ -873,11 +1056,19 @@ impl Engine {
                 progressed += 1;
             }
         }
-        for Collection { index, ticket, buf, result } in scratch.batch.drain(..) {
+        for Collection {
+            index,
+            ticket,
+            buf,
+            polled,
+            result,
+            ..
+        } in scratch.batch.drain(..)
+        {
             let stamp = inner.next_stamp();
             let Some(window) = inner.windows.get_mut(&index) else {
                 // Removed while the pump held the buffer: no reader owns it.
-                if !matches!(result, Ok(true) | Err(_)) {
+                if !polled || !matches!(result, Ok(true) | Err(_)) {
                     transport.cancel(ticket);
                 }
                 inner.recycle(buf);
@@ -891,6 +1082,18 @@ impl Engine {
                 continue;
             };
             let stale = *stale;
+            if !polled {
+                if stale {
+                    transport.cancel(ticket);
+                    inner.windows.remove(&index);
+                    inner.in_flight = inner.in_flight.saturating_sub(1);
+                    inner.recycle(buf);
+                    progressed += 1;
+                } else {
+                    *slot = Some(buf);
+                }
+                continue;
+            }
             match result {
                 Ok(false) => {
                     if stale {
@@ -927,9 +1130,15 @@ impl Engine {
                 }
             }
         }
+        let has_waited = inner
+            .windows
+            .values()
+            .any(|w| matches!(w.state, State::InFlight { waited: true, .. }));
         let status = PumpStatus {
             in_flight: inner.in_flight,
             progressed,
+            truncated,
+            has_waited,
         };
         drop(inner);
         if progressed != 0 {
@@ -954,14 +1163,17 @@ impl Engine {
                 inner.depth_cap,
             )
         };
-        eprintln!(
-            "storaged: read engine reads={reads} waited={} stall_us={} demand_windows={} ahead_windows={} in_flight_peak={} streams={streams} ahead_used={used} ahead_wasted={wasted} depth_cap={cap}",
+        // Format into a single buffer so stderr emits one atomic write instead
+        // of ~22 fragmented debugcon syscalls per telemetry report.
+        let line = format!(
+            "storaged: read engine reads={reads} waited={} stall_us={} demand_windows={} ahead_windows={} in_flight_peak={} streams={streams} ahead_used={used} ahead_wasted={wasted} depth_cap={cap}\n",
             self.stats.waited.load(Ordering::Relaxed),
             self.stats.stall_ns.load(Ordering::Relaxed) / 1_000,
             self.stats.demand_windows.load(Ordering::Relaxed),
             self.stats.ahead_windows.load(Ordering::Relaxed),
             self.stats.in_flight_peak.load(Ordering::Relaxed),
         );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
     }
 }
 
@@ -1579,5 +1791,185 @@ mod tests {
         assert_eq!(status.in_flight, 0);
         assert_eq!(fake.state.lock().unwrap().timed_out.len(), 1);
         assert!(engine.lock().windows.is_empty());
+    }
+
+    #[test]
+    fn parallel_lanes_out_of_order_chunks_keep_one_stream_and_full_read_ahead() {
+        let engine = Engine::new();
+        let fake = Fake::default();
+        let geo = geometry(256 * WINDOW_BLOCKS);
+        // Simulate 4 parallel lanes reading adjacent 15-block (~60 KiB) chunks
+        // arriving in permuted groups of 4, plus an occasional lagging chunk
+        // delayed by 12 chunks.
+        with_pump(&engine, &fake, || {
+            let chunk_blocks = 15_u64;
+            let mut out = vec![0_u8; chunk_blocks as usize * BLOCK];
+            let mut order = Vec::new();
+            for group in 0..24_u64 {
+                let base = group * 4;
+                order.extend([base + 2, base, base + 3, base + 1]);
+            }
+            // Delay chunk 20 until after chunk 35 to simulate a preempted lane.
+            if let Some(pos) = order.iter().position(|&c| c == 20) {
+                order.remove(pos);
+                order.insert(36, 20);
+            }
+            for chunk in order {
+                let lba = chunk * chunk_blocks;
+                assert_eq!(
+                    engine.read(&fake, geo, lba, chunk_blocks, &mut out),
+                    Ok(chunk_blocks as usize * BLOCK)
+                );
+                expect_data(&out, lba, chunk_blocks);
+                engine.top_up(&fake);
+            }
+        });
+        let inner = engine.lock();
+        assert_eq!(
+            inner.streams.len(),
+            1,
+            "parallel lane reordering must stay on one stream instead of fragmenting"
+        );
+        assert_eq!(
+            inner.streams[0].depth, MAX_DEPTH,
+            "reordered parallel lanes must not falsely ramp down read-ahead depth"
+        );
+        let submitted = fake.submitted();
+        let unique: BTreeSet<_> = submitted.iter().collect();
+        assert_eq!(unique.len(), submitted.len(), "each window fetched once");
+    }
+
+    #[test]
+    fn bounded_pump_polls_waited_first_and_stops_early_on_pending_tail() {
+        struct SelectiveTransport {
+            state: Mutex<SelectiveState>,
+        }
+        #[derive(Default)]
+        struct SelectiveState {
+            next: u64,
+            ready_ids: BTreeSet<u64>,
+            polled_ids: Vec<u64>,
+            tickets: BTreeMap<u64, (u64, u64)>,
+        }
+        impl Transport for SelectiveTransport {
+            fn submit_read(
+                &self,
+                generation: u64,
+                lba: u64,
+                block_count: u64,
+                _byte_len: usize,
+            ) -> Result<DvmBlockTicketWire, i32> {
+                let mut state = self.state.lock().unwrap();
+                state.next += 1;
+                let id = state.next;
+                state.tickets.insert(id, (lba, block_count));
+                Ok(DvmBlockTicketWire {
+                    generation,
+                    request_id: id,
+                    data_slot: (id % 64) as u32,
+                    ..DvmBlockTicketWire::default()
+                })
+            }
+            fn try_collect(&self, ticket: DvmBlockTicketWire, buf: &mut [u8]) -> Result<bool, i32> {
+                let mut state = self.state.lock().unwrap();
+                state.polled_ids.push(ticket.request_id);
+                if !state.ready_ids.contains(&ticket.request_id) {
+                    return Ok(false);
+                }
+                let (lba, count) = state.tickets.remove(&ticket.request_id).ok_or(libc::EIO)?;
+                for block in 0..count as usize {
+                    buf[block * BLOCK..(block + 1) * BLOCK].fill((lba as usize + block) as u8);
+                }
+                Ok(true)
+            }
+            fn cancel(&self, _ticket: DvmBlockTicketWire) {}
+            fn timed_out(&self, _ticket: DvmBlockTicketWire) {}
+        }
+
+        let engine = Engine::new();
+        let transport = SelectiveTransport {
+            state: Mutex::new(SelectiveState::default()),
+        };
+        let geo = geometry(32 * WINDOW_BLOCKS);
+        {
+            let mut inner = engine.lock();
+            inner.bind(geo);
+            for index in 0..16_u64 {
+                engine.submit(&mut inner, &transport, index, false).unwrap();
+            }
+            // Mark window 15 (newest ticket, request_id=16) as actively waited.
+            if let Some(Window {
+                state: State::InFlight { waited, .. },
+                ..
+            }) = inner.windows.get_mut(&15)
+            {
+                *waited = true;
+            }
+        }
+        {
+            let mut st = transport.state.lock().unwrap();
+            // Windows 0, 1, 2 (ids 1, 2, 3) and waited window 15 (id 16) are ready;
+            // windows 3..14 (ids 4..15) are still pending.
+            st.ready_ids.extend([1, 2, 3, 16]);
+        }
+        let mut scratch = PumpScratch::default();
+        let status = engine.pump_once_bounded(&transport, &mut scratch, true);
+        assert_eq!(status.progressed, 4);
+        assert_eq!(status.in_flight, 12);
+        assert!(status.truncated);
+        assert!(!status.has_waited);
+        let polled = transport.state.lock().unwrap().polled_ids.clone();
+        // Waited window (id 16) must be polled FIRST, followed by oldest ready
+        // tickets (1, 2, 3), then exactly EARLY_STOP_CONSECUTIVE_PENDING misses.
+        assert_eq!(polled[0], 16);
+        assert_eq!(&polled[1..4], &[1, 2, 3]);
+        assert_eq!(polled.len(), 4 + EARLY_STOP_CONSECUTIVE_PENDING);
+        assert!(engine.has_ready(15));
+        assert!(engine.has_ready(0) && engine.has_ready(1) && engine.has_ready(2));
+        // Mark remaining windows ready and verify a full sweep collects all 12.
+        {
+            let mut st = transport.state.lock().unwrap();
+            for id in 4..=15 {
+                st.ready_ids.insert(id);
+            }
+        }
+        let status2 = engine.pump_once_bounded(&transport, &mut scratch, false);
+        assert_eq!(status2.progressed, 12);
+        assert_eq!(status2.in_flight, 0);
+        assert!(!status2.truncated);
+        for index in 0..16_u64 {
+            assert!(engine.has_ready(index));
+        }
+    }
+
+    #[test]
+    fn top_up_bounds_each_refill_batch_and_retains_hint_until_full() {
+        let engine = Engine::new();
+        let fake = Fake::default();
+        let geo = geometry(128 * WINDOW_BLOCKS);
+        with_pump(&engine, &fake, || {
+            let mut out = vec![0_u8; WINDOW_BYTES];
+            // Ramp stream up to full MAX_DEPTH without calling top_up yet.
+            for w in 0..8_u64 {
+                engine
+                    .read(&fake, geo, w * WINDOW_BLOCKS, WINDOW_BLOCKS, &mut out)
+                    .unwrap();
+            }
+        });
+        // Reset ahead_end back to last_window to force a full MAX_DEPTH refill.
+        {
+            let mut inner = engine.lock();
+            inner.streams[0].depth = MAX_DEPTH;
+            inner.streams[0].ahead_end = inner.streams[0].last_window;
+            engine.topup_hint.store(true, Ordering::Relaxed);
+        }
+        let before = fake.submitted().len();
+        engine.top_up(&fake);
+        let after_first = fake.submitted().len();
+        assert!(after_first - before <= TOP_UP_BATCH_LIMIT);
+        assert!(
+            engine.needs_top_up(),
+            "top_up must retain topup_hint when more windows remain below target depth"
+        );
     }
 }

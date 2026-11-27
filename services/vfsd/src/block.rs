@@ -161,9 +161,17 @@ impl BootBlockDevice {
             &mut self.bulk_response,
         ) {
             result.map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
-            self.account_bulk_progress(out.len());
+            // Parallel lanes already block across storaged IPC round trips and
+            // run demoted to user scheduling class; avoid forcing an extra
+            // `sched_yield` barrier between every 4 MiB snapshot window once
+            // demoted.
+            if !super::SNAPSHOT_WORKER_DEMOTED.load(Ordering::Relaxed) {
+                self.account_bulk_progress(out.len());
+            }
             return Ok(());
         }
+        let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK);
+        request.arg0 = self.generation;
         let mut done = 0usize;
         while done < out.len() {
             let remaining_blocks = ((out.len() - done) / self.block_size) as u64;
@@ -172,8 +180,6 @@ impl BootBlockDevice {
             let chunk_lba = lba
                 .checked_add((done / self.block_size) as u64)
                 .ok_or(StorageError::InvalidInput)?;
-            let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK);
-            request.arg0 = self.generation;
             request.arg1 = chunk_lba;
             request.arg2 = block_count;
             call_storaged_bulk(

@@ -357,16 +357,30 @@ pub(super) fn call_fixed_service_rpc_boxed<Req, Resp>(
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
 ) -> LinuxResult<alloc::boxed::Box<Resp>> {
+    call_fixed_service_rpc_boxed_with_log(service_id, request, class, timeout_ms, true)
+}
+
+pub(super) fn call_fixed_service_rpc_boxed_with_log<Req, Resp>(
+    service_id: u64,
+    request: &Req,
+    class: ipc_ops::ServiceIpcClass,
+    timeout_ms: Option<u64>,
+    log_slow: bool,
+) -> LinuxResult<alloc::boxed::Box<Resp>> {
     let bytes = match timeout_ms {
-        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
+        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline_with_log(
             service_id,
             wire_as_bytes(request),
             class,
             timeout_ms,
+            log_slow,
         )?,
-        None => {
-            ipc_ops::call_service_endpoint_with_class(service_id, wire_as_bytes(request), class)?
-        }
+        None => ipc_ops::call_service_endpoint_with_class_with_log(
+            service_id,
+            wire_as_bytes(request),
+            class,
+            log_slow,
+        )?,
     };
     decode_fixed_response_boxed::<Resp>(bytes.as_slice())
 }

@@ -1,12 +1,19 @@
 //! Anonymous 2 MiB leaves with ordinary 4 KiB frame ownership.
 //!
-//! Pagerd authorizes the size; the fault permit pins one complete private VMA.
-//! Installation claims all 512 zeroed frames and a deposited split table before
-//! its single absent-to-present PDE CAS. A lost CAS returns every unpublished
-//! claim. Normal VMA writers demote through the deposited table, so partial
-//! unmap/protect and fork never need an allocation merely to split a huge leaf.
-//! The mutation shootdown completes before any subpage rights or lifetime can
-//! be changed. Retirement visits both the deposit and all 512 frame claims.
+//! - **Owner:** `kernel-mm` owns PDE huge-leaf encoding, 512-frame ownership
+//!   claims, and pre-deposited split tables.
+//! - **Boundary:** Operates only on pagerd-authorized 2 MiB private anonymous
+//!   VMAs pinned under the fault-install permit or VMA mutation guard.
+//! - **Lifecycle:** Allocates/claims 512 zeroed frames + split table, installs
+//!   via single absent-to-present CAS, demotes via deposited table, frees both
+//!   on retirement.
+//! - **Concurrency:** Concurrent installers race on absent PDE CAS (losers
+//!   return claims); demotion completes TLB shootdown before subpage changes.
+//! - **Failure:** CAS loss or decode/deposit mismatch fails closed and returns
+//!   every unpublished frame claim without partial PTE state.
+//! - **Forbidden:** Compound non-4-KiB frame descriptors, demotion allocation,
+//!   COW huge leaves, or missing shootdown before split-table mutation.
+//! - **Evidence:** `PageTableMapTransaction` and `kernel-mm` huge-leaf tests.
 
 use core::sync::atomic::Ordering;
 

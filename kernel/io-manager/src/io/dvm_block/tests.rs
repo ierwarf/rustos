@@ -616,3 +616,54 @@ fn startup_not_ready_is_sleepable_not_a_fault_event() {
     assert!(!state.completion_or_fault_pending());
     assert!(state.ready_observed);
 }
+
+#[test]
+fn drained_uncollected_completion_keeps_wait_ready_until_finished() {
+    let (mut aperture, _registers, mut state) = test_state();
+    let t0 = state
+        .submit(7, DvmBlockOperation::Read, 0, &[], 4096, false)
+        .expect("submit first read");
+    let t1 = state
+        .submit(7, DvmBlockOperation::Read, 8, &[], 4096, false)
+        .expect("submit second read");
+    assert!(!state.completion_or_fault_pending());
+
+    let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
+    let request_bytes: [u8; DVM_BLOCK_RECORD_BYTES] = aperture_bytes(&mut aperture)
+        [request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
+        .try_into()
+        .expect("request record");
+    let request0 = DvmBlockRequest::decode(&request_bytes).expect("decode request 0");
+    let data_offset = DVM_BLOCK_DATA_OFFSET as usize
+        + (t0.data_slot as usize) * (DVM_BLOCK_DATA_SLOT_BYTES as usize);
+    aperture_bytes(&mut aperture)[data_offset..data_offset + 4096].fill(0x5a);
+
+    let completion = DvmBlockCompletion {
+        generation: request0.generation,
+        request_id: request0.request_id,
+        operation_id: request0.operation_id,
+        status: DvmBlockCompletionStatus::Success,
+        data_slot: request0.data_slot,
+        completed_bytes: request0.data_len,
+        durable_through_operation_id: request0.operation_id,
+    };
+    let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
+    aperture_bytes(&mut aperture)[completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
+        .copy_from_slice(&completion.encode());
+    let base = aperture.as_mut_ptr().cast::<u8>();
+    store_u64(base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
+    store_u64(base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
+
+    // Polling a different still-pending ticket drains `t0` out of the shared
+    // ring into `state.pending[t0.data_slot].completion` and advances
+    // `completion_consumer == producer`. `DVM_WAIT` must still report ready
+    // until `t0` is collected and finished.
+    assert_eq!(state.poll_ready(t1, 4096), Ok(DvmBlockPoll::Pending));
+    assert!(state.completion_or_fault_pending());
+
+    let mut buf = vec![0_u8; 4096];
+    assert_eq!(state.poll(t0, &mut buf), Ok(DvmBlockPoll::Completed(4096)));
+    assert!(buf.iter().all(|&b| b == 0x5a));
+    state.finish(t0).expect("finish first read");
+    assert!(!state.completion_or_fault_pending());
+}

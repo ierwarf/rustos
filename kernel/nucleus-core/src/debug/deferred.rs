@@ -1,23 +1,18 @@
 //! Deferred records for diagnostics that lost the output sink.
 //!
-//! Linux's printk never discards a record because a CPU lost the console: the
-//! record is appended to a ringbuffer and whichever CPU next owns the console
-//! emits it. The rule that makes this necessary is the same one that forbids
-//! waiting - a context serializing the console must not spin for another CPU -
-//! so the only remaining way to keep the record is to hand it on.
-//!
-//! This ring is that hand-off for the unsequenced diagnostics: a writer that
-//! cannot take the sink parks its already-rendered line here, and the next
-//! writer that does take the sink emits a bounded batch, oldest ready first,
-//! before its own. Milestones retain their unrendered record: their output
-//! sequence is allocated only while the sink is held, preserving wire order.
-//! Ready bitmaps avoid scanning every empty slot on every diagnostic. A drain
-//! budget prevents concurrent producers from extending one IRQ-masked output
-//! turn indefinitely; records beyond the budget keep their original custody.
-//!
-//! Overflow is still accounted rather than hidden. A full ring means the sink
-//! has been unavailable for longer than the ring is deep, which is a real
-//! transport failure and not something to paper over.
+//! - **Owner:** `nucleus-core::debug` owns per-CPU deferred line/milestone slots
+//!   and the sink handoff sequence counter.
+//! - **Boundary:** Accepts bounded unsequenced diagnostic lines and milestones
+//!   when the console sink cannot be acquired without spinning.
+//! - **Lifecycle:** Claims an empty slot (`SLOT_WRITING`), writes record bytes
+//!   and sequence, publishes `SLOT_READY` + per-CPU ready bit, then drains FIFO.
+//! - **Concurrency:** Per-CPU slot claims prevent cross-CPU CAS contention;
+//!   atomic state/ready-bit Release/Acquire pairs order payload publication.
+//! - **Failure:** Full per-CPU rings fail closed and increment overflow
+//!   accounting rather than overwriting parked custody.
+//! - **Forbidden:** Spinning on another CPU while holding/seeking the sink,
+//!   silently overwriting un-emitted records, or cross-CPU burst starvation.
+//! - **Evidence:** `kernel/nucleus-core` deferred ring unit tests.
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
@@ -134,13 +129,12 @@ pub(super) fn park(bytes: &[u8]) -> bool {
     }
     let cpu = DEFERRED.local_cpu();
     for (index, slot) in DEFERRED.cpu_slots[cpu][..DEFERRED_GENERAL_SLOTS_PER_CPU].iter().enumerate() {
-        // ORDERING: AcqRel claims the slot before any byte is written to it,
-        // so no drainer can observe a partially filled record.
         if slot
             .state
             .compare_exchange(
                 SLOT_EMPTY,
                 SLOT_WRITING,
+                // ORDERING: AcqRel claims the slot before any byte is written to it.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -162,6 +156,7 @@ pub(super) fn park(bytes: &[u8]) -> bool {
         }
         slot.len.store(bytes.len() as u32, Ordering::Relaxed);
         slot.kind.store(KIND_LINE, Ordering::Relaxed);
+        // ORDERING: Release makes payload fields visible before Ready state and bitmap bit.
         slot.state.store(SLOT_READY, Ordering::Release);
         // ORDERING: Release publishes this complete record to bitmap readers.
         // No drainer may inspect a Ready slot before this final publication.
@@ -180,13 +175,12 @@ pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
         DEFERRED_GENERAL_SLOTS_PER_CPU
     };
     for (index, slot) in DEFERRED.cpu_slots[cpu][..capacity].iter().enumerate() {
-        // ORDERING: AcqRel claims the slot before it is written, so no drainer
-        // can observe a partially published record.
         if slot
             .state
             .compare_exchange(
                 SLOT_EMPTY,
                 SLOT_WRITING,
+                // ORDERING: AcqRel claims the slot before it is written.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -203,6 +197,7 @@ pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
             *slot.milestone.get() = Some(parked);
         }
         slot.kind.store(KIND_MILESTONE, Ordering::Relaxed);
+        // ORDERING: Release publishes milestone payload before Ready state and bitmap bit.
         slot.state.store(SLOT_READY, Ordering::Release);
         // ORDERING: Release publishes this complete record to bitmap readers.
         // No drainer may inspect a Ready slot before this final publication.
@@ -314,6 +309,7 @@ mod tests {
         assert_eq!(emitted, 2);
         assert_eq!(seen, vec![b"first".to_vec(), b"second".to_vec()]);
         assert_eq!(drain_all(), vec![b"third".to_vec(), b"concurrent".to_vec(), b"concurrent".to_vec()]);
+        // ORDERING: test assertion under serialized mutex; Acquire observes cleared bits.
         assert!(DEFERRED.ready.iter().all(|bits| bits.load(core::sync::atomic::Ordering::Acquire) == 0));
         assert!(park(b"reused"));
         assert_eq!(drain_all(), vec![b"reused".to_vec()]);
@@ -366,6 +362,7 @@ mod tests {
             .skip(1)
             .flat_map(|slots| slots.iter())
             .filter(|slot| {
+                // ORDERING: test assertion under serialized mutex; Acquire reads published slot state.
                 slot.state.load(core::sync::atomic::Ordering::Acquire) != super::SLOT_EMPTY
             })
             .count();

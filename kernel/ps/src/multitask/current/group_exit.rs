@@ -66,6 +66,16 @@ pub(super) fn terminate_marked(pid: u64) -> Option<bool> {
         request_marked(&preemption, pid, super::current_user_id())?
     };
     wait(receipt);
+    #[cfg(not(test))]
+    if fresh {
+        // Give remote CPUs that just received reschedule IPIs for executing
+        // siblings a turn to switch off-CPU, then drain any newly quiescent
+        // deferred producers before returning to process-wide teardown.
+        super::super::yield_now();
+        let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+        scope.mask_irqs();
+        let _ = super::super::scheduler::group_exit::service_deferred(&scope);
+    }
     Some(fresh)
 }
 
@@ -128,7 +138,7 @@ fn wait(receipt: Receipt) {
         // neither raw guards nor binding loans survive the following safe point.
         let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
         scope.mask_irqs();
-        let _ = super::super::scheduler::group_exit::service(&scope);
+        let _ = super::super::scheduler::group_exit::service_deferred(&scope);
         drop(scope);
         if receipt.complete() {
             break;

@@ -60,6 +60,8 @@ const MAPPING_STATE_CLAIMED: u64 = 1;
 const MAPPING_STATE_LIVE: u64 = 2;
 const MAPPING_STATE_REPLACING: u64 = 3;
 const SHARED_LOCK_SPINS: usize = 100_000_000;
+/// Guaranteed AVL height bound for any `u32`-indexed pool (`<= 1.44 * log2(2^32) + 2`).
+const AVL_MAX_HEIGHT: usize = 48;
 
 // ORDERING: Acquire observes payload initialized before a descriptor or free-list
 // head was release-published.
@@ -394,17 +396,25 @@ impl FrameDescriptorLedger {
             .expect("lazy table is outside frame descriptors");
         assert_eq!(table.role.load(DESCRIPTOR_ACQUIRE), ROLE_LAZY_TABLE);
         assert_eq!(table.owner_or_table_head.load(Ordering::Relaxed), root_phys);
-        let mut head = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
+        let table_pfn =
+            u32::try_from(table_phys / PAGE_SIZE).expect("lazy-table frame index overflow");
+        let mut packed = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
         loop {
-            table.next_or_virtual_address.store(head, Ordering::Relaxed);
+            let head_phys = u64::from(table_head_pfn(packed)) * PAGE_SIZE;
+            let next_count = table_head_count(packed)
+                .checked_add(1)
+                .expect("lazy-table count overflow");
+            table
+                .next_or_virtual_address
+                .store(head_phys, Ordering::Relaxed);
             match root.owner_or_table_head.compare_exchange_weak(
-                head,
-                table_phys,
+                packed,
+                pack_table_head(next_count, table_pfn),
                 DESCRIPTOR_ACQ_REL,
                 DESCRIPTOR_ACQUIRE,
             ) {
                 Ok(_) => return,
-                Err(observed) => head = observed,
+                Err(observed) => packed = observed,
             }
         }
     }
@@ -436,13 +446,23 @@ impl FrameDescriptorLedger {
         }
     }
 
-    /// Counts the published lazy tables of a retiring root without allocating.
+    /// Reads the exact published lazy-table count of a root in O(1).
     fn table_count(&self, root_phys: u64) -> usize {
         let root = self
             .verify_root(root_phys)
             .expect("retired root is outside frame descriptors");
+        table_head_count(root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE)) as usize
+    }
+
+    /// Walks the lazy-table list to cross-check the O(1) tracked count in tests.
+    #[cfg(test)]
+    fn walk_table_count(&self, root_phys: u64) -> usize {
+        let root = self
+            .verify_root(root_phys)
+            .expect("retired root is outside frame descriptors");
         let maximum = self.frame_count.load(DESCRIPTOR_ACQUIRE);
-        let mut current = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
+        let mut current =
+            u64::from(table_head_pfn(root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE))) * PAGE_SIZE;
         let mut count = 0;
         while current != 0 {
             assert!(count < maximum, "frame-descriptor table cycle");
@@ -472,24 +492,35 @@ impl FrameDescriptorLedger {
         let root = self
             .verify_root(root_phys)
             .expect("retired root is outside frame descriptors");
-        let current = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
-        if current == 0 {
+        let packed = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
+        let head_pfn = table_head_pfn(packed);
+        if head_pfn == 0 {
+            assert_eq!(
+                table_head_count(packed),
+                0,
+                "empty lazy-table list retained a nonzero count"
+            );
             return None;
         }
+        let count = table_head_count(packed);
+        assert!(count != 0, "nonempty lazy-table list lost its count");
+        let current = u64::from(head_pfn) * PAGE_SIZE;
         let table = self
             .record(current)
             .expect("table descriptor points outside metadata");
         assert_eq!(table.role.load(DESCRIPTOR_ACQUIRE), ROLE_LAZY_TABLE);
         assert_eq!(table.owner_or_table_head.load(Ordering::Relaxed), root_phys);
         let next = table.next_or_virtual_address.swap(0, DESCRIPTOR_ACQ_REL);
+        let next_pfn =
+            u32::try_from(next / PAGE_SIZE).expect("next lazy-table frame index overflow");
         assert_eq!(
             root.owner_or_table_head.compare_exchange(
-                current,
-                next,
+                packed,
+                pack_table_head(count - 1, next_pfn),
                 DESCRIPTOR_ACQ_REL,
                 DESCRIPTOR_ACQUIRE
             ),
-            Ok(current),
+            Ok(packed),
             "retiring root published a table during retirement"
         );
         table.owner_or_table_head.store(0, Ordering::Relaxed);
@@ -676,13 +707,10 @@ impl FrameDescriptorLedger {
             self.release_mapping_record(mapping_id);
             return None;
         };
-        let mapping = self
-            .mapping(mapping_id)
-            .expect("claimed shared mapping escaped the boot-sized pool");
-        mapping.next.store(u64::from(head), Ordering::Relaxed);
+        let new_head = self.avl_insert_locked(head, mapping_id, (new_root, new_va, mapping_id));
         frame
             .data_leaf_count_or_map_head
-            .store(pack_shared(next_count, mapping_id), Ordering::Relaxed);
+            .store(pack_shared(next_count, new_head), Ordering::Relaxed);
         let ticket = SharedAliasTicket {
             frame_phys,
             root_phys: new_root,
@@ -984,13 +1012,11 @@ impl FrameDescriptorLedger {
             self.release_mapping_record(mapping_id);
             return Err(SharedAliasRunError::OutOfFrames);
         };
-        let mapping = self
-            .mapping(mapping_id)
-            .expect("claimed shared mapping escaped the boot-sized pool");
-        mapping.next.store(u64::from(head), Ordering::Relaxed);
+        let new_head =
+            self.avl_insert_locked(head, mapping_id, (new_root, req.new_va, mapping_id));
         frame
             .data_leaf_count_or_map_head
-            .store(pack_shared(next_count, mapping_id), Ordering::Relaxed);
+            .store(pack_shared(next_count, new_head), Ordering::Relaxed);
         Ok(SharedAliasTicket {
             frame_phys: req.frame_phys,
             root_phys: new_root,
@@ -1081,29 +1107,14 @@ impl FrameDescriptorLedger {
         }
     }
 
-    /// Unlinks a duplicate ticket known to be at the head of its locked frame's
-    /// shared list (used during reverse-order rollback inside prepare).
+    /// Unlinks a duplicate ticket from its locked frame's shared AVL tree
+    /// (used during reverse-order rollback inside prepare).
     fn cancel_shared_alias_duplicate_head(&self, ticket: SharedAliasTicket) {
-        let frame = self
-            .record(ticket.frame_phys)
-            .expect("cancelled shared alias frame disappeared");
-        let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
-        assert_eq!(shared_head(packed), ticket.mapping_id);
-        let mapping = self
-            .mapping(ticket.mapping_id)
-            .expect("cancelled shared alias mapping disappeared");
-        let next = u32::try_from(mapping.next.load(Ordering::Relaxed))
-            .expect("shared mapping next id overflow");
-        let count = shared_count(packed);
-        assert!(count >= 2);
-        frame
-            .data_leaf_count_or_map_head
-            .store(pack_shared(count - 1, next), Ordering::Relaxed);
-        self.release_mapping_record(ticket.mapping_id);
+        self.cancel_shared_alias_duplicate_any(ticket);
     }
 
     /// Unlinks a duplicate ticket at any position in its locked frame's shared
-    /// list (used by `cancel_shared_alias_run`, whose slice is in caller order).
+    /// AVL tree in `O(log S)` (used by `cancel_shared_alias_run`).
     fn cancel_shared_alias_duplicate_any(&self, ticket: SharedAliasTicket) {
         let frame = self
             .record(ticket.frame_phys)
@@ -1112,39 +1123,13 @@ impl FrameDescriptorLedger {
         let count = shared_count(packed);
         let head = shared_head(packed);
         assert!(count >= 2);
-        let mut previous = 0_u32;
-        let mut current = head;
-        let mut traversed = 0_usize;
-        let maximum = self.mapping_count.load(DESCRIPTOR_ACQUIRE);
-        while current != ticket.mapping_id {
-            traversed += 1;
-            assert!(traversed <= maximum, "shared mapping list cycle");
-            let record = self
-                .mapping(current)
-                .expect("shared mapping id escaped pool");
-            previous = current;
-            current = u32::try_from(record.next.load(Ordering::Relaxed))
-                .expect("shared mapping next id overflow");
-            assert_ne!(current, 0, "cancelled duplicate mapping was not linked");
-        }
-        let record = self
-            .mapping(ticket.mapping_id)
-            .expect("cancelled shared alias mapping disappeared");
-        let next = u32::try_from(record.next.load(Ordering::Relaxed))
-            .expect("shared mapping next id overflow");
-        if previous == 0 {
-            frame
-                .data_leaf_count_or_map_head
-                .store(pack_shared(count - 1, next), Ordering::Relaxed);
-        } else {
-            self.mapping(previous)
-                .expect("shared mapping predecessor escaped pool")
-                .next
-                .store(u64::from(next), Ordering::Relaxed);
-            frame
-                .data_leaf_count_or_map_head
-                .store(pack_shared(count - 1, head), Ordering::Relaxed);
-        }
+        let new_head = self.avl_remove_locked(
+            head,
+            (ticket.root_phys, ticket.virtual_address, ticket.mapping_id),
+        );
+        frame
+            .data_leaf_count_or_map_head
+            .store(pack_shared(count - 1, new_head), Ordering::Relaxed);
         self.release_mapping_record(ticket.mapping_id);
     }
 
@@ -1190,17 +1175,16 @@ impl FrameDescriptorLedger {
             .record(ticket.frame_phys)
             .expect("cancelled shared alias frame disappeared");
         let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
-        assert_eq!(shared_head(packed), ticket.mapping_id);
-        let mapping = self
-            .mapping(ticket.mapping_id)
-            .expect("cancelled shared alias mapping disappeared");
-        let next = u32::try_from(mapping.next.load(Ordering::Relaxed))
-            .expect("shared mapping next id overflow");
         let count = shared_count(packed);
+        let head = shared_head(packed);
         assert!(count >= 2);
+        let new_head = self.avl_remove_locked(
+            head,
+            (ticket.root_phys, ticket.virtual_address, ticket.mapping_id),
+        );
         if ticket.converted_exclusive {
             assert_eq!(count, 2);
-            assert_eq!(next, 0);
+            assert_eq!(new_head, 0);
             frame
                 .data_leaf_count_or_map_head
                 .store(0, Ordering::Relaxed);
@@ -1211,7 +1195,7 @@ impl FrameDescriptorLedger {
         } else {
             frame
                 .data_leaf_count_or_map_head
-                .store(pack_shared(count - 1, next), Ordering::Relaxed);
+                .store(pack_shared(count - 1, new_head), Ordering::Relaxed);
             frame
                 .role
                 .store(shared_live_role(ticket.kind), DESCRIPTOR_RELEASE);
@@ -1715,7 +1699,25 @@ impl FrameDescriptorLedger {
                         }
                         Some(id) => match self.mapping(id) {
                             Some(mapping) => {
-                                mapping.virtual_address.store(new_va, Ordering::Relaxed);
+                                if old_va != new_va {
+                                    let packed =
+                                        frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
+                                    let count = shared_count(packed);
+                                    let head = shared_head(packed);
+                                    let without =
+                                        self.avl_remove_locked(head, (root_phys, old_va, id));
+                                    mapping
+                                        .virtual_address
+                                        .store(pack_mapping_va(new_va, 1), Ordering::Relaxed);
+                                    let reinserted = self.avl_insert_locked(
+                                        without,
+                                        id,
+                                        (root_phys, new_va, id),
+                                    );
+                                    frame
+                                        .data_leaf_count_or_map_head
+                                        .store(pack_shared(count, reinserted), Ordering::Relaxed);
+                                }
                                 true
                             }
                             None => false,
@@ -1811,9 +1813,8 @@ impl FrameDescriptorLedger {
             let promoted_root_state = promoted.root_and_state.load(DESCRIPTOR_ACQUIRE);
             assert_eq!(promoted_root_state & MAPPING_STATE_MASK, MAPPING_STATE_LIVE);
             let promoted_root = promoted_root_state & !MAPPING_STATE_MASK;
-            let promoted_va = promoted.virtual_address.load(Ordering::Relaxed);
-            let next = u32::try_from(promoted.next.load(Ordering::Relaxed))
-                .expect("shared promotion next id overflow");
+            let promoted_va = mapping_va(promoted.virtual_address.load(Ordering::Relaxed));
+            let new_head = self.avl_remove_locked(head, (promoted_root, promoted_va, head));
             frame
                 .owner_or_table_head
                 .store(promoted_root, Ordering::Relaxed);
@@ -1822,44 +1823,13 @@ impl FrameDescriptorLedger {
                 .store(promoted_va, Ordering::Relaxed);
             frame
                 .data_leaf_count_or_map_head
-                .store(pack_shared(count - 1, next), Ordering::Relaxed);
+                .store(pack_shared(count - 1, new_head), Ordering::Relaxed);
             self.release_mapping_record(head);
         } else {
-            let mut previous = 0_u32;
-            let mut current = head;
-            let mut traversed = 0_usize;
-            while current != mapping_id {
-                traversed += 1;
-                assert!(
-                    traversed <= self.mapping_count.load(DESCRIPTOR_ACQUIRE),
-                    "shared mapping list cycle"
-                );
-                let record = self
-                    .mapping(current)
-                    .expect("shared mapping id escaped pool");
-                previous = current;
-                current = u32::try_from(record.next.load(Ordering::Relaxed))
-                    .expect("shared mapping next id overflow");
-                assert_ne!(current, 0, "shared mapping claim was not linked");
-            }
-            let record = self
-                .mapping(mapping_id)
-                .expect("shared mapping claim escaped pool");
-            let next = u32::try_from(record.next.load(Ordering::Relaxed))
-                .expect("shared mapping next id overflow");
-            if previous == 0 {
-                frame
-                    .data_leaf_count_or_map_head
-                    .store(pack_shared(count - 1, next), Ordering::Relaxed);
-            } else {
-                self.mapping(previous)
-                    .expect("shared mapping predecessor escaped pool")
-                    .next
-                    .store(u64::from(next), Ordering::Relaxed);
-                frame
-                    .data_leaf_count_or_map_head
-                    .store(pack_shared(count - 1, head), Ordering::Relaxed);
-            }
+            let new_head = self.avl_remove_locked(head, (root_phys, va, mapping_id));
+            frame
+                .data_leaf_count_or_map_head
+                .store(pack_shared(count - 1, new_head), Ordering::Relaxed);
             self.release_mapping_record(mapping_id);
         }
         if unlock {
@@ -1889,27 +1859,411 @@ impl FrameDescriptorLedger {
         {
             return Some(0);
         }
-        let mut current = shared_head(frame.data_leaf_count_or_map_head.load(Ordering::Relaxed));
-        let maximum = self.mapping_count.load(DESCRIPTOR_ACQUIRE);
-        let mut traversed = 0_usize;
+        let head = shared_head(frame.data_leaf_count_or_map_head.load(Ordering::Relaxed));
+        let mut current = head;
+        let mut depth = 0_usize;
         while current != 0 {
-            traversed += 1;
-            if traversed > maximum {
+            depth += 1;
+            if depth > AVL_MAX_HEIGHT {
                 return None;
             }
             let mapping = self.mapping(current)?;
             let root_state = mapping.root_and_state.load(DESCRIPTOR_ACQUIRE);
-            let state = root_state & MAPPING_STATE_MASK;
-            let root = root_state & !MAPPING_STATE_MASK;
-            if (state == MAPPING_STATE_LIVE || state == MAPPING_STATE_REPLACING)
-                && root == root_phys
-                && mapping.virtual_address.load(Ordering::Relaxed) == va
-            {
-                return Some(current);
+            let node_root = root_state & !MAPPING_STATE_MASK;
+            let node_va = mapping_va(mapping.virtual_address.load(Ordering::Relaxed));
+            match (root_phys, va).cmp(&(node_root, node_va)) {
+                core::cmp::Ordering::Less => {
+                    current = mapping_left(mapping.next.load(Ordering::Relaxed));
+                }
+                core::cmp::Ordering::Greater => {
+                    current = mapping_right(mapping.next.load(Ordering::Relaxed));
+                }
+                core::cmp::Ordering::Equal => {
+                    let state = root_state & MAPPING_STATE_MASK;
+                    if state == MAPPING_STATE_LIVE || state == MAPPING_STATE_REPLACING {
+                        return Some(current);
+                    }
+                    // A CLAIMED entry temporarily shares `(root_phys, va)`;
+                    // scan only the equal-key range in-order.
+                    return self.find_equal_live_mapping_locked(head, root_phys, va);
+                }
             }
-            current = u32::try_from(mapping.next.load(Ordering::Relaxed)).ok()?;
         }
         None
+    }
+
+    /// Fallback when a `MAPPING_STATE_CLAIMED` record collides on `(root_phys, va)`:
+    /// finds the lower bound `(root_phys, va, 0)` and walks equal keys in-order
+    /// without recursion or allocation.
+    fn find_equal_live_mapping_locked(
+        &self,
+        head: u32,
+        root_phys: u64,
+        va: u64,
+    ) -> Option<u32> {
+        let mut stack = [0_u32; AVL_MAX_HEIGHT];
+        let mut sp = 0_usize;
+        let mut cur = head;
+        while cur != 0 {
+            let mapping = self.mapping(cur)?;
+            let node_root = mapping.root_and_state.load(DESCRIPTOR_ACQUIRE) & !MAPPING_STATE_MASK;
+            let node_va = mapping_va(mapping.virtual_address.load(Ordering::Relaxed));
+            if (node_root, node_va) >= (root_phys, va) {
+                if sp >= AVL_MAX_HEIGHT {
+                    return None;
+                }
+                stack[sp] = cur;
+                sp += 1;
+                cur = mapping_left(mapping.next.load(Ordering::Relaxed));
+            } else {
+                cur = mapping_right(mapping.next.load(Ordering::Relaxed));
+            }
+        }
+        while sp > 0 {
+            sp -= 1;
+            let id = stack[sp];
+            let mapping = self.mapping(id)?;
+            let root_state = mapping.root_and_state.load(DESCRIPTOR_ACQUIRE);
+            let node_root = root_state & !MAPPING_STATE_MASK;
+            let node_va = mapping_va(mapping.virtual_address.load(Ordering::Relaxed));
+            if (node_root, node_va) != (root_phys, va) {
+                break;
+            }
+            let state = root_state & MAPPING_STATE_MASK;
+            if state == MAPPING_STATE_LIVE || state == MAPPING_STATE_REPLACING {
+                return Some(id);
+            }
+            let mut next = mapping_right(mapping.next.load(Ordering::Relaxed));
+            while next != 0 {
+                if sp >= AVL_MAX_HEIGHT {
+                    return None;
+                }
+                stack[sp] = next;
+                sp += 1;
+                next = mapping_left(self.mapping(next)?.next.load(Ordering::Relaxed));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn avl_node_key(&self, id: u32) -> (u64, u64, u32) {
+        let mapping = self.mapping(id).expect("shared mapping id escaped pool");
+        let root = mapping.root_and_state.load(DESCRIPTOR_ACQUIRE) & !MAPPING_STATE_MASK;
+        let va = mapping_va(mapping.virtual_address.load(Ordering::Relaxed));
+        (root, va, id)
+    }
+
+    #[inline]
+    fn avl_node_height(&self, id: u32) -> i32 {
+        if id == 0 {
+            return 0;
+        }
+        let mapping = self.mapping(id).expect("shared mapping id escaped pool");
+        mapping_height(mapping.virtual_address.load(Ordering::Relaxed)) as i32
+    }
+
+    #[inline]
+    fn avl_update_height(&self, id: u32) {
+        let mapping = self.mapping(id).expect("shared mapping id escaped pool");
+        let links = mapping.next.load(Ordering::Relaxed);
+        let lh = self.avl_node_height(mapping_left(links));
+        let rh = self.avl_node_height(mapping_right(links));
+        let h = (1 + lh.max(rh)) as u8;
+        let va = mapping_va(mapping.virtual_address.load(Ordering::Relaxed));
+        mapping
+            .virtual_address
+            .store(pack_mapping_va(va, h), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn avl_set_child(&self, parent: u32, is_right: bool, child: u32) {
+        let mapping = self.mapping(parent).expect("shared mapping parent escaped pool");
+        let links = mapping.next.load(Ordering::Relaxed);
+        let updated = if is_right {
+            pack_mapping_links(mapping_left(links), child)
+        } else {
+            pack_mapping_links(child, mapping_right(links))
+        };
+        mapping.next.store(updated, Ordering::Relaxed);
+    }
+
+    fn avl_rotate_left(&self, x: u32) -> u32 {
+        let xm = self.mapping(x).expect("shared mapping escaped pool");
+        let x_links = xm.next.load(Ordering::Relaxed);
+        let y = mapping_right(x_links);
+        let ym = self.mapping(y).expect("shared mapping right child escaped pool");
+        let y_links = ym.next.load(Ordering::Relaxed);
+        let t2 = mapping_left(y_links);
+        xm.next
+            .store(pack_mapping_links(mapping_left(x_links), t2), Ordering::Relaxed);
+        ym.next
+            .store(pack_mapping_links(x, mapping_right(y_links)), Ordering::Relaxed);
+        self.avl_update_height(x);
+        self.avl_update_height(y);
+        y
+    }
+
+    fn avl_rotate_right(&self, y: u32) -> u32 {
+        let ym = self.mapping(y).expect("shared mapping escaped pool");
+        let y_links = ym.next.load(Ordering::Relaxed);
+        let x = mapping_left(y_links);
+        let xm = self.mapping(x).expect("shared mapping left child escaped pool");
+        let x_links = xm.next.load(Ordering::Relaxed);
+        let t2 = mapping_right(x_links);
+        ym.next
+            .store(pack_mapping_links(t2, mapping_right(y_links)), Ordering::Relaxed);
+        xm.next
+            .store(pack_mapping_links(mapping_left(x_links), y), Ordering::Relaxed);
+        self.avl_update_height(y);
+        self.avl_update_height(x);
+        x
+    }
+
+    fn avl_rebalance(&self, id: u32) -> u32 {
+        self.avl_update_height(id);
+        let links = self
+            .mapping(id)
+            .expect("shared mapping escaped pool")
+            .next
+            .load(Ordering::Relaxed);
+        let left = mapping_left(links);
+        let right = mapping_right(links);
+        let balance = self.avl_node_height(left) - self.avl_node_height(right);
+        if balance > 1 {
+            let l_links = self
+                .mapping(left)
+                .expect("shared mapping left escaped pool")
+                .next
+                .load(Ordering::Relaxed);
+            if self.avl_node_height(mapping_left(l_links))
+                < self.avl_node_height(mapping_right(l_links))
+            {
+                let rotated = self.avl_rotate_left(left);
+                self.avl_set_child(id, false, rotated);
+            }
+            return self.avl_rotate_right(id);
+        }
+        if balance < -1 {
+            let r_links = self
+                .mapping(right)
+                .expect("shared mapping right escaped pool")
+                .next
+                .load(Ordering::Relaxed);
+            if self.avl_node_height(mapping_right(r_links))
+                < self.avl_node_height(mapping_left(r_links))
+            {
+                let rotated = self.avl_rotate_right(right);
+                self.avl_set_child(id, true, rotated);
+            }
+            return self.avl_rotate_left(id);
+        }
+        id
+    }
+
+    fn avl_insert_locked(&self, root: u32, id: u32, key: (u64, u64, u32)) -> u32 {
+        let node = self
+            .mapping(id)
+            .expect("claimed shared mapping escaped the boot-sized pool");
+        node.next.store(pack_mapping_links(0, 0), Ordering::Relaxed);
+        node.virtual_address
+            .store(pack_mapping_va(key.1, 1), Ordering::Relaxed);
+        if root == 0 {
+            return id;
+        }
+        let mut path = [(0_u32, false); AVL_MAX_HEIGHT];
+        let mut depth = 0_usize;
+        let mut cur = root;
+        while cur != 0 {
+            assert!(depth < AVL_MAX_HEIGHT, "shared mapping AVL depth exceeded");
+            let cur_key = self.avl_node_key(cur);
+            let go_right = match key.cmp(&cur_key) {
+                core::cmp::Ordering::Less => false,
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => panic!("duplicate shared mapping id in AVL tree"),
+            };
+            path[depth] = (cur, go_right);
+            depth += 1;
+            let links = self
+                .mapping(cur)
+                .expect("shared mapping id escaped pool")
+                .next
+                .load(Ordering::Relaxed);
+            cur = if go_right {
+                mapping_right(links)
+            } else {
+                mapping_left(links)
+            };
+        }
+        let (parent, go_right) = path[depth - 1];
+        self.avl_set_child(parent, go_right, id);
+        let mut new_root = root;
+        for i in (0..depth).rev() {
+            let balanced = self.avl_rebalance(path[i].0);
+            if i == 0 {
+                new_root = balanced;
+            } else {
+                let (anc, anc_right) = path[i - 1];
+                self.avl_set_child(anc, anc_right, balanced);
+            }
+        }
+        new_root
+    }
+
+    fn avl_remove_locked(&self, root: u32, key: (u64, u64, u32)) -> u32 {
+        let mut path = [(0_u32, false); AVL_MAX_HEIGHT];
+        let mut depth = 0_usize;
+        let mut cur = root;
+        while cur != 0 {
+            let cur_key = self.avl_node_key(cur);
+            match key.cmp(&cur_key) {
+                core::cmp::Ordering::Equal => break,
+                core::cmp::Ordering::Less => {
+                    assert!(depth < AVL_MAX_HEIGHT, "shared mapping AVL cycle");
+                    path[depth] = (cur, false);
+                    depth += 1;
+                    cur = mapping_left(
+                        self.mapping(cur)
+                            .expect("shared mapping id escaped pool")
+                            .next
+                            .load(Ordering::Relaxed),
+                    );
+                }
+                core::cmp::Ordering::Greater => {
+                    assert!(depth < AVL_MAX_HEIGHT, "shared mapping AVL cycle");
+                    path[depth] = (cur, true);
+                    depth += 1;
+                    cur = mapping_right(
+                        self.mapping(cur)
+                            .expect("shared mapping id escaped pool")
+                            .next
+                            .load(Ordering::Relaxed),
+                    );
+                }
+            }
+        }
+        assert_ne!(cur, 0, "shared mapping claim was not linked");
+        let cur_mapping = self
+            .mapping(cur)
+            .expect("shared mapping claim escaped pool");
+        let cur_links = cur_mapping.next.load(Ordering::Relaxed);
+        let cur_left = mapping_left(cur_links);
+        let cur_right = mapping_right(cur_links);
+        cur_mapping
+            .next
+            .store(pack_mapping_links(0, 0), Ordering::Relaxed);
+
+        let mut new_root = root;
+        if cur_left == 0 || cur_right == 0 {
+            let replacement = if cur_left != 0 { cur_left } else { cur_right };
+            if depth == 0 {
+                return replacement;
+            }
+            let (parent, go_right) = path[depth - 1];
+            self.avl_set_child(parent, go_right, replacement);
+            for i in (0..depth).rev() {
+                let balanced = self.avl_rebalance(path[i].0);
+                if i == 0 {
+                    new_root = balanced;
+                } else {
+                    let (anc, anc_right) = path[i - 1];
+                    self.avl_set_child(anc, anc_right, balanced);
+                }
+            }
+            return new_root;
+        }
+
+        // Two children: replace `cur` with its in-order successor (leftmost of `cur_right`).
+        let cur_pos = depth;
+        assert!(depth < AVL_MAX_HEIGHT, "shared mapping AVL depth exceeded");
+        path[depth] = (cur, true);
+        depth += 1;
+        let mut succ = cur_right;
+        loop {
+            let succ_left = mapping_left(
+                self.mapping(succ)
+                    .expect("shared mapping successor escaped pool")
+                    .next
+                    .load(Ordering::Relaxed),
+            );
+            if succ_left == 0 {
+                break;
+            }
+            assert!(depth < AVL_MAX_HEIGHT, "shared mapping AVL depth exceeded");
+            path[depth] = (succ, false);
+            depth += 1;
+            succ = succ_left;
+        }
+        let succ_mapping = self
+            .mapping(succ)
+            .expect("shared mapping successor escaped pool");
+        let succ_right = mapping_right(succ_mapping.next.load(Ordering::Relaxed));
+        if depth == cur_pos + 1 {
+            // `succ` was the immediate right child of `cur`.
+            succ_mapping
+                .next
+                .store(pack_mapping_links(cur_left, succ_right), Ordering::Relaxed);
+            path[cur_pos] = (succ, true);
+        } else {
+            let (succ_parent, succ_is_right) = path[depth - 1];
+            self.avl_set_child(succ_parent, succ_is_right, succ_right);
+            succ_mapping
+                .next
+                .store(pack_mapping_links(cur_left, cur_right), Ordering::Relaxed);
+            path[cur_pos] = (succ, true);
+        }
+        for i in (0..depth).rev() {
+            let balanced = self.avl_rebalance(path[i].0);
+            if i == 0 {
+                new_root = balanced;
+            } else {
+                let (anc, anc_right) = path[i - 1];
+                self.avl_set_child(anc, anc_right, balanced);
+            }
+        }
+        new_root
+    }
+
+    #[cfg(test)]
+    fn assert_shared_tree_valid(&self, frame_phys: u64) -> usize {
+        fn verify(
+            ledger: &FrameDescriptorLedger,
+            id: u32,
+            min_key: Option<(u64, u64, u32)>,
+            max_key: Option<(u64, u64, u32)>,
+        ) -> (usize, i32) {
+            if id == 0 {
+                return (0, 0);
+            }
+            let key = ledger.avl_node_key(id);
+            if let Some(lo) = min_key {
+                assert!(key > lo, "AVL ordering violated: {key:?} <= {lo:?}");
+            }
+            if let Some(hi) = max_key {
+                assert!(key < hi, "AVL ordering violated: {key:?} >= {hi:?}");
+            }
+            let mapping = ledger.mapping(id).expect("AVL node escaped pool");
+            let links = mapping.next.load(Ordering::Relaxed);
+            let left = mapping_left(links);
+            let right = mapping_right(links);
+            let (lc, lh) = verify(ledger, left, min_key, Some(key));
+            let (rc, rh) = verify(ledger, right, Some(key), max_key);
+            assert!(
+                (lh - rh).abs() <= 1,
+                "AVL balance factor violated at node {id}: lh={lh} rh={rh}"
+            );
+            let stored_h = mapping_height(mapping.virtual_address.load(Ordering::Relaxed)) as i32;
+            let expected_h = 1 + lh.max(rh);
+            assert_eq!(stored_h, expected_h, "AVL stored height mismatch at node {id}");
+            (1 + lc + rc, expected_h)
+        }
+        let frame = self.record(frame_phys).expect("missing frame");
+        let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
+        let total = shared_count(packed) as usize;
+        let head = shared_head(packed);
+        let (tree_nodes, height) = verify(self, head, None, None);
+        assert_eq!(tree_nodes + 1, total, "AVL node count disagrees with shared_count");
+        height as usize
     }
 
     fn lock_shared(
@@ -1969,8 +2323,10 @@ impl FrameDescriptorLedger {
                         mapping.root_and_state.load(DESCRIPTOR_ACQUIRE),
                         MAPPING_STATE_FREE
                     );
-                    mapping.next.store(0, Ordering::Relaxed);
-                    mapping.virtual_address.store(va, Ordering::Relaxed);
+                    mapping.next.store(pack_mapping_links(0, 0), Ordering::Relaxed);
+                    mapping
+                        .virtual_address
+                        .store(pack_mapping_va(va, 1), Ordering::Relaxed);
                     mapping
                         .root_and_state
                         .store(root_phys | MAPPING_STATE_CLAIMED, DESCRIPTOR_RELEASE);

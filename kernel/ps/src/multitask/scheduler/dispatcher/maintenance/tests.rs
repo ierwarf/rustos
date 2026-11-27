@@ -67,3 +67,29 @@ fn raced_block_refuses_migration_without_reacquiring_generation_or_waking() {
         drop(pin);
     });
 }
+
+#[test]
+fn busiest_source_cpu_picks_highest_runnable_count_and_breaks_ties_by_load() {
+    let _queue = runqueue::test_serial_guard();
+    runqueue::reset_before_publication();
+    assert_eq!(busiest_source_cpu(runqueue::nonempty_rq_cpu_mask()), None);
+
+    // CPU 1: 1 task (weight 100), CPU 3: 1 task (weight 500), CPU 6: 2 tasks (weight 100 each).
+    for (slot, cpu, weight) in [(30, 1, 100), (31, 3, 500), (32, 6, 100), (33, 6, 100)] {
+        runqueue::weight::initialize(slot, weight);
+        runqueue::admit_blocked(slot);
+        runqueue::publish_local(slot, cpu, weight);
+    }
+    let mask = runqueue::nonempty_rq_cpu_mask();
+    assert_eq!(mask, (1 << 1) | (1 << 3) | (1 << 6));
+    assert_eq!(busiest_source_cpu(mask), Some(6));
+    // Excluding CPU 6, CPU 3 beats CPU 1 on load tie-breaker.
+    assert_eq!(busiest_source_cpu(mask & !(1 << 6)), Some(3));
+    assert_eq!(busiest_source_cpu(mask & !((1 << 6) | (1 << 3))), Some(1));
+
+    for (slot, weight) in [(30, 100), (31, 500), (32, 100), (33, 100)] {
+        runqueue::retire(slot, weight);
+        runqueue::release_retired(slot);
+    }
+    runqueue::reset_before_publication();
+}

@@ -530,7 +530,7 @@ fn cropped_client_commit_patches_only_damaged_fragment_pixels() {
         content_version: 1,
         outer,
         focused: true,
-        pixels_opaque: true,
+        opaque_local: rect(0, 0, win.width, win.height),
         fragments: vec![(left, left_region), (right, right_region)],
     };
     // Client damage straddling the fragment seam, 4x2 at client (client.width/2 - 2, 3).
@@ -673,7 +673,7 @@ fn cropped_translucent_ssd_damage_recomposites_chrome_and_only_changes_damaged_p
         content_version: 1,
         outer,
         focused: true,
-        pixels_opaque: false,
+        opaque_local: Rect::empty(),
         fragments: vec![(rect(0, 0, 200, 160), rect(0, 0, 200, 160))],
     };
     let mut atlas = vec![0xdead_beef; 256 * 200];
@@ -695,4 +695,163 @@ fn cropped_translucent_ssd_damage_recomposites_chrome_and_only_changes_damaged_p
             assert_eq!(pixel, 0xdead_beef);
         }
     }
+}
+
+#[test]
+fn inset_opaque_wayland_window_occludes_interior_despite_transparent_corners() {
+    let outer = rect(0, 0, 2880, 1800);
+    let mut win = window(rect(0, 0, 2880, 1750), 0xff);
+    win.server_decoration = false;
+    // Simulate transparent CSD rounded corner pixel while keeping interior opaque.
+    Arc::make_mut(&mut win.pixels)[0] = 0x0000_0000;
+    let mut cache = Vec::new();
+    let opaque = cached_opaque_wayland_interior(&mut cache, &win);
+    assert!(!opaque.is_empty(), "opaque interior must still occlude desktop");
+    let expected_inset = crate::layout::window_radius().max(24);
+    assert_eq!(opaque.x, expected_inset);
+    assert_eq!(opaque.y, expected_inset);
+    assert_eq!(opaque.width, win.width - expected_inset * 2);
+    assert_eq!(opaque.height, win.height - expected_inset * 2);
+    let layers = [
+        FragmentLayer {
+            destination: outer,
+            opaque: outer,
+        },
+        FragmentLayer {
+            destination: wayland_window_outer_rect(&win),
+            opaque,
+        },
+    ];
+    packed(&layers, outer, 3008, 2944)
+        .expect("2880x1750 CSD Chrome with rounded transparent corners must fit 3008x2944 atlas");
+}
+
+#[test]
+fn cropped_csd_damage_outside_inset_opaque_rect_stays_reusable() {
+    let outer = rect(0, 0, 2880, 1750);
+    let mut win = window(outer, 0xff);
+    win.server_decoration = false;
+    win.frame = outer;
+    win.width = outer.width;
+    win.height = outer.height;
+    win.stride_pixels = outer.width;
+    let mut pixels = vec![0xff22_3344_u32; outer.width * outer.height];
+    // Transparent rounded corners outside the proven opaque inset box.
+    pixels[0] = 0x0000_0000;
+    pixels[outer.width - 1] = 0x0000_0000;
+    win.pixels = Arc::new(pixels);
+
+    let mut cache = Vec::new();
+    let opaque_local = cached_opaque_wayland_interior(&mut cache, &win);
+    assert!(!opaque_local.is_empty());
+    assert!(opaque_local.x > 0 && opaque_local.y > 0);
+
+    let stride = 3008_usize;
+    let mut atlas = vec![0_u32; stride * 1800];
+    let binding = CroppedWaylandBinding {
+        surface_id: 1,
+        content_version: 1,
+        outer,
+        focused: true,
+        opaque_local,
+        fragments: vec![(outer, rect(1, 1, outer.width, outer.height))],
+    };
+    let mut damage = Vec::new();
+    assert!(
+        super::super::copy_wayland_damage_to_fragments(
+            &mut atlas,
+            stride,
+            &binding,
+            &win,
+            outer,
+            &mut damage,
+        )
+        .unwrap(),
+        "full-window CSD commit touching transparent rounded corners must stay reusable"
+    );
+    assert_eq!(damage, vec![rect(1, 1, outer.width, outer.height)]);
+
+    // A translucent pixel INSIDE `opaque_local` MUST still invalidate occlusion.
+    Arc::make_mut(&mut win.pixels)[(opaque_local.y + 1) * outer.width + opaque_local.x + 1] =
+        0x7f00_0000;
+    let mut invalidated = Vec::new();
+    assert!(
+        !super::super::copy_wayland_damage_to_fragments(
+            &mut atlas,
+            stride,
+            &binding,
+            &win,
+            outer,
+            &mut invalidated,
+        )
+        .unwrap(),
+        "translucent pixel inside proven opaque interior must invalidate occlusion"
+    );
+}
+
+#[test]
+fn single_pass_opaque_subrect_handles_full_inset_and_translucent_windows() {
+    let mut win = window(rect(0, 0, 200, 160), 0xff);
+    win.server_decoration = false;
+    win.width = 200;
+    win.height = 160;
+    win.stride_pixels = 200;
+    win.pixels = Arc::new(vec![0xff11_2233; 200 * 160]);
+    assert_eq!(
+        wayland_opaque_subrect_local(&win, 200, 160),
+        rect(0, 0, 200, 160),
+        "fully opaque window returns full rect"
+    );
+
+    // Non-corner border pixel translucent -> falls back to inset box.
+    let inset = crate::layout::window_radius().max(24);
+    Arc::make_mut(&mut win.pixels)[2 * 200 + 100] = 0x8011_2233;
+    assert_eq!(
+        wayland_opaque_subrect_local(&win, 200, 160),
+        rect(inset, inset, 200 - inset * 2, 160 - inset * 2)
+    );
+
+    // Interior pixel translucent -> empty.
+    Arc::make_mut(&mut win.pixels)[(inset + 5) * 200 + inset + 5] = 0x8011_2233;
+    assert_eq!(wayland_opaque_subrect_local(&win, 200, 160), Rect::empty());
+}
+
+#[test]
+fn retained_region_classification_reuses_exact_and_subrect_interiors() {
+    let prev = [AtlasRegionEntry {
+        atlas_rect: rect(1, 220, 2880, 1700),
+        source_rect: rect(0, 0, 2880, 1700),
+        kind: AtlasRegionKind::WaylandCsd { surface_id: 3 },
+        content_version: 42,
+    }];
+    assert_eq!(
+        classify_retained_atlas_region(Some(&prev), &prev[0]),
+        RetainedAtlasAction::ReuseAll
+    );
+    let subrect = AtlasRegionEntry {
+        atlas_rect: rect(1, 220, 2880, 800),
+        source_rect: rect(0, 0, 2880, 800),
+        kind: AtlasRegionKind::WaylandCsd { surface_id: 3 },
+        content_version: 42,
+    };
+    assert_eq!(
+        classify_retained_atlas_region(Some(&prev), &subrect),
+        RetainedAtlasAction::ReuseInteriorOnly
+    );
+    let shifted_source = AtlasRegionEntry {
+        source_rect: rect(0, 10, 2880, 800),
+        ..subrect
+    };
+    assert_eq!(
+        classify_retained_atlas_region(Some(&prev), &shifted_source),
+        RetainedAtlasAction::WriteAndDiff
+    );
+    let newer_version = AtlasRegionEntry {
+        content_version: 43,
+        ..prev[0]
+    };
+    assert_eq!(
+        classify_retained_atlas_region(Some(&prev), &newer_version),
+        RetainedAtlasAction::WriteAndDiff
+    );
 }

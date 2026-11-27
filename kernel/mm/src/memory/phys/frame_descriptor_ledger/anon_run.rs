@@ -1,9 +1,18 @@
 //! Contiguous anonymous ownership claims and their preallocated split tables.
 //!
-//! A huge leaf still owns one ordinary descriptor per 4 KiB frame. The run
-//! operations amortize charge and census atomics without inventing compound
-//! frame ownership. The head's otherwise-unused exclusive backing word holds
-//! a root-owned page table, making demotion independent of memory pressure.
+//! - **Owner:** `kernel-mm` ledger owns contiguous 4 KiB frame descriptors and
+//!   head-attached deposited split-table claims.
+//! - **Boundary:** Accepts only verified huge-run boundaries (`<= 512` aligned
+//!   pages excluding `root_phys`) and valid higher-half split tables.
+//! - **Lifecycle:** Claims 512 exclusive anonymous frames plus deposit table
+//!   together, releasing unused claims or consuming deposit on demotion/exit.
+//! - **Concurrency:** Serializes run claims against the global descriptor array
+//!   under ledger acquire/release descriptor transitions.
+//! - **Failure:** Out-of-bounds, unaligned, or mismatched-state runs fail
+//!   closed without partial descriptor mutation.
+//! - **Forbidden:** Compound non-4-KiB frame ownership, un-preallocated split
+//!   table demotion, or partial range commits.
+//! - **Evidence:** `kernel-mm` huge-run unit tests and `PageTableMapTransaction`.
 
 use super::*;
 use crate::memory::phys::ANON_HUGE_PAGE_COUNT;

@@ -35,12 +35,13 @@ pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
 
 /// Hard directory ceiling on pager VMA slots ring0 keeps for one process.
 ///
-/// Ring0 allocates per-process VMA slots lazily in chunks on demand rather than
-/// preallocating a fixed table of this size for every process. Published here
-/// because a pager sizes its own region ceiling against it and may narrow it
-/// via `PagerAnonymousPolicyWire::process_vma_ceiling`: one process must not
-/// be able to wedge the pager for every other process.
-pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 4096;
+/// Matches Linux's default `vm.max_map_count` (`65536`, power of two). Ring0
+/// allocates per-process VMA slots and index nodes lazily in chunks on demand
+/// rather than preallocating a fixed table of this size for every process.
+/// Published here because a pager sizes its own region ceiling against it and
+/// may narrow it via `PagerAnonymousPolicyWire::process_vma_ceiling`: one
+/// process must not be able to wedge the pager for every other process.
+pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 65536;
 
 /// Regions a pager tracks across all processes.
 ///
@@ -628,6 +629,13 @@ const _: () = assert!(core::mem::size_of::<PagerAnonymousPolicyWire>() == 96);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_process_vma_ceiling_matches_linux_parity_power_of_two() {
+        assert_eq!(PAGER_MAX_VMAS_PER_PROCESS, 65_536);
+        assert!(PAGER_MAX_VMAS_PER_PROCESS.is_power_of_two());
+        assert_eq!(PAGER_MAX_TRACKED_REGIONS, 4 * PAGER_MAX_VMAS_PER_PROCESS);
+    }
 
     #[test]
     fn anonymous_policy_versions_huge_pages_without_widening_fault_runs() {

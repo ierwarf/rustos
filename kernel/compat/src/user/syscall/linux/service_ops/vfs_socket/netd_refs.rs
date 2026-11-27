@@ -1,10 +1,19 @@
 //! Socket descriptor references and lossless final-release custody.
 //!
-//! The initial reply publication reserves one fixed slot before ownership
-//! leaves netd. Dup/fork/SCM_RIGHTS/epoll pins share its local reference count;
-//! only the final release sends CLOSE. The SAME slot survives close, a lost
-//! reply, and exact ACK, so neither cleanup nor a committed mutation needs a
-//! second fallible queue admission. Provider identity is always epoch-bound.
+//! - **Owner:** `kernel-compat` owns the fixed `SOCKET_CUSTODY_CAPACITY` slot
+//!   table and local reference counts for netd-backed socket descriptions.
+//! - **Boundary:** Reserves custody before reply publication; foreground
+//!   dup/fork/close update local counts and defer final CLOSE + ACK to maintenance.
+//! - **Lifecycle:** `Empty -> Live -> Close/Closing -> Ack/Acking -> Empty` on
+//!   the same reserved slot without post-close allocation; epoch-bound throughout.
+//! - **Concurrency:** `REFERENCES` spinlock protects slot table transitions;
+//!   `DRAINING` Acquire/Release claim serializes maintenance executor turns.
+//! - **Failure:** Full custody table rejects new initial publication before reply;
+//!   failed closes/ACKs rotate with exponential backoff without losing custody.
+//! - **Forbidden:** Foreground close IPC blocking, slot reuse before ACK, or
+//!   executing maintenance from forged/missing kernel task identity.
+//! - **Evidence:** `service-mutation-recovery/ServiceMutationRecovery`,
+//!   `netd-deferred-reply/NetdDeferredReply`, and `netd_refs::tests`.
 
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -285,7 +294,7 @@ pub(super) fn release(token: u64) {
 struct DrainClaim;
 impl Drop for DrainClaim {
     fn drop(&mut self) {
-        // Release publishes this drainer's queue transitions to its successor.
+        // ORDERING: Release publishes this drainer's queue transitions to its successor.
         DRAINING.store(false, Ordering::Release);
     }
 }
@@ -309,7 +318,7 @@ pub(super) fn service() -> usize {
     if kernel_ps::api::snapshot::ipc_sender_ids_for_task(task) != Some((0, task)) {
         return 0;
     }
-    // Acquire pairs with DrainClaim's Release; a losing caller touches no work.
+    // ORDERING: Acquire pairs with DrainClaim's Release; a losing caller touches no work.
     if DRAINING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         return 0;
     }

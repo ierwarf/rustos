@@ -149,14 +149,15 @@ pub(crate) fn observe(surface_id: u32, title: &str, pixels: &[u32], width: usize
         return;
     }
     let stats = scan(pixels);
-    crate::sys::diag_line(format!(
+    let line = format!(
         "uiserver: pixel-probe surface={surface_id} title=\"{}\" size={width}x{height} non_black={} distinct={}{} hash={:016x}",
         sanitize_title(title),
         stats.non_black,
         stats.distinct,
         if stats.saturated { "+" } else { "" },
         stats.hash,
-    ));
+    );
+    crate::sys::debug_line(&line);
 }
 
 #[cfg(test)]

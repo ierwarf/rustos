@@ -379,31 +379,41 @@ The generalization, which applies well beyond this subsystem:
 > caller could succeed by trying again, the kernel is the thing that should try
 > again — it is the side that knows the wait is bounded.
 
-**`PAGER_MAX_VMAS_PER_PROCESS` is 4096 (directory ceiling) with lazy chunked
-allocation.** Chrome exhausted the former fixed 256-slot per-process array:
-`pager-vma-capacity-refused` immediately preceded two failed `mprotect`
-requests and a browser fault. Rather than merely raising a fixed per-process
-array (which preallocated slots for every process slot), each process's
-`ProcessVmaTable` now starts with zero slot chunks and allocates 32-slot
-`PublishedPagerVma` chunks on demand up to the effective policy
-`process_vma_ceiling` (clamped to `PAGER_MAX_VMAS_PER_PROCESS`). Exception-time
-readers (`lookup`, `acquire_fault_install`) never allocate; writers (`publish`,
-`rewrite_range`, `relocate_range`) fail cleanly with `Pressure` without touching
-existing mappings when a policy ceiling or actual OOM prevents expansion.
-`pagerd`'s `PagerState` likewise allocates tracked regions lazily in chunks up
-to `PAGER_MAX_TRACKED_REGIONS` rather than inline as a fixed array.
+**`PAGER_MAX_VMAS_PER_PROCESS` is 65536 (Linux `vm.max_map_count` parity,
+directory ceiling) with lazy chunked allocation and an O(log N) B-tree index.**
+Chrome exhausted the former fixed 256-slot and later 4096-slot ceilings during
+image-heavy scrolling: `pager-vma-capacity-refused` immediately preceded failed
+`mprotect`/`mmap` requests (`ENOMEM`) and a renderer `SIGTRAP`. Rather than
+merely raising a fixed per-process array (which preallocated slots for every
+process slot) or scanning slots linearly at scale, each process's
+`ProcessVmaTable` starts with zero slot chunks and a null index pointer. Writers
+allocate 128-slot `PublishedPagerVma` chunks (512 directory entries = 65536) and
+a degree-16 all-atomic `VmaIndex` B-tree (32-node chunks in a grow-only
+`AtomicDir`) on demand up to the effective policy `process_vma_ceiling`
+(clamped to `PAGER_MAX_VMAS_PER_PROCESS`). Exception-time readers (`lookup_slot`,
+`acquire_fault_install`) traverse the B-tree lock-free inside `read_rewrite_epoch`
+in O(log N) (at most 5 hops at 65536 VMAs) with zero allocation and verify the
+exact candidate slot's sequence, identity, and access rights; writers (`publish`,
+`rewrite_range`, `relocate_range_with`, `revoke`, `first_mapping_conflict`) use
+O(log N) / O(log N + K) B-tree lookups and O(1) free-slot lists, mutating the
+B-tree only inside `RangeRewrite` (odd epoch) and failing cleanly with
+`Pressure` without touching existing mappings on policy ceiling or OOM.
+`pagerd`'s `PagerState` likewise stores tracked regions in per-process `BTreeMap`
+indices up to `PAGER_MAX_TRACKED_REGIONS` (`4 * 65536 = 262144`) for O(log P +
+log M) lookup, admission, and range edits and O(log P) process invalidation with
+zero preallocation.
 It was 64, calibrated when pagerd refused most ranges so few were
 pager-tracked. Ring0 now tracks every anonymous range, and one
 `mprotect(PROT_NONE)` guard page splits a region into three, so a process with
 a dozen threads exhausted it — which is what produced the `ENOMEM` above.
 
-Range edits validate all affected regions and reserve the complete positive
-split growth before mutation. The sorted region vector then opens one gap,
-compacts fragments forward, and moves the untouched tail once; it must not
-shift that tail separately for every edited region. The reserved growth bounds
-every output prefix, so compaction cannot overwrite unread source rows.
-Foreign process generations, unaffected neighbors and backing-object offsets
-remain exact, and a preflight refusal publishes no partial edit.
+Range edits validate all affected regions and reserve split headroom before
+mutation. `pagerd` collects only the O(log M + K) overlapping regions in the
+target process's `BTreeMap`, validates every outcome and free-slot headroom up
+front, then replaces only those K keys in O(K log M) without shifting unrelated
+entries or other processes. Foreign process generations, unaffected neighbors
+and backing-object offsets remain exact, and a preflight refusal publishes no
+partial edit.
 
 Raising it required removing the reason it could not grow.
 `rewrite_attenuated_range` held `[PagerVmRegionWire; N]`-shaped arrays on a

@@ -1,16 +1,20 @@
 //! Occlusion is source selection, not CPU composition: every fragment still
 //! samples exactly one independently rasterized layer, in original draw order.
 use super::{
-    CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene, PlannedWindow,
-    apply_atlas_window_fragment_alpha, chrome,
-    gpu_window_draw_plan, render_dock_gpu_texture, render_wayland_gpu_texture, taskbar_dirty_rect,
-    update_gpu_cursor_texture, wayland_window_client_rect_for, wayland_window_outer_rect,
+    AtlasRegionEntry, AtlasRegionKind, CroppedConsoleBinding, CroppedWaylandBinding,
+    GpuAtlasScene, PlannedWindow, RetainedAtlasAction, apply_atlas_window_fragment_alpha,
+    chrome, classify_retained_atlas_region, cursor_region_kind, gpu_dock_reuse_signature,
+    gpu_window_draw_plan, padded_outer_rect, render_dock_gpu_texture,
+    render_wayland_gpu_texture_fragment_at, taskbar_dirty_rect, update_gpu_cursor_texture,
+    wayland_ssd_title_hash, wayland_window_client_rect_for, wayland_window_outer_rect,
 };
+#[cfg(test)]
+use super::render_wayland_gpu_texture;
 use crate::app::AppState;
 use crate::canvas::{CURSOR_TEXTURE_SIZE, Rect};
 use crate::gpu_scene::{
-    GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
-    GpuTextureCapability, GpuTextureRegion,
+    AtlasLayoutPacker, GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError,
+    GpuSceneLayer, GpuTextureCapability, GpuTextureRegion,
 };
 use crate::wayland::WaylandWindowSnapshot;
 use driver_domain_protocol::DVM_GPU_RENDER_MAX_COMMANDS;
@@ -127,6 +131,7 @@ fn subtract(rect: Rect, cover: Rect, output: &mut Vec<Rect>) {
 
 /// Packing order is independent of draw order: big fragments go first to avoid
 /// stranding the maximized client behind a desktop-sized shelf.
+#[cfg(test)]
 pub(super) fn reserve_fragments(
     packer: &mut GpuAtlasPacker<'_>,
     fragments: Vec<AtlasFragment>,
@@ -209,6 +214,89 @@ pub(super) fn reserve_fragments(
     Ok(placed.into_iter().unzip())
 }
 
+/// Geometry-only fragment packing matching [`reserve_fragments`] identically,
+/// touching zero atlas pixels until the complete scene is proven to fit.
+pub(super) fn reserve_fragments_layout(
+    packer: &mut AtlasLayoutPacker,
+    fragments: Vec<AtlasFragment>,
+) -> Result<(Vec<AtlasFragment>, Vec<Rect>), GpuSceneError> {
+    let mut pending = fragments;
+    pending.sort_by_key(|fragment| fragment.source.width * fragment.source.height);
+    let mut placed = Vec::new();
+    while let Some(fragment) = pending.pop() {
+        let requested = fragment.source;
+        let region = match packer.reserve(requested.width, requested.height) {
+            Ok(region) => region,
+            Err(GpuSceneError::AtlasFull) => {
+                let (width, height) = packer
+                    .largest_available_crop(requested.width, requested.height)
+                    .ok_or(GpuSceneError::AtlasFull)?;
+                packer.reserve(width, height)?
+            }
+            Err(error) => return Err(error),
+        };
+        for crop in [
+            Rect {
+                x: region.width,
+                y: 0,
+                width: requested.width - region.width,
+                height: region.height,
+            },
+            Rect {
+                x: 0,
+                y: region.height,
+                width: requested.width,
+                height: requested.height - region.height,
+            },
+        ] {
+            if crop.is_empty() {
+                continue;
+            }
+            if placed.len() + pending.len() + 1 >= MAX_FRAGMENTS {
+                return Err(GpuSceneError::CommandLimit);
+            }
+            pending.push(AtlasFragment {
+                layer_index: fragment.layer_index,
+                destination: Rect {
+                    x: fragment.destination.x + crop.x,
+                    y: fragment.destination.y + crop.y,
+                    ..crop
+                },
+                source: Rect {
+                    x: requested.x + crop.x,
+                    y: requested.y + crop.y,
+                    ..crop
+                },
+            });
+        }
+        placed.push((
+            AtlasFragment {
+                destination: Rect {
+                    width: region.width,
+                    height: region.height,
+                    ..fragment.destination
+                },
+                source: Rect {
+                    width: region.width,
+                    height: region.height,
+                    ..fragment.source
+                },
+                ..fragment
+            },
+            region,
+        ));
+    }
+    placed.sort_by_key(|(fragment, _)| {
+        (
+            fragment.layer_index,
+            fragment.destination.y,
+            fragment.destination.x,
+        )
+    });
+    Ok(placed.into_iter().unzip())
+}
+
+#[cfg(test)]
 pub(super) fn write_fragment_layer(
     packer: &mut GpuAtlasPacker<'_>,
     fragments: &[AtlasFragment],
@@ -258,37 +346,156 @@ pub(crate) struct WaylandOpaqueCacheEntry {
     width: usize,
     height: usize,
     stride_pixels: usize,
-    pixels_opaque: bool,
+    opaque_local: Rect,
 }
 
-fn wayland_pixels_are_opaque(window: &WaylandWindowSnapshot, width: usize, height: usize) -> bool {
-    if width == 0 || height == 0 || window.stride_pixels < width {
+fn wayland_pixels_are_opaque_rect(
+    window: &WaylandWindowSnapshot,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> bool {
+    if width == 0 || height == 0 || window.stride_pixels < x.saturating_add(width) {
         return false;
     }
     // SHM snapshots normalize XRGB to alpha=255; ARGB may prove opacity by
     // actual content, but format or an opaque-region request is not enough.
-    for row in 0..height {
+    for row in y..y.saturating_add(height) {
         let Some(pixels) = row
             .checked_mul(window.stride_pixels)
+            .and_then(|start| start.checked_add(x))
             .and_then(|start| window.pixels.get(start..start.checked_add(width)?))
         else {
             return false;
         };
-        if pixels.iter().any(|pixel| pixel >> 24 != 255) {
+        if !crate::simd::all_pixels_opaque_u32(pixels) {
             return false;
         }
     }
     true
 }
 
-fn wayland_opaque_rect(window: &WaylandWindowSnapshot, client: Rect, pixels_opaque: bool) -> Rect {
-    if !pixels_opaque {
+fn pixel_is_opaque(window: &WaylandWindowSnapshot, x: usize, y: usize) -> bool {
+    y.checked_mul(window.stride_pixels)
+        .and_then(|start| start.checked_add(x))
+        .and_then(|index| window.pixels.get(index))
+        .is_some_and(|&pixel| pixel >> 24 == 0xff)
+}
+
+fn corners_are_opaque(
+    window: &WaylandWindowSnapshot,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let x1 = x + width - 1;
+    let y1 = y + height - 1;
+    pixel_is_opaque(window, x, y)
+        && pixel_is_opaque(window, x1, y)
+        && pixel_is_opaque(window, x, y1)
+        && pixel_is_opaque(window, x1, y1)
+}
+
+fn wayland_opaque_subrect_local(window: &WaylandWindowSnapshot, width: usize, height: usize) -> Rect {
+    if width == 0 || height == 0 || window.stride_pixels < width {
         return Rect::empty();
     }
+    // Clients with rounded corners or drop-shadow borders fail whole-surface
+    // opacity even when their entire interior is solid. Check the interior
+    // ONCE first (with O(1) corner fast-reject), then only scan the four thin
+    // border strips to promote to full-surface opacity — every pixel is
+    // scanned at most once.
+    let inset = crate::layout::window_radius().max(24);
+    if width > inset * 2 && height > inset * 2 {
+        let inner_w = width - inset * 2;
+        let inner_h = height - inset * 2;
+        if !corners_are_opaque(window, inset, inset, inner_w, inner_h)
+            || !wayland_pixels_are_opaque_rect(window, inset, inset, inner_w, inner_h)
+        {
+            return Rect::empty();
+        }
+        if corners_are_opaque(window, 0, 0, width, height)
+            && wayland_pixels_are_opaque_rect(window, 0, 0, width, inset)
+            && wayland_pixels_are_opaque_rect(window, 0, height - inset, width, inset)
+            && wayland_pixels_are_opaque_rect(window, 0, inset, inset, inner_h)
+            && wayland_pixels_are_opaque_rect(window, width - inset, inset, inset, inner_h)
+        {
+            return Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+        }
+        return Rect {
+            x: inset,
+            y: inset,
+            width: inner_w,
+            height: inner_h,
+        };
+    }
+    if corners_are_opaque(window, 0, 0, width, height)
+        && wayland_pixels_are_opaque_rect(window, 0, 0, width, height)
+    {
+        return Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+    }
+    Rect::empty()
+}
+
+/// After an incremental Wayland commit proves that all damage intersecting the
+/// retained opaque interior stayed opaque, advance the cached opacity entry's
+/// `content_version` so a subsequent topology rebuild (e.g. a popup opening
+/// over Chrome) does not re-scan the entire 20 MiB surface buffer.
+pub(super) fn refresh_opaque_wayland_cache_version(
+    cache: &mut [WaylandOpaqueCacheEntry],
+    window: &WaylandWindowSnapshot,
+    previous_version: u64,
+    opaque_local: Rect,
+) {
+    if opaque_local.is_empty() {
+        return;
+    }
+    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
+    let width = window.width.min(client.width);
+    let height = window.height.min(client.height);
+    if let Some(entry) = cache.iter_mut().find(|entry| {
+        entry.surface_id == window.surface_id
+            && entry.content_version == previous_version
+            && entry.width == width
+            && entry.height == height
+            && entry.stride_pixels == window.stride_pixels
+            && !entry.opaque_local.is_empty()
+            && entry.opaque_local == opaque_local
+    }) {
+        entry.content_version = window.content_version;
+    }
+}
+
+fn wayland_opaque_rect(window: &WaylandWindowSnapshot, client: Rect, opaque_local: Rect) -> Rect {
+    if opaque_local.is_empty() {
+        return Rect::empty();
+    }
+    let proven = Rect {
+        x: client.x + opaque_local.x,
+        y: client.y + opaque_local.y,
+        width: opaque_local.width,
+        height: opaque_local.height,
+    }
+    .intersect(client);
     if window.server_decoration {
-        client.intersect(opaque_window_interior(wayland_window_outer_rect(window)))
+        proven.intersect(opaque_window_interior(wayland_window_outer_rect(window)))
     } else {
-        client
+        proven
     }
 }
 
@@ -300,7 +507,7 @@ fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
     wayland_opaque_rect(
         window,
         client,
-        wayland_pixels_are_opaque(window, width, height),
+        wayland_opaque_subrect_local(window, width, height),
     )
 }
 
@@ -321,16 +528,16 @@ fn cached_opaque_wayland_interior(
             && entry.height == height
             && entry.stride_pixels == window.stride_pixels
     }) {
-        return wayland_opaque_rect(window, client, entry.pixels_opaque);
+        return wayland_opaque_rect(window, client, entry.opaque_local);
     }
-    let pixels_opaque = wayland_pixels_are_opaque(window, width, height);
+    let opaque_local = wayland_opaque_subrect_local(window, width, height);
     let new_entry = WaylandOpaqueCacheEntry {
         surface_id: window.surface_id,
         content_version: window.content_version,
         width,
         height,
         stride_pixels: window.stride_pixels,
-        pixels_opaque,
+        opaque_local,
     };
     if let Some(slot) = cache
         .iter_mut()
@@ -340,7 +547,7 @@ fn cached_opaque_wayland_interior(
     } else {
         cache.push(new_entry);
     }
-    wayland_opaque_rect(window, client, pixels_opaque)
+    wayland_opaque_rect(window, client, opaque_local)
 }
 
 pub(super) fn build_cropped_gpu_atlas_scene(
@@ -350,6 +557,7 @@ pub(super) fn build_cropped_gpu_atlas_scene(
     atlas_height: usize,
     atlas_stride: usize,
     atlas: GpuTextureCapability,
+    retained_regions: Option<&[AtlasRegionEntry]>,
 ) -> Result<GpuAtlasScene, GpuSceneError> {
     let output = Rect {
         x: 0,
@@ -402,95 +610,206 @@ pub(super) fn build_cropped_gpu_atlas_scene(
     }
     let dock_destination =
         taskbar_dirty_rect(state.surface.width, state.surface.height).intersect(output);
+    let dock_layer_index = inputs.len();
     inputs.push(FragmentLayer {
         destination: dock_destination,
         opaque: dock_destination,
     });
     let fragments = visible_fragments(&inputs, output)?;
-    let mut packer = GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride)?;
-    let cursor_source_rect = packer.reserve(CURSOR_TEXTURE_SIZE, CURSOR_TEXTURE_SIZE)?;
-    let (pixels, stride) = packer.pixels_mut();
-    update_gpu_cursor_texture(pixels, stride, cursor_source_rect, state.cursor_motion)?;
-    let (fragments, regions) = reserve_fragments(&mut packer, fragments)?;
-    write_fragment_layer(
-        &mut packer,
-        &fragments,
-        &regions,
-        0,
-        &state.desktop_cache.pixels,
-        state.desktop_cache.width,
-        true,
-    )?;
-    // CSD pixels and console rasters are already owned snapshots. Copy only
-    // their visible fragments; a maximized/occluded window must not allocate
-    // another full raster just to discard its hidden pixels afterwards.
+    // Pure-geometry packing first: prove every fragment + cursor fits before
+    // writing any pixels or mutating any console cache.
+    let mut layout = AtlasLayoutPacker::new(atlas_width, atlas_height)?;
+    let cursor_source_rect = layout.reserve(CURSOR_TEXTURE_SIZE, CURSOR_TEXTURE_SIZE)?;
+    let (fragments, regions) = reserve_fragments_layout(&mut layout, fragments)?;
+    let used_height = layout.used_height();
+
+    // Ensure every visible console window has an up-to-date surface cache so
+    // its provenance `content_version` is authoritative before classification.
     for (plan_index, planned) in plan.iter().enumerate() {
-        if !fragments
-            .iter()
-            .any(|fragment| fragment.layer_index == plan_index + 1)
-        {
+        let layer_index = plan_index + 1;
+        if !fragments.iter().any(|fragment| fragment.layer_index == layer_index) {
             continue;
         }
-        let (width, height, focused, server_decoration) = match *planned {
-            PlannedWindow::Wayland { index, focused } => {
-                let window = &state.wayland_windows[index];
-                let outer = wayland_window_outer_rect(window);
-                if window.server_decoration {
-                    let pixels = render_wayland_gpu_texture(window, focused)?;
-                    write_fragment_layer(
-                        &mut packer,
-                        &fragments,
-                        &regions,
-                        plan_index + 1,
-                        &pixels,
-                        outer.width,
-                        false,
-                    )?;
-                } else {
-                    write_fragment_layer(
-                        &mut packer,
-                        &fragments,
-                        &regions,
-                        plan_index + 1,
-                        &window.pixels,
-                        window.stride_pixels,
-                        false,
-                    )?;
-                }
-                (
-                    outer.width,
-                    outer.height,
-                    focused,
-                    window.server_decoration,
-                )
+        if let PlannedWindow::Console { index, focused } = *planned {
+            let window = &mut state.console_windows[index];
+            chrome::rebuild_console_window_surface(window, focused);
+            if !window.surface_cache.valid {
+                return Err(GpuSceneError::SceneNotReady);
             }
-            PlannedWindow::Console { index, focused } => {
-                let window = &mut state.console_windows[index];
-                chrome::rebuild_console_window_surface(window, focused);
-                if !window.surface_cache.valid {
-                    return Err(GpuSceneError::SceneNotReady);
+        }
+    }
+
+    let dock_signature = gpu_dock_reuse_signature(state);
+    let mut packer = GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride)?;
+    let mut region_entries = Vec::with_capacity(fragments.len() + 1);
+    let mut changed_outer_rects = Vec::new();
+    let mut border_only_rects = Vec::new();
+
+    let cursor_entry = AtlasRegionEntry {
+        atlas_rect: cursor_source_rect,
+        source_rect: Rect {
+            x: 0,
+            y: 0,
+            width: CURSOR_TEXTURE_SIZE,
+            height: CURSOR_TEXTURE_SIZE,
+        },
+        kind: cursor_region_kind(state.cursor_motion),
+        content_version: 1,
+    };
+    region_entries.push(cursor_entry);
+    match classify_retained_atlas_region(retained_regions, &cursor_entry) {
+        RetainedAtlasAction::ReuseAll => {}
+        RetainedAtlasAction::ReuseInteriorOnly => border_only_rects.push(cursor_source_rect),
+        RetainedAtlasAction::WriteAndDiff => {
+            packer.zero_padding_border(cursor_source_rect)?;
+            let (pixels, stride) = packer.pixels_mut();
+            update_gpu_cursor_texture(pixels, stride, cursor_source_rect, state.cursor_motion)?;
+            changed_outer_rects.push(padded_outer_rect(cursor_source_rect));
+        }
+    }
+
+    // Classify every fragment once and write only fragments not already present
+    // in the retained atlas.
+    let mut dock_pixels: Option<Vec<u32>> = None;
+    for (fragment, &region) in fragments.iter().zip(&regions) {
+        let entry = if fragment.layer_index == 0 {
+            AtlasRegionEntry {
+                atlas_rect: region,
+                source_rect: fragment.source,
+                kind: AtlasRegionKind::Desktop,
+                content_version: state.desktop_cache.content_version,
+            }
+        } else if fragment.layer_index == dock_layer_index {
+            AtlasRegionEntry {
+                atlas_rect: region,
+                source_rect: fragment.source,
+                kind: AtlasRegionKind::Dock,
+                content_version: dock_signature,
+            }
+        } else {
+            match plan[fragment.layer_index - 1] {
+                PlannedWindow::Wayland { index, focused } => {
+                    let window = &state.wayland_windows[index];
+                    let outer = wayland_window_outer_rect(window);
+                    let kind = if window.server_decoration {
+                        AtlasRegionKind::WaylandSsd {
+                            surface_id: window.surface_id,
+                            focused,
+                            outer_width: outer.width,
+                            outer_height: outer.height,
+                            title_hash: wayland_ssd_title_hash(window),
+                        }
+                    } else {
+                        AtlasRegionKind::WaylandCsd {
+                            surface_id: window.surface_id,
+                        }
+                    };
+                    AtlasRegionEntry {
+                        atlas_rect: region,
+                        source_rect: fragment.source,
+                        kind,
+                        content_version: window.content_version,
+                    }
                 }
-                write_fragment_layer(
-                    &mut packer,
-                    &fragments,
-                    &regions,
-                    plan_index + 1,
-                    &window.surface_cache.pixels,
-                    window.surface_cache.width,
-                    false,
-                )?;
-                (
-                    window.surface_cache.width,
-                    window.surface_cache.height,
-                    focused,
-                    true,
-                )
+                PlannedWindow::Console { index, focused } => {
+                    let window = &state.console_windows[index];
+                    AtlasRegionEntry {
+                        atlas_rect: region,
+                        source_rect: fragment.source,
+                        kind: AtlasRegionKind::Console {
+                            session_handle: window.session_handle,
+                            focused,
+                        },
+                        content_version: window.surface_cache.content_version,
+                    }
+                }
             }
         };
-        if server_decoration {
-            let (pixels, stride) = packer.pixels_mut();
-            for (fragment, &region) in fragments.iter().zip(&regions) {
-                if fragment.layer_index == plan_index + 1 {
+        region_entries.push(entry);
+        match classify_retained_atlas_region(retained_regions, &entry) {
+            RetainedAtlasAction::ReuseAll => continue,
+            RetainedAtlasAction::ReuseInteriorOnly => {
+                border_only_rects.push(region);
+                continue;
+            }
+            RetainedAtlasAction::WriteAndDiff => {}
+        }
+
+        if fragment.layer_index == 0 {
+            let offset = fragment
+                .source
+                .y
+                .checked_mul(state.desktop_cache.width)
+                .and_then(|row| row.checked_add(fragment.source.x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source = state
+                .desktop_cache
+                .pixels
+                .get(offset..)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            packer.write_xrgb_at(region, source, state.desktop_cache.width)?;
+        } else if fragment.layer_index == dock_layer_index {
+            let dock = match dock_pixels.as_ref() {
+                Some(dock) => dock,
+                None => {
+                    let (_, rendered) = render_dock_gpu_texture(state)?;
+                    dock_pixels.insert(rendered)
+                }
+            };
+            let offset = fragment
+                .source
+                .y
+                .checked_mul(dock_destination.width)
+                .and_then(|row| row.checked_add(fragment.source.x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source = dock.get(offset..).ok_or(GpuSceneError::InvalidLayer)?;
+            packer.write_xrgb_at(region, source, dock_destination.width)?;
+        } else {
+            match plan[fragment.layer_index - 1] {
+                PlannedWindow::Wayland { index, focused } => {
+                    let window = &state.wayland_windows[index];
+                    if window.server_decoration {
+                        packer.zero_padding_border(region)?;
+                        let (pixels, stride) = packer.pixels_mut();
+                        render_wayland_gpu_texture_fragment_at(
+                            pixels,
+                            stride,
+                            region,
+                            fragment.source,
+                            window,
+                            focused,
+                        )?;
+                    } else {
+                        let offset = fragment
+                            .source
+                            .y
+                            .checked_mul(window.stride_pixels)
+                            .and_then(|row| row.checked_add(fragment.source.x))
+                            .ok_or(GpuSceneError::InvalidLayer)?;
+                        let source = window
+                            .pixels
+                            .get(offset..)
+                            .ok_or(GpuSceneError::InvalidLayer)?;
+                        packer.write_bgra_at(region, source, window.stride_pixels)?;
+                    }
+                }
+                PlannedWindow::Console { index, focused } => {
+                    let window = &state.console_windows[index];
+                    let width = window.surface_cache.width;
+                    let height = window.surface_cache.height;
+                    let offset = fragment
+                        .source
+                        .y
+                        .checked_mul(width)
+                        .and_then(|row| row.checked_add(fragment.source.x))
+                        .ok_or(GpuSceneError::InvalidLayer)?;
+                    let source = window
+                        .surface_cache
+                        .pixels
+                        .get(offset..)
+                        .ok_or(GpuSceneError::InvalidLayer)?;
+                    packer.write_bgra_at(region, source, width)?;
+                    let (pixels, stride) = packer.pixels_mut();
                     apply_atlas_window_fragment_alpha(
                         pixels,
                         stride,
@@ -504,19 +823,9 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                 }
             }
         }
+        changed_outer_rects.push(padded_outer_rect(region));
     }
-    if !dock_destination.is_empty() {
-        let (_, dock) = render_dock_gpu_texture(state)?;
-        write_fragment_layer(
-            &mut packer,
-            &fragments,
-            &regions,
-            inputs.len() - 1,
-            &dock,
-            dock_destination.width,
-            true,
-        )?;
-    }
+
     let mut cropped_wayland_bindings = Vec::new();
     let mut cropped_console_bindings = Vec::new();
     for (plan_index, planned) in plan.iter().enumerate() {
@@ -532,12 +841,25 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         match *planned {
             PlannedWindow::Wayland { index, focused } => {
                 let window = &state.wayland_windows[index];
+                let outer = wayland_window_outer_rect(window);
+                let client = wayland_window_client_rect_for(window, outer);
+                let proven_screen = inputs[plan_index + 1].opaque.intersect(client);
+                let opaque_local = if proven_screen.is_empty() {
+                    Rect::empty()
+                } else {
+                    Rect {
+                        x: proven_screen.x - client.x,
+                        y: proven_screen.y - client.y,
+                        width: proven_screen.width,
+                        height: proven_screen.height,
+                    }
+                };
                 cropped_wayland_bindings.push(CroppedWaylandBinding {
                     surface_id: window.surface_id,
                     content_version: window.content_version,
-                    outer: wayland_window_outer_rect(window),
+                    outer,
                     focused,
-                    pixels_opaque: !inputs[plan_index + 1].opaque.is_empty(),
+                    opaque_local,
                     fragments: layer_fragments,
                 });
             }
@@ -553,13 +875,19 @@ pub(super) fn build_cropped_gpu_atlas_scene(
             }
         }
     }
+    let cropped_dock_fragments: Vec<(Rect, Rect)> = fragments
+        .iter()
+        .zip(regions.iter())
+        .filter(|(fragment, _)| fragment.layer_index == dock_layer_index)
+        .map(|(fragment, region)| (fragment.source, *region))
+        .collect();
     let layers = fragments
         .iter()
         .zip(regions)
         .map(|(fragment, source_rect)| GpuSceneLayer {
             destination: fragment.destination,
             opacity: u8::MAX,
-            source_over: fragment.layer_index != 0 && fragment.layer_index != inputs.len() - 1,
+            source_over: fragment.layer_index != 0 && fragment.layer_index != dock_layer_index,
             transform: GpuLayerTransform::flat(),
             kind: GpuLayerKind::Texture {
                 region: GpuTextureRegion { atlas, source_rect },
@@ -567,8 +895,10 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         })
         .collect();
     Ok(GpuAtlasScene {
-        used_height: packer.used_height(),
+        used_height,
         dock_source_rect: None,
+        cropped_dock_destination: dock_destination,
+        cropped_dock_fragments,
         layers,
         cursor_source_rect,
         wayland_bindings: Vec::new(),
@@ -577,6 +907,9 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         cropped_console_bindings,
         cropped_reusable: true,
         cropped: true,
+        regions: region_entries,
+        changed_outer_rects,
+        border_only_rects,
     })
 }
 

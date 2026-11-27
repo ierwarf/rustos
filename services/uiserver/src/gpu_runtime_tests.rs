@@ -4,8 +4,9 @@ use super::{
     AtlasDamageEpoch, DvmGpuAtlasDamage, GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT,
     GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
     GpuCompositorRuntime, GpuProviderAdmission, Rect, completion_wait_origin,
-    copy_atlas_damage_to_slot, difference_bounds, difference_damage_into, gpu_completion_timed_out,
-    gpu_provider_admission, gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
+    copy_atlas_damage_to_slot, diff_and_commit_incremental_rebuild, difference_bounds,
+    difference_damage_into, gpu_completion_timed_out, gpu_provider_admission,
+    gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
     snapshot_damage_for_slot,
 };
 use crate::sys::DisplayInfo;
@@ -559,4 +560,148 @@ fn repacked_fragment_damage_reconstructs_every_rotated_slot_pixel() {
         old, desired,
         "cleared storage cannot reappear on slot rotation"
     );
+}
+
+#[test]
+fn incremental_diff_and_commit_reconstructs_rotated_slot_across_epochs() {
+    let (width, height, stride) = (64_usize, 48_usize, 64_usize);
+    // Epoch 1: baseline atlas and Slot 0 snapshot.
+    let mut atlas = vec![0_u32; stride * height];
+    for y in 1..21 {
+        atlas[y * stride + 1..y * stride + 41].fill(0xff11_2233);
+    }
+    let mut slot0 = atlas.clone();
+
+    // Epoch 2: incremental rebuild with one changed outer region (popup) and one
+    // border-only sub-rect (shrunk window at (1, 1, 40, 10) inside (1, 1, 40, 20)).
+    let mut scratch = vec![0xdead_beef_u32; stride * height];
+    let popup_outer = Rect { x: 42, y: 0, width: 12, height: 12 };
+    for y in popup_outer.y..popup_outer.y + popup_outer.height {
+        scratch[y * stride + popup_outer.x..y * stride + popup_outer.x + popup_outer.width].fill(0);
+    }
+    for y in 1..11 {
+        scratch[y * stride + 43..y * stride + 53].fill(0xffaa_bbcc);
+    }
+    let shrunk_inner = Rect { x: 1, y: 1, width: 40, height: 10 };
+    let mut damage_e2 = Vec::new();
+    diff_and_commit_incremental_rebuild(
+        &mut atlas,
+        &scratch,
+        width,
+        height,
+        stride,
+        &[popup_outer],
+        &[shrunk_inner],
+        &mut damage_e2,
+    )
+    .unwrap();
+    assert!(driver_domain_protocol::dvm_gpu_atlas_damage_is_valid(
+        &damage_e2,
+        width as u32,
+        height as u32,
+        false,
+    ));
+    // Verify border row y=11 (just below shrunk_inner) was zeroed in atlas.
+    assert!(atlas[11 * stride..11 * stride + 42].iter().all(|&p| p == 0));
+    // Verify interior of shrunk_inner stayed intact.
+    assert!(atlas[5 * stride + 1..5 * stride + 41].iter().all(|&p| p == 0xff11_2233));
+    // Verify popup pixels landed in atlas.
+    assert!(atlas[5 * stride + 43..5 * stride + 53].iter().all(|&p| p == 0xffaa_bbcc));
+
+    // Epoch 3: popup moves to (42, 20, 12, 12), reusing nothing from epoch 2's popup.
+    let popup2_outer = Rect { x: 42, y: 20, width: 12, height: 12 };
+    for y in popup2_outer.y..popup2_outer.y + popup2_outer.height {
+        scratch[y * stride + popup2_outer.x..y * stride + popup2_outer.x + popup2_outer.width].fill(0);
+    }
+    for y in 21..31 {
+        scratch[y * stride + 43..y * stride + 53].fill(0xff44_5566);
+    }
+    let mut damage_e3 = Vec::new();
+    diff_and_commit_incremental_rebuild(
+        &mut atlas,
+        &scratch,
+        width,
+        height,
+        stride,
+        &[popup2_outer],
+        &[],
+        &mut damage_e3,
+    )
+    .unwrap();
+
+    // Replay epochs 2 + 3 into Slot 0 (which still holds epoch 1): slot must equal atlas everywhere.
+    let history = VecDeque::from([AtlasDamageEpoch {
+        epoch: 2,
+        damage: damage_e2,
+    }]);
+    let replay =
+        snapshot_damage_for_slot(1, 3, &damage_e3, &history, width as u32, height as u32).unwrap();
+    copy_atlas_damage_to_slot(
+        &mut slot0,
+        &atlas,
+        stride,
+        &replay,
+        width as u32,
+        height as u32,
+    )
+    .unwrap();
+    assert_eq!(slot0, atlas, "rotated slot must match authoritative atlas everywhere");
+}
+
+#[test]
+fn incremental_diff_collapses_at_wire_cap_and_still_commits_every_pixel() {
+    let limit = driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize;
+    let (width, height, stride) = (16_usize, limit * 2 + 4, 16_usize);
+    let mut atlas = vec![0_u32; stride * height];
+    let mut scratch = atlas.clone();
+    let mut changed_rects = Vec::new();
+    for band in 0..limit + 2 {
+        let y = band * 2;
+        scratch[y * stride + (band % width)] = 0xff00_0001 + band as u32;
+        changed_rects.push(Rect { x: 0, y, width, height: 1 });
+    }
+    let mut damage = Vec::new();
+    diff_and_commit_incremental_rebuild(
+        &mut atlas,
+        &scratch,
+        width,
+        height,
+        stride,
+        &changed_rects,
+        &[],
+        &mut damage,
+    )
+    .unwrap();
+    assert_eq!(damage.len(), 1, "exceeding wire cap collapses to bounding box");
+    assert_eq!(atlas, scratch, "every changed pixel must still commit after collapse");
+}
+
+#[test]
+fn incremental_diff_on_3008x2944_atlas_matches_full_diff_for_localized_change() {
+    let (width, height, stride) = (3008_usize, 2944_usize, 3008_usize);
+    let mut atlas = vec![0xff10_2030_u32; stride * height];
+    let mut scratch = atlas.clone();
+    let popup = Rect { x: 100, y: 200, width: 400, height: 300 };
+    for y in popup.y..popup.y + popup.height {
+        scratch[y * stride + popup.x..y * stride + popup.x + popup.width].fill(0xffaa_bbcc);
+    }
+
+    let mut full_damage = Vec::new();
+    difference_damage_into(&atlas, &scratch, width, height, stride, &mut full_damage).unwrap();
+
+    let mut inc_damage = Vec::new();
+    diff_and_commit_incremental_rebuild(
+        &mut atlas,
+        &scratch,
+        width,
+        height,
+        stride,
+        &[popup],
+        &[],
+        &mut inc_damage,
+    )
+    .unwrap();
+
+    assert_eq!(inc_damage, full_damage);
+    assert_eq!(atlas, scratch);
 }

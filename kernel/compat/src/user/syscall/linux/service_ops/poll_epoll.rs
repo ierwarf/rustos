@@ -244,6 +244,7 @@ fn wait_until_poll_ready(
         }
         super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
         crate::arch::rtc::disarm_sleep_waiter(task_id);
+        super::super::process_termination::retire_if_current_process_exiting();
         if current_wait_interrupted() {
             return Err(LINUX_EINTR);
         }
@@ -1321,6 +1322,7 @@ fn wait_under_signal_mask(
         Err(errno) => return complete_syscall_with_signals(frame, linux_errno(errno), None).0,
     };
     let result = linux_result(wait());
+    super::super::process_termination::retire_if_current_process_exiting();
     let Some(original) = original else {
         return complete_syscall_with_signals(frame, result, None).0;
     };
@@ -1496,9 +1498,19 @@ fn epoll_handle_or_errno(epfd: u64) -> Result<multitask::EpollHandle, i64> {
     Err(if open { LINUX_EINVAL } else { LINUX_EBADF })
 }
 
+/// Whether an `epoll_wait` error belongs to a live process (and should be
+/// recorded and returned to userspace) rather than an exiting sibling racing
+/// process teardown.
+fn should_report_epoll_wait_failure(process_exiting: bool) -> bool {
+    !process_exiting
+}
+
 /// Names which `epoll_wait` exit produced an error: the same errno comes from
 /// several scan, registration and block-commit sites.
 fn epoll_wait_failed(site: u64, errno: i64) -> i64 {
+    if !should_report_epoll_wait_failure(super::super::process_termination::current_process_is_exiting()) {
+        super::super::process_termination::retire_exiting_sibling_thread();
+    }
     debug::record_milestone(debug::LogCategory::Compat, "epoll-wait-failed", site, errno.unsigned_abs());
     errno
 }
@@ -1679,6 +1691,7 @@ pub fn syscall_linux_epoll_wait(
                 }
             }
             acknowledge_epoll_wait_block(task_id);
+            super::super::process_termination::retire_if_current_process_exiting();
             if current_wait_interrupted() {
                 return Err(LINUX_EINTR);
             }
@@ -2271,6 +2284,15 @@ mod audit_tests {
             }),
             i64::MAX
         );
+    }
+
+    #[test]
+    fn epoll_wait_failure_is_suppressed_for_exiting_process() {
+        assert!(should_report_epoll_wait_failure(false));
+        assert!(!should_report_epoll_wait_failure(true));
+        // Without an active exiting user process, epoll_wait_failed reports
+        // the exact errno as before.
+        assert_eq!(epoll_wait_failed(1, LINUX_EIO), LINUX_EIO);
     }
 }
 

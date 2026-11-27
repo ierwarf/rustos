@@ -20,7 +20,7 @@
 //! - **Evidence:** `per-cpu-runqueue-ownership`, `scheduler-dispatch`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
-use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::multitask::irq_leaf::IrqLeaf;
 use crate::multitask::irq_pool::{SlabPool, SlabQueue};
@@ -74,6 +74,124 @@ pub(super) use ownership::{
 use ownership::{clear_wait_arm, publish_wait_arm, set_wait_armed, set_wait_reason, wake_wait_locked};
 pub(super) mod conservation;
 
+const RQ_SLOT_WORDS: usize = task_table::MAX_TASK_SLOTS / 64;
+
+/// Per-slot bitmaps owned by whichever `RunQueueInner` currently links `slot`.
+/// Keeps `RunQueueInner`'s System-class and missing-weight counts exact in O(1)
+/// even if `weight::replace` or `weight::clear` races while `slot` is queued.
+static RQ_SLOT_IS_SYSTEM: [AtomicU64; RQ_SLOT_WORDS] =
+    [const { AtomicU64::new(0) }; RQ_SLOT_WORDS];
+static RQ_SLOT_MISSING_WEIGHT: [AtomicU64; RQ_SLOT_WORDS] =
+    [const { AtomicU64::new(0) }; RQ_SLOT_WORDS];
+
+#[inline]
+fn slot_bitmap_set(bitmap: &[AtomicU64; RQ_SLOT_WORDS], slot: usize) {
+    let bit = 1_u64 << (slot & 63);
+    bitmap[slot >> 6].fetch_or(bit, Ordering::Relaxed);
+}
+
+#[inline]
+fn slot_bitmap_clear(bitmap: &[AtomicU64; RQ_SLOT_WORDS], slot: usize) -> bool {
+    let bit = 1_u64 << (slot & 63);
+    (bitmap[slot >> 6].fetch_and(!bit, Ordering::Relaxed) & bit) != 0
+}
+
+#[inline]
+fn slot_bitmap_test(bitmap: &[AtomicU64; RQ_SLOT_WORDS], slot: usize) -> bool {
+    let bit = 1_u64 << (slot & 63);
+    (bitmap[slot >> 6].load(Ordering::Relaxed) & bit) != 0
+}
+
+#[inline]
+fn classify_queued_slot(slot: usize) -> (bool, bool) {
+    if idle::is_idle(slot) {
+        return (false, false);
+    }
+    match weight::observe(slot) {
+        None => (false, true),
+        Some(w) => (w & super::SYSTEM_CLASS_WEIGHT_FLAG != 0, false),
+    }
+}
+
+/// Per-CPU bitmasks for O(1) idle-CPU selection and non-empty runqueue lookup.
+/// Each mask's bit `cpu` has a single exclusive writer:
+/// - `RUNNING_IDLE_CPU_MASK[cpu]`: `cpu` itself under IRQ exclusion on dispatch/bootstrap.
+/// - `NONEMPTY_RQ_CPU_MASK[cpu]`: `RUN_QUEUES[cpu].inner` lock in `publish_load`.
+/// - `MAILBOX_PENDING_CPU_MASK[cpu]`: `REMOTE_WAKE_MAILBOXES[cpu]` lock.
+static RUNNING_IDLE_CPU_MASK: AtomicU64 = AtomicU64::new(0);
+static NONEMPTY_RQ_CPU_MASK: AtomicU64 = AtomicU64::new(0);
+static MAILBOX_PENDING_CPU_MASK: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn update_cpu_mask_bit(mask: &AtomicU64, cpu: usize, set: bool) {
+    let bit = 1_u64 << cpu;
+    // ORDERING: Relaxed avoids dirtying a shared cache line on steady-state CPUs.
+    if (mask.load(Ordering::Relaxed) & bit != 0) != set {
+        if set {
+            // ORDERING: AcqRel publishes non-empty/idle transition to placement readers.
+            mask.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            // ORDERING: AcqRel publishes empty/busy transition to placement readers.
+            mask.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Records whether `cpu` is currently executing its idle task.
+#[inline]
+pub(super) fn set_cpu_running_idle(cpu: usize, idle: bool) {
+    validate_cpu(cpu);
+    update_cpu_mask_bit(&RUNNING_IDLE_CPU_MASK, cpu, idle);
+}
+
+/// Bitmask of CPUs currently running their idle task with empty local runqueue
+/// and empty remote-wake mailbox. Advisory placement hint; owner CAS stays authority.
+#[inline]
+pub(super) fn idle_cpu_mask() -> u64 {
+    // ORDERING: Acquire observes Release/AcqRel updates across the three disjoint masks.
+    RUNNING_IDLE_CPU_MASK.load(Ordering::Acquire)
+        & !NONEMPTY_RQ_CPU_MASK.load(Ordering::Acquire)
+        & !MAILBOX_PENDING_CPU_MASK.load(Ordering::Acquire)
+}
+
+/// Bitmask of CPUs whose published local runqueue is non-empty.
+#[inline]
+pub(super) fn nonempty_rq_cpu_mask() -> u64 {
+    // ORDERING: Acquire pairs with publish_load's AcqRel mask update.
+    NONEMPTY_RQ_CPU_MASK.load(Ordering::Acquire)
+}
+
+/// Raw packed `(weight << 16) | count` load snapshot for tie-breaking busiest-CPU selection.
+#[inline]
+pub(super) fn published_load_word(cpu: usize) -> u64 {
+    validate_cpu(cpu);
+    // ORDERING: Acquire observes complete placement snapshot.
+    RUN_QUEUES[cpu].published_load.load(Ordering::Acquire)
+}
+
+/// Marks `cpu`'s cached System-class/ready-age summary dirty so the next
+/// `publish_load` recomputes it and readers fall back to scanning until then.
+#[inline]
+pub(super) fn note_overdue_resync_needed(cpu: usize) {
+    if cpu < MAX_TRACKED_CPUS {
+        // ORDERING: Release ensures readers observe invalidation after the slot mutation.
+        RUN_QUEUES[cpu].overdue_resync_needed.store(true, Ordering::Release);
+    }
+}
+
+/// Invalidates the owning CPU's overdue summary if `slot` is currently `Local`.
+/// In steady-state production `ready_since_ticks` is written while `Blocked` or
+/// `Running`, so this performs one L1-hot atomic load and zero writes.
+#[inline]
+pub(super) fn note_slot_resync_if_local(slot: usize) {
+    let snap = owner(slot);
+    if snap.state == RunOwnerState::Local
+        && let Some(cpu) = snap.cpu
+    {
+        note_overdue_resync_needed(cpu);
+    }
+}
+
 // Per-slot CFS accounting, RSP, and kernel-stack fields live in `task_table::Task`.
 /// Per-slot saved execution-frame pointer. The owner-word generation bounds
 /// its lifetime: admission installs it before publication, only the execution
@@ -85,6 +203,13 @@ struct RunQueueInner {
     runnable_count: usize,
     runnable_weight: u64,
     queue_sequence: u64,
+    system_count: usize,
+    missing_weight_count: usize,
+    /// Earliest non-zero `ready_since_ticks` among base-System slots in this RQ,
+    /// `u64::MAX` if no System slot has non-zero `ready_since`, or `0` if unknown
+    /// (after removing the minimum slot) until resynced.
+    min_system_ready_since: u64,
+    synced_class_epoch: u64,
     // Mutation scratch belongs exclusively to `inner`'s queue lock; only the
     // published mirror below is read by other CPUs. Plain fields avoid locked
     // swaps merely to drain data whose sole writer already holds the lock.
@@ -102,10 +227,47 @@ impl RunQueueInner {
             runnable_count: 0,
             runnable_weight: 0,
             queue_sequence: 0,
+            system_count: 0,
+            missing_weight_count: 0,
+            min_system_ready_since: u64::MAX,
+            synced_class_epoch: 0,
             dirty_slots: [NO_SLOT; 4],
             dirty_len: 0,
             full_resync: false,
         }
+    }
+
+    fn resync_class_summary(&mut self, epoch: u64) {
+        let mut sys_count = 0_usize;
+        let mut missing_count = 0_usize;
+        let mut min_ready = u64::MAX;
+        let mut cur = self.head;
+        while cur != NO_SLOT {
+            let slot = cur as usize;
+            let (is_sys, missing) = classify_queued_slot(slot);
+            if is_sys {
+                slot_bitmap_set(&RQ_SLOT_IS_SYSTEM, slot);
+                slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+                sys_count += 1;
+                let since = wait::ready_since_ticks(slot);
+                if since != 0 && since < min_ready {
+                    min_ready = since;
+                }
+            } else if missing {
+                slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+                slot_bitmap_set(&RQ_SLOT_MISSING_WEIGHT, slot);
+                missing_count += 1;
+            } else {
+                slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+                slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+            }
+            // SAFETY: exclusive `RunQueueInner` lock protects `rq_next` of queued tasks.
+            cur = unsafe { *task_table::get(slot).rq_next.get() };
+        }
+        self.system_count = sys_count;
+        self.missing_weight_count = missing_count;
+        self.min_system_ready_since = min_ready;
+        self.synced_class_epoch = epoch;
     }
 
     fn mark_dirty(&mut self, slot: u32) {
@@ -122,7 +284,10 @@ impl RunQueueInner {
     fn clear(&mut self) {
         let mut cur = self.head;
         while cur != NO_SLOT {
-            let task = task_table::get(cur as usize);
+            let slot = cur as usize;
+            let task = task_table::get(slot);
+            slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+            slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
             // SAFETY: exclusive `RunQueueInner` lock protects `rq_prev/next/cpu` of queued tasks.
             let next = unsafe { *task.rq_next.get() };
             // SAFETY: exclusive `RunQueueInner` lock owns queued links before clearing.
@@ -138,6 +303,10 @@ impl RunQueueInner {
         self.runnable_count = 0;
         self.runnable_weight = 0;
         self.queue_sequence = 0;
+        self.system_count = 0;
+        self.missing_weight_count = 0;
+        self.min_system_ready_since = u64::MAX;
+        self.synced_class_epoch = weight::base_class_epoch();
         self.dirty_len = 0;
         self.full_resync = true;
     }
@@ -184,6 +353,19 @@ impl RunQueueInner {
             .queue_sequence
             .checked_add(1)
             .expect("scheduler rq sequence exhausted");
+        let (is_sys, missing) = classify_queued_slot(slot);
+        if is_sys {
+            slot_bitmap_set(&RQ_SLOT_IS_SYSTEM, slot);
+            slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+            self.system_count += 1;
+        } else if missing {
+            slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+            slot_bitmap_set(&RQ_SLOT_MISSING_WEIGHT, slot);
+            self.missing_weight_count += 1;
+        } else {
+            slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+            slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+        }
         self.mark_dirty(slot_u32);
     }
 
@@ -219,6 +401,23 @@ impl RunQueueInner {
             .queue_sequence
             .checked_add(1)
             .expect("scheduler rq sequence exhausted");
+        let was_sys = slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+        let was_missing = slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+        if was_missing {
+            self.missing_weight_count = self.missing_weight_count.saturating_sub(1);
+        }
+        if was_sys {
+            self.system_count = self.system_count.saturating_sub(1);
+            if self.system_count == 0 {
+                self.min_system_ready_since = u64::MAX;
+            } else if self.min_system_ready_since != 0 && self.min_system_ready_since != u64::MAX {
+                let since = wait::ready_since_ticks(slot);
+                if since == 0 || since <= self.min_system_ready_since {
+                    // Removed slot may have been the minimum; mark unknown until scanned/resynced.
+                    self.min_system_ready_since = 0;
+                }
+            }
+        }
         self.mark_dirty(slot as u32);
     }
 }
@@ -230,6 +429,11 @@ struct PerCpuRunQueue {
     published_count: AtomicUsize,
     /// Even/odd publication epoch bracketing the dense published runnable slice.
     published_sequence: AtomicU64,
+    published_system_count: AtomicUsize,
+    published_missing_weight: AtomicBool,
+    published_min_system_ready: AtomicU64,
+    published_class_epoch: AtomicU64,
+    overdue_resync_needed: AtomicBool,
     published_slots: AtomicDir<AtomicU32, 64, 4096>,
 }
 
@@ -240,6 +444,11 @@ impl PerCpuRunQueue {
             published_load: AtomicU64::new(0),
             published_count: AtomicUsize::new(0),
             published_sequence: AtomicU64::new(0),
+            published_system_count: AtomicUsize::new(0),
+            published_missing_weight: AtomicBool::new(false),
+            published_min_system_ready: AtomicU64::new(u64::MAX),
+            published_class_epoch: AtomicU64::new(0),
+            overdue_resync_needed: AtomicBool::new(false),
             published_slots: AtomicDir::new(),
         }
     }
@@ -250,6 +459,10 @@ impl PerCpuRunQueue {
         assert_eq!(sequence & 1, 0, "scheduler rq publication overlapped a writer");
         let committed_sequence = sequence.checked_add(2)
             .expect("scheduler rq publication sequence exhausted");
+        let current_epoch = weight::base_class_epoch();
+        let need_summary_resync = self.overdue_resync_needed.swap(false, Ordering::AcqRel)
+            || inner.synced_class_epoch != current_epoch
+            || inner.full_resync;
         if core::mem::take(&mut inner.full_resync) {
             inner.dirty_len = 0;
             let old_pub = self.published_count.load(Ordering::Relaxed);
@@ -299,6 +512,15 @@ impl PerCpuRunQueue {
                 // SAFETY: `rq_pub_idx` is protected by `inner`.
                 let cur_idx = unsafe { *task.rq_pub_idx.get() };
                 if in_rq && cur_idx == NO_SLOT {
+                    if !need_summary_resync
+                        && slot_bitmap_test(&RQ_SLOT_IS_SYSTEM, s as usize)
+                        && inner.min_system_ready_since != 0
+                    {
+                        let since = wait::ready_since_ticks(s as usize);
+                        if since != 0 && since < inner.min_system_ready_since {
+                            inner.min_system_ready_since = since;
+                        }
+                    }
                     if self.published_slots.get(pub_len).is_none() {
                         ensure_pub_slots_for_count(pub_len + 1);
                     }
@@ -343,6 +565,23 @@ impl PerCpuRunQueue {
             // ORDERING: Release publishes updated dense slice length.
             self.published_count.store(pub_len, Ordering::Release);
         }
+        if need_summary_resync {
+            inner.resync_class_summary(current_epoch);
+        }
+        // ORDERING: Release publishes System-class / ready-age summary before closing sequence.
+        self.published_system_count
+            .store(inner.system_count, Ordering::Release);
+        self.published_missing_weight
+            .store(inner.missing_weight_count != 0, Ordering::Release);
+        self.published_min_system_ready
+            .store(inner.min_system_ready_since, Ordering::Release);
+        self.published_class_epoch
+            .store(inner.synced_class_epoch, Ordering::Release);
+        update_cpu_mask_bit(
+            &NONEMPTY_RQ_CPU_MASK,
+            inner.cpu as usize,
+            inner.runnable_count != 0,
+        );
         let count = u64::try_from(inner.runnable_count).unwrap_or(u64::MAX) & 0xffff;
         let weight = inner.runnable_weight.min((1_u64 << 48) - 1);
         // ORDERING: Release publishes read-only placement snapshot after exact rq updates.
@@ -436,11 +675,15 @@ impl EnqueueDuty {
 /// Publishes one generation's mailbox record to `cpu` and raises its pending
 /// edge; true when this producer won the 0-to-1 edge (it owes the IPI).
 fn publish_mailbox_record(cpu: usize, slot: usize, generation: u64, weight: u32) -> bool {
-    REMOTE_WAKE_MAILBOXES[cpu].lock().publish(RunTransfer {
-        slot,
-        generation,
-        weight,
-    });
+    {
+        let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
+        mailbox.publish(RunTransfer {
+            slot,
+            generation,
+            weight,
+        });
+        update_cpu_mask_bit(&MAILBOX_PENDING_CPU_MASK, cpu, true);
+    }
     // ORDERING: the mailbox lock release publishes the record before this
     // 0-to-1 edge grants notification custody to the winning producer.
     MAILBOX_PENDING[cpu]
@@ -519,9 +762,19 @@ pub(super) fn reset_before_publication() {
     affinity_payload::reset_before_publication();
     wait::reset_before_publication();
     weight::reset_before_publication();
+    RUNNING_IDLE_CPU_MASK.store(0, Ordering::Release);
+    NONEMPTY_RQ_CPU_MASK.store(0, Ordering::Release);
+    MAILBOX_PENDING_CPU_MASK.store(0, Ordering::Release);
+    for slot in task_table::allocated_slots() {
+        slot_bitmap_clear(&RQ_SLOT_IS_SYSTEM, slot);
+        slot_bitmap_clear(&RQ_SLOT_MISSING_WEIGHT, slot);
+    }
     for cpu in 0..MAX_TRACKED_CPUS {
         let mut rq = RUN_QUEUES[cpu].inner.lock();
         rq.clear();
+        RUN_QUEUES[cpu]
+            .overdue_resync_needed
+            .store(false, Ordering::Release);
         RUN_QUEUES[cpu]
             .published_sequence
             .store(0, Ordering::Release);
@@ -1178,6 +1431,74 @@ pub(super) fn release_retired(slot: usize) {
     frame_publication::clear(slot);
 }
 
+/// O(1) proof that `cpu`'s runqueue at `expected_queue_sequence` contains no
+/// base-System slot with an overdue ready age (and no missing-weight slot that
+/// must fail closed). Caller must separately check `live_inherited_system_count() == 0`
+/// and `class_publication_sequence`.
+pub(super) fn overdue_system_short_circuit(
+    cpu: usize,
+    now_ticks: u64,
+    ticks_per_second: u64,
+    bound_ms: u64,
+    expected_queue_sequence: u64,
+) -> bool {
+    validate_cpu(cpu);
+    let rq = &RUN_QUEUES[cpu];
+    // ORDERING: Acquire pairs with publish_load's Release stores.
+    if rq.published_count.load(Ordering::Acquire) == 0 {
+        return rq.published_sequence.load(Ordering::Acquire) == expected_queue_sequence;
+    }
+    if rq.overdue_resync_needed.load(Ordering::Acquire)
+        || rq.published_class_epoch.load(Ordering::Acquire) != weight::base_class_epoch()
+    {
+        return false;
+    }
+    let sys_count = rq.published_system_count.load(Ordering::Acquire);
+    let min_ready = rq.published_min_system_ready.load(Ordering::Acquire);
+    let has_missing_weight = rq.published_missing_weight.load(Ordering::Acquire);
+    fence(Ordering::Acquire);
+    if rq.published_sequence.load(Ordering::Acquire) != expected_queue_sequence {
+        return false;
+    }
+    if has_missing_weight {
+        return false;
+    }
+    if sys_count == 0 || min_ready == u64::MAX {
+        return true;
+    }
+    if min_ready == 0 {
+        return false;
+    }
+    let elapsed_ms = now_ticks
+        .saturating_sub(min_ready)
+        .saturating_mul(1000)
+        .saturating_div(ticks_per_second);
+    elapsed_ms < bound_ms
+}
+
+/// O(1) proof that `cpu`'s runqueue at `expected_queue_sequence` has zero
+/// base-System slots and zero missing-weight slots. Caller must separately
+/// check `live_inherited_system_count() == 0` and `class_publication_sequence`.
+pub(super) fn has_no_system_runnable(cpu: usize, expected_queue_sequence: u64) -> bool {
+    validate_cpu(cpu);
+    let rq = &RUN_QUEUES[cpu];
+    if rq.published_count.load(Ordering::Acquire) == 0 {
+        return rq.published_sequence.load(Ordering::Acquire) == expected_queue_sequence;
+    }
+    if rq.overdue_resync_needed.load(Ordering::Acquire)
+        || rq.published_class_epoch.load(Ordering::Acquire) != weight::base_class_epoch()
+    {
+        return false;
+    }
+    let sys_count = rq.published_system_count.load(Ordering::Acquire);
+    let has_missing_weight = rq.published_missing_weight.load(Ordering::Acquire);
+    fence(Ordering::Acquire);
+    if rq.published_sequence.load(Ordering::Acquire) != expected_queue_sequence {
+        return false;
+    }
+    sys_count == 0 && !has_missing_weight
+}
+
 pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize {
     validate_cpu(fallback_cpu);
     let mut best = (eligible_mask & (1_u64 << fallback_cpu) != 0).then(|| {
@@ -1191,10 +1512,10 @@ pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize
                 .load(Ordering::Acquire),
         )
     });
-    for cpu in 0..MAX_TRACKED_CPUS {
-        if eligible_mask & (1_u64 << cpu) == 0 {
-            continue;
-        }
+    let mut remaining = eligible_mask & !(1_u64 << fallback_cpu);
+    while remaining != 0 {
+        let cpu = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
         // ORDERING: Acquire observes a complete rq accounting snapshot. It is
         // a placement hint only; owner CAS and target adoption remain authority.
         let load = RUN_QUEUES[cpu].published_load.load(Ordering::Acquire);

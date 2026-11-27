@@ -38,9 +38,12 @@ const RECEIVE_THREADS: usize = 4;
 // rebinds that liveness proof to current DVM geometry before touching storage.
 static DVM_E2E_READY_GENERATION: AtomicU64 = AtomicU64::new(0);
 // Read by every request, written only on a readiness transition: a reader lock
-// keeps the receive threads from serializing on it.
+// keeps the receive threads from serializing on it, and a monotonic sequence
+// counter lets each receive thread reuse its local copy without atomic RMW
+// contention on the shared RwLock cache line.
 static PROVEN_BLOCK_INFO: std::sync::RwLock<Option<block::BlockInfo>> =
     std::sync::RwLock::new(None);
+static PROVEN_BLOCK_INFO_SEQ: AtomicU64 = AtomicU64::new(0);
 // A readiness transition may cause many normal loader probes. Keep the first
 // one observable, but never let expected `EAGAIN` diagnostics become a DVM
 // boot-time work source themselves.
@@ -154,6 +157,7 @@ fn supervise_dvm_block_readiness() {
                     if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
                         *slot = Some(info);
                     }
+                    PROVEN_BLOCK_INFO_SEQ.fetch_add(1, Ordering::Release);
                     DVM_E2E_READY_GENERATION.store(generation, Ordering::Release);
                     note_dvm_request_ready();
                     proven_generation = generation;
@@ -180,6 +184,7 @@ fn supervise_dvm_block_readiness() {
 
 fn invalidate_dvm_readiness(published: &AtomicU64, proven_generation: &mut u64) {
     published.store(0, Ordering::Release);
+    PROVEN_BLOCK_INFO_SEQ.fetch_add(1, Ordering::Release);
     if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
         *slot = None;
     }
@@ -206,10 +211,39 @@ fn dvm_e2e_ready_for_current_generation() -> Result<block::BlockInfo, i32> {
         if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
             *slot = Some(info);
         }
+        PROVEN_BLOCK_INFO_SEQ.fetch_add(1, Ordering::Release);
         Ok(info)
     } else {
         Err(libc::EAGAIN)
     }
+}
+
+/// Lock-free read-side cache for the receive threads: validates both the
+/// published readiness generation and the monotonic write sequence so hot bulk
+/// reads never bounce the shared `PROVEN_BLOCK_INFO` RwLock cache line.
+fn dvm_e2e_ready_cached(
+    cache: &mut Option<(u64, block::BlockInfo)>,
+) -> Result<block::BlockInfo, i32> {
+    let seq1 = PROVEN_BLOCK_INFO_SEQ.load(Ordering::Acquire);
+    let proven = DVM_E2E_READY_GENERATION.load(Ordering::Acquire);
+    let seq2 = PROVEN_BLOCK_INFO_SEQ.load(Ordering::Acquire);
+    if proven != 0 && seq1 == seq2 {
+        if let Some((cached_seq, info)) = *cache {
+            if cached_seq == seq1 && info.generation == proven {
+                return Ok(info);
+            }
+        }
+    }
+    let info = dvm_e2e_ready_for_current_generation()?;
+    let seq_after = PROVEN_BLOCK_INFO_SEQ.load(Ordering::Acquire);
+    let proven_after = DVM_E2E_READY_GENERATION.load(Ordering::Acquire);
+    if proven_after == info.generation && PROVEN_BLOCK_INFO_SEQ.load(Ordering::Acquire) == seq_after
+    {
+        *cache = Some((seq_after, info));
+    } else {
+        *cache = None;
+    }
+    Ok(info)
 }
 
 const fn e2e_generation_matches(proven_generation: u64, live_generation: u64) -> bool {
@@ -269,23 +303,56 @@ impl BulkReplySlot {
     }
 }
 
+fn log_reply_recv_failure(message: &'static str) {
+    debug_line(format!("storaged: {message}").as_str());
+}
+
 fn serve(endpoint: u64) {
     let mut bulk_slot = BulkReplySlot::new();
     let mut recv_words = vec![0_u64; IPC_MAX_INLINE_BYTES.div_ceil(size_of::<u64>())];
+    let mut cached_info: Option<(u64, block::BlockInfo)> = None;
+    let mut pending_bulk_reply: Option<(u64, usize)> = None;
     loop {
         let mut reply_cap = 0_u64;
         let mut sender_pid = 0_u64;
         let mut sender_tid = 0_u64;
-        let received = syscall6(
-            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-            endpoint,
-            recv_words.as_mut_ptr() as u64,
-            IPC_MAX_INLINE_BYTES as u64,
-            (&mut reply_cap as *mut u64) as u64,
-            (&mut sender_pid as *mut u64) as u64,
-            (&mut sender_tid as *mut u64) as u64,
-        );
+        let (received, used_fused) =
+            if let Some((prev_reply_cap, prev_reply_len)) = pending_bulk_reply.take() {
+                // SAFETY: `bulk_slot.response` holds the initialized bulk reply
+                // of length `prev_reply_len` and is disjoint from `recv_words`.
+                let status = unsafe {
+                    rustos_svc_runtime::ipc::reply_then_recv(
+                        endpoint,
+                        prev_reply_cap,
+                        (&*bulk_slot.response as *const StoragedBulkReadResponse).cast::<u8>(),
+                        prev_reply_len,
+                        recv_words.as_mut_ptr().cast::<u8>(),
+                        IPC_MAX_INLINE_BYTES,
+                        &mut reply_cap,
+                        &mut sender_pid,
+                        &mut sender_tid,
+                        log_reply_recv_failure,
+                    )
+                };
+                (status, true)
+            } else {
+                let status = syscall6(
+                    SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+                    endpoint,
+                    recv_words.as_mut_ptr() as u64,
+                    IPC_MAX_INLINE_BYTES as u64,
+                    (&mut reply_cap as *mut u64) as u64,
+                    (&mut sender_pid as *mut u64) as u64,
+                    (&mut sender_tid as *mut u64) as u64,
+                );
+                (status, false)
+            };
         if received < 0 {
+            if used_fused {
+                // `reply_then_recv` already committed or recovered the reply;
+                // fall straight into a plain receive without sleeping.
+                continue;
+            }
             thread::sleep(RECV_BACKOFF);
             continue;
         }
@@ -312,7 +379,7 @@ fn serve(endpoint: u64) {
             if !exact_sender || owner_status < 0 {
                 reply_bulk_write_error(reply_cap, bulk_req.header, libc::EACCES);
             } else {
-                reply_bulk_write_request(reply_cap, bulk_req, received);
+                reply_bulk_write_request(reply_cap, bulk_req, received, &mut cached_info);
             }
             continue;
         }
@@ -354,7 +421,8 @@ fn serve(endpoint: u64) {
             reply_commercial_error(reply_cap, request, libc::EACCES);
             continue;
         }
-        reply_commercial_request(reply_cap, request, &mut bulk_slot);
+        pending_bulk_reply =
+            reply_commercial_request(reply_cap, request, &mut bulk_slot, &mut cached_info);
     }
 }
 
@@ -384,7 +452,12 @@ fn reply_bulk_write_error(
     }
 }
 
-fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest, received: usize) {
+fn reply_bulk_write_request(
+    reply_cap: u64,
+    request: &StoragedBulkWriteRequest,
+    received: usize,
+    cached_info: &mut Option<(u64, block::BlockInfo)>,
+) {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
         ..CommercialMaxProtocolResponse::default()
@@ -393,7 +466,7 @@ fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest, 
     response.status = if !request.has_valid_shape() {
         libc::EINVAL
     } else {
-        match dvm_e2e_ready_for_current_generation().and_then(|info| {
+        match dvm_e2e_ready_cached(cached_info).and_then(|info| {
             if request.generation != info.generation {
                 return Err(libc::EAGAIN);
             }
@@ -464,10 +537,10 @@ fn reply_commercial_request(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
     bulk_slot: &mut BulkReplySlot,
-) {
+    cached_info: &mut Option<(u64, block::BlockInfo)>,
+) -> Option<(u64, usize)> {
     if request.header.op == COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK {
-        reply_bulk_read(reply_cap, request, bulk_slot);
-        return;
+        return reply_bulk_read(reply_cap, request, bulk_slot, cached_info);
     }
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
@@ -483,7 +556,7 @@ fn reply_commercial_request(
             );
             errno
         }
-        Ok(()) => match dvm_e2e_ready_for_current_generation()
+        Ok(()) => match dvm_e2e_ready_cached(cached_info)
             .and_then(|info| dispatch_commercial(request, &mut response, info))
         {
             Ok(()) => {
@@ -505,13 +578,15 @@ fn reply_commercial_request(
     if reply < 0 {
         let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
     }
+    None
 }
 
 fn reply_bulk_read(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
     slot: &mut BulkReplySlot,
-) {
+    cached_info: &mut Option<(u64, block::BlockInfo)>,
+) -> Option<(u64, usize)> {
     let response = &mut *slot.response;
     response.header = request.header;
     response.status = 0;
@@ -530,7 +605,7 @@ fn reply_bulk_read(
             );
             errno
         }
-        Ok(()) => match dvm_e2e_ready_for_current_generation().and_then(|info| {
+        Ok(()) => match dvm_e2e_ready_cached(cached_info).and_then(|info| {
             require_request_generation(request, info)?;
             block::read_into_with_info(
                 info,
@@ -560,6 +635,11 @@ fn reply_bulk_read(
         response.status = libc::EIO;
         STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
     });
+    if !block::needs_read_ahead_top_up() {
+        // Fast path: fuse this reply with the next receive in one
+        // `SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER` syscall.
+        return Some((reply_cap, reply_len));
+    }
     let reply = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
@@ -576,6 +656,7 @@ fn reply_bulk_read(
     // Stream read-ahead runs after the reply so its submit syscalls overlap the
     // requester's work on its next request.
     block::service_read_ahead();
+    None
 }
 
 fn dispatch_commercial(
@@ -991,6 +1072,37 @@ mod tests {
             dispatch_commercial(&write_req, &mut write_resp, ro_info),
             Err(libc::EROFS)
         );
+    }
+
+    #[test]
+    fn proven_block_info_cache_tracks_sequence_and_invalidates_cleanly() {
+        let sample = block::BlockInfo {
+            generation: 11,
+            capacity_sectors: 4096,
+            logical_block_size: 512,
+            physical_block_size: 512,
+            features: 0,
+            flags: 0,
+        };
+        if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
+            *slot = Some(sample);
+        }
+        PROVEN_BLOCK_INFO_SEQ.fetch_add(1, Ordering::Release);
+        DVM_E2E_READY_GENERATION.store(sample.generation, Ordering::Release);
+
+        let mut cache = None;
+        assert_eq!(dvm_e2e_ready_cached(&mut cache), Ok(sample));
+        assert!(cache.is_some());
+        // Second call serves directly from the thread-local cache.
+        assert_eq!(dvm_e2e_ready_cached(&mut cache), Ok(sample));
+
+        let mut proven = sample.generation;
+        invalidate_dvm_readiness(&DVM_E2E_READY_GENERATION, &mut proven);
+        assert_eq!(proven, 0);
+        // After invalidation the stale local cache entry must never be returned.
+        let seq1 = PROVEN_BLOCK_INFO_SEQ.load(Ordering::Acquire);
+        assert_ne!(cache.unwrap().0, seq1);
+        assert_eq!(DVM_E2E_READY_GENERATION.load(Ordering::Acquire), 0);
     }
 
     #[test]

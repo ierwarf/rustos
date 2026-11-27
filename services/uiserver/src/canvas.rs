@@ -110,6 +110,8 @@ pub(crate) struct SurfaceCanvas<'a> {
     height: u32,
     stride_pixels: usize,
     clip_rect: Rect,
+    offset_x: isize,
+    offset_y: isize,
 }
 
 impl<'a> SurfaceCanvas<'a> {
@@ -128,6 +130,8 @@ impl<'a> SurfaceCanvas<'a> {
             height,
             stride_pixels,
             clip_rect,
+            offset_x: 0,
+            offset_y: 0,
         }
     }
 
@@ -147,7 +151,74 @@ impl<'a> SurfaceCanvas<'a> {
             height,
             stride_pixels,
             clip_rect: screen_rect.intersect(clip_rect),
+            offset_x: 0,
+            offset_y: 0,
         }
+    }
+
+    /// Paint a clipped window-space `source_clip` directly into `pixels` at
+    /// `(dst_x, dst_y)` without allocating an intermediate window raster.
+    pub(crate) fn with_fragment_target(
+        pixels: &'a mut [u32],
+        logical_width: u32,
+        logical_height: u32,
+        stride_pixels: usize,
+        source_clip: Rect,
+        dst_x: usize,
+        dst_y: usize,
+    ) -> Self {
+        let screen_rect = Rect {
+            x: 0,
+            y: 0,
+            width: logical_width as usize,
+            height: logical_height as usize,
+        };
+        let clipped = screen_rect.intersect(source_clip);
+        let offset_x = isize::try_from(dst_x)
+            .ok()
+            .zip(isize::try_from(source_clip.x).ok())
+            .and_then(|(d, s)| d.checked_sub(s));
+        let offset_y = isize::try_from(dst_y)
+            .ok()
+            .zip(isize::try_from(source_clip.y).ok())
+            .and_then(|(d, s)| d.checked_sub(s));
+        let (clip_rect, offset_x, offset_y) = match (offset_x, offset_y) {
+            (Some(ox), Some(oy)) if !clipped.is_empty() => (clipped, ox, oy),
+            _ => (Rect::empty(), 0, 0),
+        };
+        Self {
+            pixels,
+            width: logical_width,
+            height: logical_height,
+            stride_pixels,
+            clip_rect,
+            offset_x,
+            offset_y,
+        }
+    }
+
+    fn target_coords(&self, canvas_x: usize, canvas_y: usize) -> Option<(usize, usize)> {
+        let tx = isize::try_from(canvas_x).ok()?.checked_add(self.offset_x)?;
+        let ty = isize::try_from(canvas_y).ok()?.checked_add(self.offset_y)?;
+        Some((usize::try_from(tx).ok()?, usize::try_from(ty).ok()?))
+    }
+
+    fn row_slice_mut(&mut self, canvas_x: usize, canvas_y: usize, width: usize) -> Option<&mut [u32]> {
+        let (tx, ty) = self.target_coords(canvas_x, canvas_y)?;
+        let row_start = ty.checked_mul(self.stride_pixels)?.checked_add(tx)?;
+        let row_end = row_start.checked_add(width)?;
+        self.pixels.get_mut(row_start..row_end)
+    }
+
+    fn pixel_index(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return None;
+        }
+        if !self.clip_rect.contains(x as u32, y as u32) {
+            return None;
+        }
+        let (tx, ty) = self.target_coords(x as usize, y as usize)?;
+        ty.checked_mul(self.stride_pixels)?.checked_add(tx)
     }
 
     pub(crate) fn clip_rect(&self) -> Rect {
@@ -161,16 +232,7 @@ impl<'a> SurfaceCanvas<'a> {
         }
 
         for row in rect.y..rect.y.saturating_add(rect.height) {
-            let Some(row_start) = row
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(rect.x))
-            else {
-                return;
-            };
-            let Some(row_end) = row_start.checked_add(rect.width) else {
-                return;
-            };
-            let Some(row_pixels) = self.pixels.get_mut(row_start..row_end) else {
+            let Some(row_pixels) = self.row_slice_mut(rect.x, row, rect.width) else {
                 return;
             };
             row_pixels.fill(color);
@@ -192,16 +254,7 @@ impl<'a> SurfaceCanvas<'a> {
         }
 
         for row in rect.y..rect.y.saturating_add(rect.height) {
-            let Some(row_start) = row
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(rect.x))
-            else {
-                return;
-            };
-            let Some(row_end) = row_start.checked_add(rect.width) else {
-                return;
-            };
-            let Some(row_pixels) = self.pixels.get_mut(row_start..row_end) else {
+            let Some(row_pixels) = self.row_slice_mut(rect.x, row, rect.width) else {
                 return;
             };
             simd::blend_solid_bgr(row_pixels, color, alpha);
@@ -318,16 +371,7 @@ impl<'a> SurfaceCanvas<'a> {
             let g = ((top_g * inv + bot_g * t) / span) as u32 & 0xff;
             let b = ((top_b * inv + bot_b * t) / span) as u32 & 0xff;
             let row_color = (r << 16) | (g << 8) | b;
-            let Some(row_start) = (rect.y + dy)
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(rect.x))
-            else {
-                return;
-            };
-            let Some(row_pixels) = self
-                .pixels
-                .get_mut(row_start..row_start.saturating_add(rect.width))
-            else {
+            let Some(row_pixels) = self.row_slice_mut(rect.x, rect.y + dy, rect.width) else {
                 return;
             };
             row_pixels.fill(row_color);
@@ -391,23 +435,15 @@ impl<'a> SurfaceCanvas<'a> {
             else {
                 return;
             };
-            let Some(dst_row) = (dst_rect.y + row)
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(dst_rect.x))
-            else {
-                return;
-            };
             let Some(src_end) = src_row.checked_add(dst_rect.width) else {
                 return;
             };
-            let Some(dst_end) = dst_row.checked_add(dst_rect.width) else {
+            let Some(src) = src_pixels.get(src_row..src_end) else {
                 return;
             };
-            if src_end > src_pixels.len() || dst_end > self.pixels.len() {
+            let Some(dst) = self.row_slice_mut(dst_rect.x, dst_rect.y + row, dst_rect.width) else {
                 return;
-            }
-            let src = &src_pixels[src_row..src_end];
-            let dst = &mut self.pixels[dst_row..dst_end];
+            };
             simd::copy_u32s(src, dst);
         }
     }
@@ -459,16 +495,7 @@ impl<'a> SurfaceCanvas<'a> {
             let Some(src_row) = src.get(source..source_end) else {
                 return;
             };
-            let Some(dest) = (rect.y + row)
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(rect.x))
-            else {
-                return;
-            };
-            let Some(dest_end) = dest.checked_add(rect.width) else {
-                return;
-            };
-            let Some(dst) = self.pixels.get_mut(dest..dest_end) else {
+            let Some(dst) = self.row_slice_mut(rect.x, rect.y + row, rect.width) else {
                 return;
             };
             simd::blend_premultiplied_bgr(src_row, dst);
@@ -518,18 +545,12 @@ impl<'a> SurfaceCanvas<'a> {
                 Some(offset) => offset.saturating_add(src_x),
                 None => return,
             };
-            let dst_row_start = match (dst_rect.y + row).checked_mul(self.stride_pixels) {
-                Some(offset) => offset.saturating_add(dst_rect.x),
-                None => return,
-            };
             let Some(src_row) =
                 alpha.get(src_row_start..src_row_start.saturating_add(dst_rect.width))
             else {
                 return;
             };
-            let Some(dst_row) = self
-                .pixels
-                .get_mut(dst_row_start..dst_row_start.saturating_add(dst_rect.width))
+            let Some(dst_row) = self.row_slice_mut(dst_rect.x, dst_rect.y + row, dst_rect.width)
             else {
                 return;
             };
@@ -538,17 +559,7 @@ impl<'a> SurfaceCanvas<'a> {
     }
 
     fn put_pixel(&mut self, x: i32, y: i32, color: u32) {
-        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
-            return;
-        }
-        if !self.clip_rect.contains(x as u32, y as u32) {
-            return;
-        }
-
-        let Some(index) = (y as usize)
-            .checked_mul(self.stride_pixels)
-            .and_then(|offset| offset.checked_add(x as usize))
-        else {
+        let Some(index) = self.pixel_index(x, y) else {
             return;
         };
         if let Some(pixel) = self.pixels.get_mut(index) {
@@ -557,14 +568,10 @@ impl<'a> SurfaceCanvas<'a> {
     }
 
     fn put_pixel_alpha(&mut self, x: i32, y: i32, color: u32, alpha: u8) {
-        if alpha == 0 || x < 0 || y < 0 || !self.clip_rect.contains(x as u32, y as u32) {
+        if alpha == 0 {
             return;
         }
-
-        let Some(index) = (y as usize)
-            .checked_mul(self.stride_pixels)
-            .and_then(|offset| offset.checked_add(x as usize))
-        else {
+        let Some(index) = self.pixel_index(x, y) else {
             return;
         };
         if let Some(pixel) = self.pixels.get_mut(index) {
