@@ -375,7 +375,7 @@ pub fn start(entry: fn(u64)) -> ! {
 
 fn secondary_idle_entry(_arg: u64) {
     loop {
-        x86_64::instructions::hlt();
+        super::idle_wait_iteration();
     }
 }
 
@@ -383,7 +383,7 @@ pub fn start_secondary_cpu() -> ! {
     interrupts::disable();
     super::scheduler::bootstrap::enter_secondary();
     loop {
-        interrupts::enable_and_hlt();
+        super::idle_wait_iteration();
     }
 }
 

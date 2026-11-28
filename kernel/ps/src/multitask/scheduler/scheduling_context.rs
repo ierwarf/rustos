@@ -388,9 +388,28 @@ impl BudgetState {
         if !self.replenish_inner(now_ns, record_counters) {
             return None;
         }
+        let counters = self.counter_scope.counters();
+        if self.policy.budget_ns == self.policy.period_ns {
+            // A 100%-share (budget == period) per-CPU/context budget can never
+            // overconsume its single-CPU share through sub-period preemption hops;
+            // pushing each hop into the 8-slot refill queue would merge gaps
+            // forward up to `now + period` and falsely starve runnable threads.
+            let charged_ns = elapsed_ns.min(self.available_ns);
+            let overrun_ns = elapsed_ns - charged_ns;
+            self.consumed_ns = self.consumed_ns.checked_add(charged_ns)?;
+            self.available_ns = self.policy.budget_ns;
+            if record_counters {
+                saturating_add(&counters.charged_ns, charged_ns);
+                saturating_add(&counters.overrun_ns, overrun_ns);
+            }
+            return Some(ChargeOutcome {
+                charged_ns,
+                overrun_ns,
+                exhausted: false,
+            });
+        }
         let charged_ns = elapsed_ns.min(self.available_ns);
         let overrun_ns = elapsed_ns - charged_ns;
-        let counters = self.counter_scope.counters();
         self.available_ns -= charged_ns;
         self.consumed_ns = self.consumed_ns.checked_add(charged_ns)?;
         if charged_ns != 0 {
@@ -1204,5 +1223,34 @@ mod tests {
         assert_eq!(budget.available_ns, policy(3).budget_ns);
         assert_eq!(context.policy().expect("admitted policy").policy_epoch, 3);
         assert_eq!(SchedulingContextPolicy::ABI_VERSION, 1);
+    }
+
+    #[test]
+    fn full_share_budget_conserves_credit_without_refill_throttling() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        let full_share = SchedulingContextPolicy {
+            budget_ns: 10_000_000,
+            period_ns: 10_000_000,
+            refill_capacity: 8,
+            cpu_mask: 0xff,
+            criticality: 0,
+            domain: 1,
+            policy_epoch: 1,
+            timeout_endpoint_cap: 0,
+        };
+        let mut state =
+            BudgetState::admitted(full_share, BudgetCounterScope::Domain).expect("valid policy");
+        let mut now_ns = 1_000_000_000_u64;
+        for _ in 0..32 {
+            let outcome = state.charge(now_ns, 5_000).expect("bounded charge");
+            assert_eq!(outcome.charged_ns, 5_000);
+            assert_eq!(outcome.overrun_ns, 0);
+            assert!(!outcome.exhausted);
+            assert_eq!(state.conserved_ns(), Some(full_share.budget_ns));
+            assert!(state.is_eligible(now_ns));
+            now_ns += 50_000;
+        }
+        assert_eq!(state.exhaustion_count, 0);
+        assert_eq!(state.overflow_merge_count, 0);
     }
 }

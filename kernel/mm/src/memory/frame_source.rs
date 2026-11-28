@@ -188,10 +188,9 @@ struct Table<const N: usize> {
     ready: AtomicUsize,
     backlog: AtomicUsize,
     reclaiming: AtomicBool,
-    release: fn(u64, u64, usize),
 }
 impl<const N: usize> Table<N> {
-    const fn new(release: fn(u64, u64, usize)) -> Self {
+    const fn new() -> Self {
         assert!(N > 0 && N < INDEX_MASK as usize);
         Self {
             slots: [const { Slot::new() }; N],
@@ -199,7 +198,6 @@ impl<const N: usize> Table<N> {
             ready: AtomicUsize::new(0),
             backlog: AtomicUsize::new(0),
             reclaiming: AtomicBool::new(false),
-            release,
         }
     }
     fn decode(token: u64) -> Result<(usize, u64), FrameSourceError> {
@@ -382,7 +380,7 @@ impl<const N: usize> Table<N> {
             }
         }
     }
-    fn reclaim(&self, budget: usize) -> usize {
+    fn reclaim(&self, budget: usize, mut release: impl FnMut(u64, u64, usize)) -> usize {
         if budget == 0 {
             return 0;
         }
@@ -417,7 +415,7 @@ impl<const N: usize> Table<N> {
             );
             assert_eq!(references(value), 0, "source queue contains borrowed slot");
             let source = slot.read();
-            (self.release)(source.frame, handle(index, generation(value)), source.group);
+            release(source.frame, handle(index, generation(value)), source.group);
             // ORDERING: Release permits reuse after descriptor/charge cleanup.
             slot.word
                 .store(word(generation(value), 0, FREE), Ordering::Release);
@@ -456,7 +454,9 @@ impl<const N: usize> Drop for Pin<'_, N> {
     }
 }
 
-static SOURCES: Table<MAX_FRAME_SOURCES> = Table::new(release_source);
+// Keep the table all-zero at boot: embedding a cleanup function pointer here
+// would make the linker serialize all 81,920 empty slots into the signed ELF.
+static SOURCES: Table<MAX_FRAME_SOURCES> = Table::new();
 
 fn release_source(frame: u64, token: u64, group: usize) {
     match phys::release_private_file_cache_frame(frame, token)
@@ -540,7 +540,7 @@ pub fn retire_frame_sources_for_owner(owner: FrameSourceOwner) -> usize {
 /// registry, process-state, or scheduler lock: descriptor retirement can wait
 /// for a concurrent MM mutation to finish its TLB reclamation.
 pub fn reclaim_frame_sources(budget: usize) -> usize {
-    SOURCES.reclaim(budget)
+    SOURCES.reclaim(budget, release_source)
 }
 
 #[cfg(test)]

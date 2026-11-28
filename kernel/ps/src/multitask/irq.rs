@@ -55,8 +55,8 @@ static PERIODIC_FAIRNESS_TICKS: [core::sync::atomic::AtomicU8;
 // Explicit wake/block/handoff requests schedule immediately. A runnable peer
 // that merely needs fair CPU time is sampled at this bounded per-CPU cadence,
 // keeping the legacy global backend below its convoy knee until the per-CPU
-// backend cutover. Eight 1 ms ticks remain below the 20 ms maximum fair burst.
-const PERIODIC_FAIRNESS_INTERVAL_TICKS: u8 = 8;
+// backend cutover. Two 1 ms ticks bound fair queueing delay without convoy.
+const PERIODIC_FAIRNESS_INTERVAL_TICKS: u8 = 2;
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::lowlevel::interrupts::timer_interrupt_handler_addr()
@@ -664,7 +664,7 @@ pub(super) fn request_target_reschedule(target: usize) {
             .expect("scheduler targeted reschedule CPU is not Online")
     };
     let publication = super::reschedule_observation::publish_request(target, snapshot.generation);
-    if !publication.newly_pending {
+    if !publication.newly_pending && !super::scheduler::runqueue::is_cpu_running_idle(target) {
         return;
     }
     let source = current_cpu_index();

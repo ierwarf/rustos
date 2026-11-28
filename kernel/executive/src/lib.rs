@@ -4,18 +4,7 @@ extern crate alloc;
 
 use alloc::format;
 
-#[macro_export]
-macro_rules! executive_debug_println {
-    () => {{
-        nucleus_core::debug::println_newline();
-    }};
-    ($($arg:tt)*) => {{
-        nucleus_core::debug::println_fmt(format_args!($($arg)*));
-    }};
-}
-
 pub(crate) mod debug {
-    pub use crate::executive_debug_println as println;
     pub use nucleus_core::debug::*;
 }
 

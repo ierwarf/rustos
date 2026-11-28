@@ -142,8 +142,16 @@ Kernel structured log lines are rendered like:
 seq=17 ts_us=102399 tick=409596 lvl=info cat=storage mod=... line=42 pid=- tid=- msg="..."
 ```
 
-When `serial_mirror = true`, those structured lines are also written to
-debugcon. When the ring wraps, snapshots include a synthetic warning line:
+When `serial_mirror = true`, those structured lines also go to debugcon. After
+early boot a dedicated fair kernel worker batches normal debugcon output from
+bounded per-CPU queues, including milestones and userspace debug writes. The
+producer never waits for port `0xe9` once the worker takes over. Queue refusal
+is explicit (a short write or `EAGAIN` for the debug syscall); required kernel
+milestones have dedicated reserve and a loss notification that fails KVM smoke.
+Very early output and panic/terminal diagnostics keep their synchronous path.
+Normal lifecycle successes are sampled from boot by default; enable boot
+tracing for their full stream. When the text ring wraps, snapshots include a
+synthetic warning line:
 
 ```text
 msg="oldest logs dropped"
@@ -434,7 +442,7 @@ Kernel structured log line은 다음 형태로 출력됩니다.
 seq=17 ts_us=102399 tick=409596 lvl=info cat=storage mod=... line=42 pid=- tid=- msg="..."
 ```
 
-`serial_mirror = true`이면 이 structured line이 debugcon에도 기록됩니다.
+`serial_mirror = true`이면 구조화 로그도 debugcon으로 보냅니다. 초기 부팅 이후에는 CPU별 큐에 넣은 일반 로그를 별도 커널 작업자가 묶어서 출력합니다. 초기 부팅과 패닉 출력은 동기 방식을 유지합니다. 반복되는 정상 프로세스 단계는 기본으로 일부만 기록하며, 상세 출력은 `boot_trace_enabled`로 켤 수 있습니다.
 ring이 wrap되면 snapshot에 synthetic warning line이 포함됩니다.
 
 ```text

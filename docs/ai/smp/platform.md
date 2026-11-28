@@ -141,6 +141,13 @@ Startup waits are bounded and use a generation-matched acknowledgement. The
 BSP must not hold a raw spin lock while waiting. Timeout leaves the topology
 unpublished and fails the boot; partial commercial SMP is forbidden.
 
+Per-AP INIT/SIPI progress, Rust entry and individual TSC warp samples are
+recorded in the bounded milestone ring. `boot_trace_enabled` also sends those
+intermediate details to debugcon for diagnosis, off by default to avoid
+synchronous console work per AP. Private-ready, parked, clocksource-selection,
+scheduler-ready, online and qualification evidence still use the required
+sink path regardless of the trace setting. No startup wait or check is skipped.
+
 ## 6. Interrupt, timer, and IPI protocol
 
 IPI vectors are statically reserved and typed:

@@ -17,21 +17,27 @@
 //! - **Evidence:** `linux-syscall-offload`, `mm-broker`, `process-lifecycle`,
 //!   `entropy-readiness`, and `service-call-authority`.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::btree_map::{BTreeMap, Entry};
 use core::mem::size_of;
+use core::ops::Deref;
 
 use rustos_user_abi::syscall::{
-    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
-    RustosMmBrokerArgs, RustosMmConflictBrokerResult, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmLibraryBindBrokerResult, RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
-    MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DEVICE_BUFFER, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
-    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE,
-    MM_BROKER_BIND_FLAG_DEMAND, MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
-    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
-    MM_BROKER_OP_MAP_FILE_SHARED,
-    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
+    identity_is_exact_sender, LinuxRlimit, LinuxSyscallOffloadFastRequest,
+    LinuxSyscallOffloadFastResponse, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+    LinuxUtsName, RustosMmBrokerArgs, RustosMmConflictBrokerResult, RustosMmFdBrokerResult,
+    RustosMmLayoutBrokerResult, RustosMmLibraryBindBrokerResult, RustosMmMapBrokerResult,
+    LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE, MM_BROKER_ABI_VERSION,
+    MM_BROKER_BIND_FLAG_DEMAND, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DEVICE_BUFFER,
+    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
+    MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_BIND_LIBRARY,
+    MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
+    MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_FILE_SHARED, MM_BROKER_OP_MAP_MEMFD_SHARED,
+    MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_CONFLICT, MM_BROKER_OP_QUERY_LAYOUT,
     MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
-    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ENTROPY_BROKER,
+    SYS_RUSTOS_MM_BROKER,
 };
 use spin::Mutex;
 
@@ -125,7 +131,62 @@ pub enum IdKind {
     Egid,
 }
 
-static PROCESS_POLICY: Mutex<BTreeMap<u64, LinuxPolicyState>> = Mutex::new(BTreeMap::new());
+struct ProcessPolicyTable {
+    map: BTreeMap<u64, LinuxPolicyState>,
+    last_id: Option<(u64, Credentials)>,
+}
+
+impl ProcessPolicyTable {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            last_id: None,
+        }
+    }
+
+    fn get_mut(&mut self, pid: &u64) -> Option<&mut LinuxPolicyState> {
+        if self.last_id.is_some_and(|(cached, _)| cached == *pid) {
+            self.last_id = None;
+        }
+        self.map.get_mut(pid)
+    }
+
+    fn entry(&mut self, pid: u64) -> Entry<'_, u64, LinuxPolicyState> {
+        if self.last_id.is_some_and(|(cached, _)| cached == pid) {
+            self.last_id = None;
+        }
+        self.map.entry(pid)
+    }
+
+    fn insert(&mut self, pid: u64, state: LinuxPolicyState) -> Option<LinuxPolicyState> {
+        if self.last_id.is_some_and(|(cached, _)| cached == pid) {
+            self.last_id = None;
+        }
+        self.map.insert(pid, state)
+    }
+
+    fn remove(&mut self, pid: &u64) -> Option<LinuxPolicyState> {
+        if self.last_id.is_some_and(|(cached, _)| cached == *pid) {
+            self.last_id = None;
+        }
+        self.map.remove(pid)
+    }
+
+    fn clear(&mut self) {
+        self.last_id = None;
+        self.map.clear();
+    }
+}
+
+impl Deref for ProcessPolicyTable {
+    type Target = BTreeMap<u64, LinuxPolicyState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+static PROCESS_POLICY: Mutex<ProcessPolicyTable> = Mutex::new(ProcessPolicyTable::new());
 // A borrowed state leaves its tree slot allocated. Repeated MM requests must
 // not remove/reallocate a B-tree node just to transfer exclusive ownership.
 static MM_POLICY: Mutex<BTreeMap<u64, Option<MmPolicyState>>> = Mutex::new(BTreeMap::new());
@@ -392,22 +453,107 @@ pub fn handle_setpriority(
     response.payload_len = 0;
 }
 
+fn lookup_or_init_creds(
+    policy: &mut ProcessPolicyTable,
+    pid: u64,
+    default_creds: impl FnOnce(&mut ProcessPolicyTable) -> Credentials,
+) -> Credentials {
+    if let Some((cached_pid, creds)) = policy.last_id {
+        if cached_pid == pid {
+            return creds;
+        }
+    }
+    let creds = if let Some(state) = policy.map.get(&pid) {
+        state.credentials
+    } else {
+        default_creds(policy)
+    };
+    policy.last_id = Some((pid, creds));
+    creds
+}
+
 pub fn handle_id(
     request: &LinuxSyscallOffloadRequest,
     kind: IdKind,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
     let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
+    let creds = lookup_or_init_creds(&mut policy, request.pid, |db| {
+        ensure_state_with_inheritance(db, request).credentials
+    });
     let value = match kind {
-        IdKind::Uid => state.credentials.uid,
-        IdKind::Gid => state.credentials.gid,
-        IdKind::Euid => state.credentials.euid,
-        IdKind::Egid => state.credentials.egid,
+        IdKind::Uid => creds.uid,
+        IdKind::Gid => creds.gid,
+        IdKind::Euid => creds.euid,
+        IdKind::Egid => creds.egid,
     };
     response.status = 0;
     response.payload_len = size_of::<u32>() as u32;
     response.payload[..size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Fast path for compact ID getters (`getuid`/`getgid`/`geteuid`/`getegid`).
+/// Operates directly on the 40-byte request and 32-byte response without
+/// zero-filling full ~1 KiB offload frames.
+pub fn handle_fast_id_request(
+    request: &LinuxSyscallOffloadFastRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> LinuxSyscallOffloadFastResponse {
+    let mut fast = LinuxSyscallOffloadFastResponse {
+        version: SYSCALL_OFFLOAD_ABI_VERSION,
+        op: request.op,
+        ..LinuxSyscallOffloadFastResponse::default()
+    };
+    if request.version != SYSCALL_OFFLOAD_ABI_VERSION || request.reserved0 != 0 {
+        fast.status = errno::EINVAL;
+        return fast;
+    }
+    if !identity_is_exact_sender(request.pid, request.tid, sender_pid, sender_tid) {
+        fast.status = errno::EACCES;
+        return fast;
+    }
+    let kind = match request.op {
+        SYSCALL_OFFLOAD_OP_LINUX_GETUID => IdKind::Uid,
+        SYSCALL_OFFLOAD_OP_LINUX_GETGID => IdKind::Gid,
+        SYSCALL_OFFLOAD_OP_LINUX_GETEUID => IdKind::Euid,
+        SYSCALL_OFFLOAD_OP_LINUX_GETEGID => IdKind::Egid,
+        _ => {
+            fast.status = errno::EINVAL;
+            return fast;
+        }
+    };
+    let mut policy = policy_db().lock();
+    let creds = lookup_or_init_creds(&mut policy, request.pid, |db| {
+        let state = LinuxPolicyState {
+            credentials: Credentials {
+                uid: request.uid,
+                gid: request.gid,
+                euid: request.euid,
+                egid: request.egid,
+                suid: request.euid,
+                sgid: request.egid,
+            },
+            rlimits: default_rlimits(),
+            umask: DEFAULT_UMASK,
+            nice: 0,
+            parent_pid: 0,
+            pgid: request.pid,
+            sid: request.pid,
+        };
+        let creds = state.credentials;
+        db.map.insert(request.pid, state);
+        creds
+    });
+    let value = match kind {
+        IdKind::Uid => creds.uid,
+        IdKind::Gid => creds.gid,
+        IdKind::Euid => creds.euid,
+        IdKind::Egid => creds.egid,
+    };
+    fast.payload_len = size_of::<u32>() as u32;
+    fast.payload[..size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+    fast
 }
 
 pub fn handle_setuid(
@@ -607,7 +753,7 @@ pub fn handle_memfd_create(
     response.payload_len = 0;
 }
 
-fn policy_db() -> &'static Mutex<BTreeMap<u64, LinuxPolicyState>> {
+fn policy_db() -> &'static Mutex<ProcessPolicyTable> {
     &PROCESS_POLICY
 }
 
@@ -666,7 +812,7 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
 /// Look up a child's initial state, inheriting umask/pgid/sid from the parent if
 /// the parent already has a tracked state. Called with the policy lock held.
 fn ensure_state_with_inheritance<'a>(
-    db: &'a mut BTreeMap<u64, LinuxPolicyState>,
+    db: &'a mut ProcessPolicyTable,
     request: &LinuxSyscallOffloadRequest,
 ) -> &'a mut LinuxPolicyState {
     if !db.contains_key(&request.pid) {
@@ -2715,5 +2861,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(skipped, brk);
+    }
+
+    #[test]
+    fn handle_fast_id_request_uses_and_invalidates_last_creds_cache() {
+        let _guard = super::super::linux_policy::PROCESS_POLICY.lock();
+        drop(_guard);
+        clear_process_policy();
+
+        let req = LinuxSyscallOffloadFastRequest {
+            version: SYSCALL_OFFLOAD_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_GETUID,
+            pid: 77_001,
+            tid: 77_002,
+            uid: 1000,
+            gid: 1000,
+            euid: 0,
+            egid: 0,
+            ..LinuxSyscallOffloadFastRequest::default()
+        };
+        let resp1 = handle_fast_id_request(&req, req.pid, req.tid);
+        assert_eq!(resp1.status, 0);
+        assert_eq!(u32::from_le_bytes(resp1.payload[..4].try_into().unwrap()), 1000);
+
+        // Mutate credentials through setuid(0): MRU cache must invalidate.
+        let mut setuid_req = LinuxSyscallOffloadRequest {
+            op: rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_SETUID,
+            pid: req.pid,
+            tid: req.tid,
+            mask: 0,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+        let mut full_resp = LinuxSyscallOffloadResponse::default();
+        handle_setuid(&setuid_req, &mut full_resp);
+        assert_eq!(full_resp.status, 0);
+
+        let resp2 = handle_fast_id_request(&req, req.pid, req.tid);
+        assert_eq!(resp2.status, 0);
+        assert_eq!(u32::from_le_bytes(resp2.payload[..4].try_into().unwrap()), 0);
+
+        // Process exit must clear cached credentials too.
+        handle_process_exit_pid(req.pid);
+        let reused = LinuxSyscallOffloadFastRequest { uid: 2000, ..req };
+        let resp3 = handle_fast_id_request(&reused, req.pid, req.tid);
+        assert_eq!(u32::from_le_bytes(resp3.payload[..4].try_into().unwrap()), 2000);
+        clear_process_policy();
     }
 }

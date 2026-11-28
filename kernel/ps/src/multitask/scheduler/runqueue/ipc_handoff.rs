@@ -256,82 +256,103 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
     if MAILBOX_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
     }
-    // One record at a time, so no staging array scales with the slot count. The
-    // pending edge is cleared only by the pop that finds the mailbox empty, so a
-    // record popped but not yet adopted stays advertised.
+    const MAILBOX_DRAIN_BATCH: usize = 16;
+    const EMPTY_TRANSFER: RunTransfer = RunTransfer {
+        slot: 0,
+        generation: 0,
+        weight: 0,
+    };
     let mut count = 0;
     loop {
-        let Some(record) = (|| {
+        let mut batch = [EMPTY_TRANSFER; MAILBOX_DRAIN_BATCH];
+        let mut batch_len = 0_usize;
+        let emptied = {
             let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
-            let popped = mailbox.pop();
-            if popped.is_none() {
+            while batch_len < MAILBOX_DRAIN_BATCH {
+                let Some(record) = mailbox.pop() else {
+                    break;
+                };
+                batch[batch_len] = record;
+                batch_len += 1;
+            }
+            MAILBOX_COUNTS[cpu].store(mailbox.len(), Ordering::Release);
+            let is_empty = mailbox.is_empty();
+            if is_empty {
                 // ORDERING: clearing under the mailbox owner closes the race with
                 // a producer that publishes the next 0-to-1 notification edge.
                 MAILBOX_PENDING[cpu].store(0, Ordering::Release);
                 update_cpu_mask_bit(&MAILBOX_PENDING_CPU_MASK, cpu, false);
             }
-            popped
-        })() else {
+            is_empty
+        };
+        if batch_len == 0 {
             break;
-        };
-        count += 1;
+        }
+        count += batch_len;
         let mut rq = RUN_QUEUES[cpu].inner.lock();
-        let observed = owner(record.slot);
-        if observed.state != RunOwnerState::RemoteQueued
-            || observed.cpu != Some(cpu)
-            || observed.generation != record.generation
-        {
-            if observed.state.is_terminal() || observed.generation > record.generation {
-                continue;
+        for record in batch[..batch_len].iter().copied() {
+            let observed = owner(record.slot);
+            if observed.state != RunOwnerState::RemoteQueued
+                || observed.cpu != Some(cpu)
+                || observed.generation != record.generation
+            {
+                if observed.state.is_terminal() || observed.generation > record.generation {
+                    continue;
+                }
+                panic!(
+                    "scheduler mailbox record lost exact owner slot={} record_gen={} observed={observed:?}",
+                    record.slot, record.generation
+                );
             }
-            panic!(
-                "scheduler mailbox record lost exact owner slot={} record_gen={} observed={observed:?}",
-                record.slot, record.generation
-            );
-        }
-        rq.insert(record.slot, record.weight);
-        // Lock-free run-intent and wait writers may change metadata bits of
-        // the `RemoteQueued` owner under this adoption; custody (state, CPU,
-        // generation) can only end in a terminal withdrawal while the exact
-        // mailbox record is held.
-        #[cfg(test)]
-        if TEST_ADOPTION_RETIRE_SLOT
-            .compare_exchange(record.slot, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // A remote terminal withdrawal between the load and the CAS.
-            retire(record.slot, record.weight);
-        }
-        let mut expected = observed;
-        let adopted = loop {
-            match transition(record.slot, expected, OwnerEvent::Adopt, Some(cpu)) {
-                Ok(committed) => {
-                    let next = committed.next;
-                    committed.into_duty().run_queue_inserted(&rq);
-                    break Some(next);
-                }
-                Err(winner) if winner.state.is_terminal() || winner.generation > record.generation => {
-                    // A remote terminal withdrawal (possibly already released and
-                    // the slot reused) took the task off its mailbox custody after
-                    // the load above; it no longer needs the queue.
-                    rq.remove(record.slot, record.weight);
-                    break None;
-                }
-                Err(winner) => {
-                    if winner.state != RunOwnerState::RemoteQueued
-                        || winner.cpu != Some(cpu)
-                        || winner.generation != record.generation
-                    {
-                        panic!("scheduler mailbox adoption lost owner race observed={winner:?}");
+            rq.insert(record.slot, record.weight);
+            // Lock-free run-intent and wait writers may change metadata bits of
+            // the `RemoteQueued` owner under this adoption; custody (state, CPU,
+            // generation) can only end in a terminal withdrawal while the exact
+            // mailbox record is held.
+            #[cfg(test)]
+            if TEST_ADOPTION_RETIRE_SLOT
+                .compare_exchange(record.slot, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                // A remote terminal withdrawal between the load and the CAS.
+                retire(record.slot, record.weight);
+            }
+            let mut expected = observed;
+            let adopted = loop {
+                match transition(record.slot, expected, OwnerEvent::Adopt, Some(cpu)) {
+                    Ok(committed) => {
+                        let next = committed.next;
+                        committed.into_duty().run_queue_inserted(&rq);
+                        break Some(next);
                     }
-                    expected = winner;
+                    Err(winner)
+                        if winner.state.is_terminal() || winner.generation > record.generation =>
+                    {
+                        // A remote terminal withdrawal (possibly already released and
+                        // the slot reused) took the task off its mailbox custody after
+                        // the load above; it no longer needs the queue.
+                        rq.remove(record.slot, record.weight);
+                        break None;
+                    }
+                    Err(winner) => {
+                        if winner.state != RunOwnerState::RemoteQueued
+                            || winner.cpu != Some(cpu)
+                            || winner.generation != record.generation
+                        {
+                            panic!("scheduler mailbox adoption lost owner race observed={winner:?}");
+                        }
+                        expected = winner;
+                    }
                 }
+            };
+            if let Some(next) = adopted {
+                frame_publication::bind_local_owner_generation(record.slot, next.generation);
             }
-        };
-        if let Some(next) = adopted {
-            frame_publication::bind_local_owner_generation(record.slot, next.generation);
         }
         RUN_QUEUES[cpu].publish_load(&mut rq);
+        if emptied {
+            break;
+        }
     }
     count
 }

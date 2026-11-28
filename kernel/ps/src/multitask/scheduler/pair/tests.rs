@@ -236,3 +236,37 @@ fn reset_before_publication_clears_all_cpu_pair_descriptors() {
         assert!(!break_requested(cpu));
     }
 }
+
+#[test]
+fn breaking_phase_refuses_new_break_flags_so_concurrent_wakes_retry_until_dissolved() {
+    const PARTNER: usize = 92;
+    const CPU: usize = 2;
+    let _cpu = crate::multitask::cpu_local::test_publication_lock();
+    let _runtime = scheduling_runtime::test_serial_guard();
+    let _queue = runqueue::test_serial_guard();
+    runqueue::reset_before_publication();
+
+    runqueue::admit_blocked(PARTNER);
+    let blocked = runqueue::owner(PARTNER);
+    let paired = runqueue::pair_claim(PARTNER, blocked, CPU).unwrap();
+
+    let ctrl = &PAIR_CONTROLS[CPU];
+    ctrl.partner_slot_plus1.store(PARTNER as u64 + 1, Ordering::Release);
+    ctrl.partner_owner_gen.store(paired.generation, Ordering::Release);
+    ctrl.state.store(
+        PairControl::pack(super::PHASE_BREAKING, FLAG_BREAK_REQUESTED, 3),
+        Ordering::Release,
+    );
+
+    assert!(!super::request_break_with_wake(CPU, PARTNER, paired.generation));
+    assert_eq!(ctrl.state.load(Ordering::Acquire) & FLAG_WAKE_PARTNER, 0);
+
+    let dissolved = runqueue::wait::dissolve_paired_to_blocked(PARTNER, 1, 0x1122, || {
+        runqueue::pair_break_blocked(PARTNER, paired).unwrap()
+    });
+    assert_eq!(dissolved.state, RunOwnerState::Blocked);
+    ctrl.partner_slot_plus1.store(0, Ordering::Release);
+    ctrl.partner_owner_gen.store(0, Ordering::Release);
+    ctrl.state.store(PHASE_VACANT, Ordering::Release);
+    runqueue::reset_before_publication();
+}

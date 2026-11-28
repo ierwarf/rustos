@@ -19,6 +19,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MilestoneOutputClass {
     BestEffort,
+    BootTrace,
     Measurement,
     Required,
     QualificationCritical,
@@ -30,12 +31,19 @@ impl MilestoneOutputClass {
         matches!(self, Self::Required | Self::QualificationCritical)
     }
 
+    pub(super) const fn admits_debugcon(self, info_enabled: bool, boot_trace: bool) -> bool {
+        match self {
+            Self::BootTrace => boot_trace,
+            _ => self.must_reach_sink() || info_enabled,
+        }
+    }
+
     pub(super) const fn output_attempts(self) -> usize {
         match self {
             Self::Required | Self::QualificationCritical => {
                 super::REQUIRED_MILESTONE_OUTPUT_ATTEMPTS
             }
-            Self::BestEffort | Self::Measurement => 1,
+            Self::BestEffort | Self::BootTrace | Self::Measurement => 1,
         }
     }
 }
@@ -48,6 +56,22 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
         | "smp-qualification-complete"
         | "hecs-registers"
         | "hecs-rsp-arrivals" => MilestoneOutputClass::QualificationCritical,
+        // These timings describe intermediate steps, not proof of a usable
+        // CPU. Keep them in the milestone ring without serializing every
+        // AP's INIT/SIPI progress onto the default boot's critical path.
+        "smp-init-assert-begin"
+        | "smp-init-assert-complete"
+        | "smp-init-deassert-complete"
+        | "smp-init-settled"
+        | "smp-first-sipi-complete"
+        | "smp-second-sipi-complete"
+        | "smp-startup-ipi-sent"
+        | "smp-ap-rust-entry"
+        | "smp-ap-tsc-warp"
+        | "console-load-enter"
+        | "console-load-allowed"
+        | "console-read-begin"
+        | "console-read-done" => MilestoneOutputClass::BootTrace,
         _ if name.starts_with("kernel-scheduler-") => MilestoneOutputClass::Measurement,
         _ if name.starts_with("smp-")
             || name.starts_with("product-")
@@ -59,6 +83,8 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "linux-user-page-fault-address"
             || name == "kernel-stack-highwater"
             || name == "kernel-stack-guard-fault"
+            || name == "fatal-init-load"
+            || name == "fatal-init-spawn"
             || name == "pager-user-fault-vma-rejected"
             || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"
@@ -107,7 +133,6 @@ pub(super) fn per_process_lifecycle(name: &str) -> bool {
         name,
         "spawn-user-process"
             | "spawn-user-process-state"
-            | "linux-process-termination"
             | "retired-task-ipc-cancelled"
             | "pager-anon-reservation"
             | "proc-prepare-published"
@@ -118,12 +143,14 @@ pub(super) fn per_process_lifecycle(name: &str) -> bool {
             | "proc-commit-prepare-done"
             | "proc-activate-batch-member"
             | "proc-activate-batch-committed"
+            | "proc-activate-committed"
     ) || name.starts_with("lifecycle-")
 }
 
-/// Boot is fully visible; later occurrences are sampled at powers of two so the
-/// stream still shows that the family is alive and how much of it there was.
-pub(super) const LIFECYCLE_EARLY_EMISSIONS: u64 = 256;
+/// Keep a small sample during boot too, instead of echoing every successful
+/// process transition. The milestone history keeps the unsampled data; full
+/// output is opt-in with boot tracing. Failure records are not sampled.
+pub(super) const LIFECYCLE_EARLY_EMISSIONS: u64 = 16;
 
 pub(super) const fn lifecycle_sample_admits(occurrence: u64) -> bool {
     occurrence <= LIFECYCLE_EARLY_EMISSIONS || occurrence.is_power_of_two()

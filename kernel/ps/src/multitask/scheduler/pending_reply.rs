@@ -70,6 +70,15 @@ pub(in crate::multitask) fn present() -> bool {
 fn caller_parked_on(caller: u64, cpu: usize) -> bool {
     let Some(slot) = task_directory::hint(caller) else { return false };
     let owner = runqueue::owner(slot);
+    // An unfused server calls `SYS_RUSTOS_IPC_REPLY` while a cold/warm-paired
+    // client is already `Paired` on this CPU (`PairPark` uses `WaitRule::Keep`,
+    // so `wait_armed` stays true). Treating `Paired` on `cpu` (on a reply
+    // wait) alongside `Blocked` avoids immediately popping the pair before the
+    // server's next `RECV` and lets the stashed reply trigger the direct resume.
+    if owner.state == runqueue::RunOwnerState::Paired {
+        return owner.cpu == Some(cpu)
+            && owner.wait_reason_kind == runqueue::wait::REASON_ENDPOINT_REPLY;
+    }
     // A Blocked owner word names no CPU: the resident cell does (an IPC wait
     // parks its loans where it blocked), and a wait that parked nothing wakes
     // on the CPU it last ran on.

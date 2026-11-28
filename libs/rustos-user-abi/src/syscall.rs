@@ -1535,6 +1535,10 @@ pub const LIFECYCLE_BROKER_MODE_DRAIN: u16 = 0;
 /// `VfsPolicy` capability may probe: vfsd uses it to prove that the owner of a
 /// POSIX record lock still exists when an exit event may have been lost.
 pub const LIFECYCLE_BROKER_MODE_PROBE_PIDS: u16 = 1;
+/// `LifecycleDrainBrokerArgs::mode`: map the shared read-only notification page
+/// for the caller's lifecycle consumer and write the consumer's `AtomicU64`
+/// sequence word address to `*out_events_ptr`.
+pub const LIFECYCLE_BROKER_MODE_MAP_NOTIFY: u16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

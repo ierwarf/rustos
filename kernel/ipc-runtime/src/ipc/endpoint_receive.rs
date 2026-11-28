@@ -239,7 +239,11 @@ pub(super) fn take_fast_request_inline<const N: usize>(
             let spill = if spilled {
                 frame.spill.as_mut().map(|spill| core::mem::take(&mut spill.request))
             } else {
-                request[..frame.request_len].copy_from_slice(&frame.request[..frame.request_len]);
+                super::copy_uninit_prefix(
+                    &frame.request,
+                    frame.request_len,
+                    &mut request[..frame.request_len],
+                );
                 None
             };
             frame.state = FastCallState::RequestTaken;

@@ -10,6 +10,27 @@ pub(super) fn init_bootstrap_task(_id: u64) {
     boot::bootstrap_init_process();
 }
 
+/// Dedicated fair-class consumer; never hold up housekeeping, IPC cleanup,
+/// or a log producer for potentially slow QEMU port I/O.
+pub(super) fn nucleus_debugcon_task(_id: u64) {
+    use nucleus_core::debug;
+
+    x86_64::instructions::interrupts::enable();
+    let mut consumer = loop {
+        if let Some(consumer) = debug::try_start_background_debugcon() {
+            break consumer;
+        }
+        ps_api::yield_now();
+    };
+    loop {
+        // Poll infrequently when idle rather than having IRQ/locked producers
+        // re-enter the scheduler to kick the logger. No HLT on this worker.
+        finish_background_turn(consumer.drain_turn(), ps_api::yield_now, || {
+            kernel_hal::api::arch::rtc::sleep(4);
+        });
+    }
+}
+
 pub(super) fn nucleus_housekeeping_task(_id: u64) {
     flow_debug(60, "housekeeping task entered");
     ps_api::register_housekeeping_task();

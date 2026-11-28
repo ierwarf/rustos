@@ -4,7 +4,7 @@
 use super::*;
 
 use rustos_user_abi::syscall::{ServiceCapability,
-    LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_PROBE_PIDS,
+    LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_MAP_NOTIFY, LIFECYCLE_BROKER_MODE_PROBE_PIDS,
     LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LifecycleDrainBrokerArgs,
     LifecyclePidProbeWire,
     ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
@@ -116,9 +116,21 @@ fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool
 
 fn lifecycle_drain_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
     args.abi_version == LIFECYCLE_DRAIN_BROKER_ABI_VERSION
-        && matches!(args.mode, LIFECYCLE_BROKER_MODE_DRAIN | LIFECYCLE_BROKER_MODE_PROBE_PIDS)
+        && matches!(
+            args.mode,
+            LIFECYCLE_BROKER_MODE_DRAIN
+                | LIFECYCLE_BROKER_MODE_PROBE_PIDS
+                | LIFECYCLE_BROKER_MODE_MAP_NOTIFY
+        )
         && args.reserved1 == 0
         && args.reserved2 == 0
+}
+
+fn lifecycle_map_notify_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
+    args.mode == LIFECYCLE_BROKER_MODE_MAP_NOTIFY
+        && args.out_events_ptr != 0
+        && args.out_capacity == 1
+        && args.out_count_ptr == 0
 }
 
 // BEGIN lifecycle-pid-probe
@@ -217,6 +229,14 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         } else {
             offload_ops::LifecycleConsumer::VfsPolicy
         };
+        if args.mode == LIFECYCLE_BROKER_MODE_MAP_NOTIFY {
+            if !lifecycle_map_notify_args_are_valid(&args) {
+                return Err(LINUX_EINVAL);
+            }
+            let notify_va = offload_ops::map_lifecycle_notify_for_consumer(consumer)?;
+            write_user_bytes(args.out_events_ptr, &notify_va.to_le_bytes())?;
+            return Ok(notify_va);
+        }
         offload_ops::drain_lifecycle_events(&args, consumer)
     })())
 }
@@ -382,8 +402,9 @@ mod tests {
     };
     use crate::multitask;
     use rustos_user_abi::syscall::{
-        LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_PROBE_PIDS,
-        LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
+        LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_MAP_NOTIFY,
+        LIFECYCLE_BROKER_MODE_PROBE_PIDS, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+        LIFECYCLE_DRAIN_MAX_EVENTS,
         LifecycleDrainBrokerArgs, LifecyclePidProbeWire, ROOTD_MEMORY_BROKER_ABI_VERSION,
         ROOTD_MEMORY_CENSUS_MAX_ENTRIES, ROOTD_TERMINATE_BROKER_ABI_VERSION,
         RustosRootdMemoryBrokerArgs, RustosRootdTerminateBrokerArgs,
@@ -422,7 +443,11 @@ mod tests {
             ..valid
         }));
         assert!(!lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
-            mode: 2,
+            mode: 3,
+            ..valid
+        }));
+        assert!(lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
+            mode: LIFECYCLE_BROKER_MODE_MAP_NOTIFY,
             ..valid
         }));
     }

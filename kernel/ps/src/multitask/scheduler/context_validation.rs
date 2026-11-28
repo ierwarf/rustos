@@ -80,6 +80,38 @@ pub(super) unsafe fn copy_saved_context(saved_rsp: usize) -> Option<SavedContext
     Some(unsafe { ptr::read(saved_rsp as *const SavedContext) })
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SavedHeader {
+    rsp: u64,
+    ss: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+}
+
+const _: () = {
+    assert!(mem::offset_of!(SavedContext, ss) - mem::offset_of!(SavedContext, rsp) == 8);
+    assert!(mem::offset_of!(SavedContext, rip) - mem::offset_of!(SavedContext, rsp) == 16);
+    assert!(mem::offset_of!(SavedContext, cs) - mem::offset_of!(SavedContext, rsp) == 24);
+    assert!(mem::offset_of!(SavedContext, rflags) - mem::offset_of!(SavedContext, rsp) == 32);
+    assert!(mem::size_of::<SavedHeader>() == 40);
+};
+
+/// Read only the trailing control header (`rsp, ss, rip, cs, rflags`) needed to
+/// validate a frame, avoiding a full 416-byte `SavedContext` (including XMM)
+/// stack copy on every context switch.
+/// # Safety
+/// Caller must prove complete initialized bounds, allocation lifetime and byte
+/// stability (IRQ-stabilized Current/Prepared or existing claim exclusion).
+unsafe fn read_saved_header(saved_rsp: usize) -> Option<SavedHeader> {
+    if saved_rsp == 0 || (saved_rsp & (mem::align_of::<SavedContext>() - 1)) != 0 {
+        return None;
+    }
+    let header_ptr = (saved_rsp + mem::offset_of!(SavedContext, rsp)) as *const SavedHeader;
+    Some(unsafe { ptr::read(header_ptr) })
+}
+
 /// Validates a stable saved context using only the supplied frame view.
 ///
 /// Error strings are the scheduler's diagnostic ABI; preserve them exactly.
@@ -107,7 +139,7 @@ pub(super) fn validate_published_saved_context(
     // SAFETY: bounds were checked above; the caller retains frame currency,
     // allocation custody and byte stability for this validator invocation.
     let saved =
-        unsafe { copy_saved_context(saved_rsp) }.ok_or("saved context pointer is invalid")?;
+        unsafe { read_saved_header(saved_rsp) }.ok_or("saved context pointer is invalid")?;
     if (saved.rflags & RFLAGS_RESERVED_BIT_1) == 0 {
         return Err("saved rflags lost the reserved bit");
     }

@@ -243,6 +243,17 @@ pub(in crate::multitask::scheduler) fn lane_install(
         ArchitectureEffect::SyscallStack(top, register_ipc) => {
             crate::user::syscall::set_kernel_stack_top_masked(cpu, top, register_ipc)
         }
+        ArchitectureEffect::Segments(state, false) => {
+            // Hardware lane switches stay in kernel mode (`return_to_user == false`)
+            // with `IA32_GS_BASE` already holding this CPU's kernel base, so only
+            // changed TLS bases need WRMSR across cross-root switches.
+            if previous.fs != state.fs {
+                FsBase::write(VirtAddr::new(state.fs));
+            }
+            if previous.gs != state.gs {
+                KernelGsBase::write(VirtAddr::new(state.gs));
+            }
+        }
         other => hardware_effect(cpu, other),
     });
     #[cfg(test)]

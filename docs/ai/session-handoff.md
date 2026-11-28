@@ -6,6 +6,79 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## Background debugcon and boot log volume (2026-11-28)
+
+- Kept QEMU debugcon (`0xe9`) and the evidence format. After the scheduler
+  starts the dedicated fair debugcon worker, normal producers enqueue into
+  bounded per-CPU slots and the worker batches writes with IRQs enabled.
+  Early output and terminal crash evidence keep their direct path. Required
+  milestones have reserved slots and an explicit loss marker that fails KVM.
+- Default output samples successful process transitions, keeps per-file boot
+  load detail in the milestone history unless boot tracing is enabled, and
+  avoids duplicate `uiserver` readiness/GPU activation messages.
+- The first 48-general-slot experiment overflowed on one vCPU. The shipping
+  layout is 512 BSP/256 AP slots, 32 per CPU reserved, in `.bss`. Ignored
+  evidence: `build/async-log/` (iterations) and `build/async-log-bsp/` (final).
+- A pre-final 16-vCPU/50%-pressure run had zero debugcon losses but timed out
+  after Linux DVM recorded `SIGXCPU RLIMIT_RTTIME` in its GPU display relay;
+  `build/async-log/pair-v16-p50-1-candidate.*` and
+  `build/kvm/debugcon-history/1795873799104-90637.dvm.txt`. The DVM image and
+  relay policy were not changed (outside this logging-only request).
+- Debug, executive, UI readiness and host-loss tests passed; the formal
+  registry check and 845 selected native witnesses passed before the final
+  BSP capacity change. Workspace check, 35 debug tests and the signed build
+  passed after that change.
+- Final 16-vCPU idle A/B (three pairs, six passes): host time after both
+  guests spawned to Wayclick's first frame went 3,928 → 2,932 ms (median);
+  UI settlement 3,469 → 2,780 ms. Debugcon lines before the guest first-frame
+  milestone went 968 → 751 (median; bytes 211,010 → 144,183).
+- Final 16-vCPU/50%-pressure candidate passed 3/3; control passed 2/3 and
+  timed out once waiting for Wayclick after GPU/UI readiness. No loaded A/B
+  median is published. The control-only failure's optional CPU snapshot was
+  partial (alternate signed control disk versus current staged ELF symbols),
+  so it does not explain the Wayclick timeout.
+- Final 1-vCPU idle smoke passed 2/2 with the background-writer and full UI
+  readiness markers. Guest first frames were 1,552 and 8,141 ms: the slow
+  run's display milestone was at 7,241 ms. Neither is a UP speed baseline.
+  All eight final candidate boots reported zero debugcon discard/overflow
+  counters. No new transport, full PR seal, or physical test.
+
+## Boot critical-path optimization (2026-11-28)
+
+- Control and candidate were signed from the same checkout, including the
+  pre-existing IPC/scheduler work. Private artifacts and measurements live in
+  `build/boot-speed/`.
+- The 81,920-slot immutable frame-source table is now zero-filled `.bss`;
+  the signed kernel ELF shrank from 26,402,928 to 18,537,632 bytes and the
+  writable load segment's memory size is unchanged. Cold reclaim remains
+  bound to the kernel's release routine.
+- Detailed per-AP INIT/SIPI/Rust-entry/TSC timings stay in the milestone ring
+  and only reach debugcon with boot tracing enabled. The required AP lifecycle
+  and boot acceptance records, waits, checks and image signature are unchanged.
+- Workspace check, formal contract registry check, frame-source native tests
+  (10), debug native tests (18), `FrameSourceLifecycle` TLC and signed build
+  passed. The additional 1-vCPU smoke required `uiserver` readiness and mapped
+  45 shared library frames, with private COW, fork, EOF-zero and exit cleanup.
+- Signed A/B images alternated in three pairs per row (24/24 smoke passes,
+  same verified Linux DVM with GUI/network/block shared-memory transports).
+  Host times start after both QEMU processes exist, excluding image/layout
+  preparation. First frame is `product-first-frame` from Wayclick; UI ready
+  is the separate `uiserver` settlement marker, not required by base smoke.
+  The 1-vCPU runs sometimes stopped at the first-frame gate before settlement,
+  so no aggregate settled time is reported there.
+
+  | vCPUs / host load | Host time to first frame, ms (median) | Host time to UI ready, ms (median) |
+  | --- | ---: | ---: |
+  | 16 / idle | 4,631 → 3,806 | 4,147 → 3,317 |
+  | 16 / 50% | 5,412 → 4,716 | 5,082 → 4,119 |
+  | 1 / idle | 4,300 → 4,213 | not measured across all runs |
+  | 1 / 50% | 5,532 → 5,248 | not measured across all runs |
+
+- Guest AP startup (`smp-bringup-begin` to clocksource selection) at 16 vCPUs
+  took 524 → 136 ms idle and 631 → 188 ms loaded (medians). The win is much
+  smaller on one vCPU. Physical hardware, cold-cache boot, and the full PR
+  gate were not checked.
+
 ## IPC L1–L3 & Queued Q0–Q4 optimization completion (2026-11-28)
 
 - Executed [ipc-l1-l3-plan.md](performance/ipc-l1-l3-plan.md) (`B0`, `L1`, `L2`, `L3a`, `L3b`) and [ipc-queued-tail-plan.md](performance/ipc-queued-tail-plan.md) (`Q0–Q4`, `T0–T3`) end-to-end.

@@ -195,6 +195,10 @@ pub fn mark_root_idle() {
     crate::multitask::mark_root_idle();
 }
 
+pub fn idle_wait_iteration() {
+    crate::multitask::idle_wait_iteration();
+}
+
 pub mod abi {
     pub use crate::user::abi::*;
 }

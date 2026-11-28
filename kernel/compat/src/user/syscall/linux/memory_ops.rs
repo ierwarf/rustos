@@ -434,7 +434,7 @@ fn bootstrap_munmap(start: u64, user_len: u64) -> Result<(), i64> {
     result
 }
 
-fn find_bootstrap_mmap_start(
+pub(super) fn find_bootstrap_mmap_start(
     address_space: &paging::ProcessAddressSpace,
     state: &linux_abi::LinuxProcessState,
     requested_addr: u64,

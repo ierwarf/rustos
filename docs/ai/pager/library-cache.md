@@ -185,6 +185,9 @@ served from a shared, page-granular object instead:
   withdraws the cache's own reference. Every refusal falls back to the eager copy.
 - `FRAME_SOURCE_TABLE_SLOTS` (kernel table) is now 81,920; `FRAME_SOURCE_MAX_LIVE`
   stays the pager's 16,384 envelope that the boot plan is validated against.
+  The kernel table starts zero-filled in `.bss`, not in the file-backed part
+  of the signed boot ELF. Cold reclaim supplies the kernel release routine;
+  slot capacity, storage lifetime and descriptor/charge custody are unchanged.
 - Counters: any failure reports once per boot as milestone `library-alias-declined`
   reason 7 (`DemandUnavailable`, detail `stage << 32 | code`; stages 1-3 create,
   4-11 fill) and reason 2/3/5/6 as before.

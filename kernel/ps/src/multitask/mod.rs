@@ -202,6 +202,23 @@ pub fn mark_root_idle() {
     crate::debug::record_milestone(crate::debug::LogCategory::Sched, "smp-cpu-idle-enter", 0, 1);
 }
 
+pub fn idle_wait_iteration() {
+    #[cfg(not(test))]
+    {
+        x86_64::instructions::interrupts::disable();
+        let cpu = nucleus_core::util::lockdep::current_cpu_index();
+        if scheduler_initialized()
+            && (scheduler::other_dispatch_work_pending(cpu)
+                || reschedule_observation::request_pending(cpu))
+        {
+            x86_64::instructions::interrupts::enable();
+            irq::yield_now();
+            return;
+        }
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnTaskError {
     InvalidWeightMicros,

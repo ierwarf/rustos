@@ -153,6 +153,107 @@ static PROCD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static VFSD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+#[cfg(all(target_os = "none", not(test)))]
+const LIFECYCLE_NOTIFY_BACKING_ID: u64 = 0x4c49_4645_4e4f_5459;
+#[cfg(all(target_os = "none", not(test)))]
+const LIFECYCLE_NOTIFY_SLOT_STRIDE: usize = 64;
+
+#[cfg(all(target_os = "none", not(test)))]
+static LIFECYCLE_NOTIFY_FRAME_PHYS: spin::Once<Option<u64>> = spin::Once::new();
+
+#[cfg(all(target_os = "none", not(test)))]
+fn lifecycle_notify_frame_phys() -> Option<u64> {
+    *LIFECYCLE_NOTIFY_FRAME_PHYS.call_once(|| {
+        let frame = kernel_mm::api::frame_capability::allocate_zeroed_frame()?;
+        let frame_phys = frame.as_u64();
+        if !kernel_mm::api::phys::claim_private_file_cache_frame(
+            frame_phys,
+            LIFECYCLE_NOTIFY_BACKING_ID,
+        ) {
+            kernel_mm::api::phys::free_frame(frame);
+            return None;
+        }
+        Some(frame_phys)
+    })
+}
+
+fn notify_lifecycle_consumer(consumer: LifecycleConsumer) {
+    #[cfg(all(target_os = "none", not(test)))]
+    {
+        let Some(frame_phys) = lifecycle_notify_frame_phys() else {
+            return;
+        };
+        let slot_virt = kernel_mm::api::virt::higher_half_addr(frame_phys)
+            + ((consumer as usize) * LIFECYCLE_NOTIFY_SLOT_STRIDE) as u64;
+        // SAFETY: `frame_phys` is a permanently cached zeroed kernel frame below
+        // the direct-map ceiling, mapped read-only in services and updated via
+        // 8-byte aligned atomic increments at disjoint 64-byte consumer slots.
+        let seq = unsafe { &*(slot_virt as *const core::sync::atomic::AtomicU64) };
+        seq.fetch_add(1, Ordering::Release);
+    }
+    #[cfg(not(all(target_os = "none", not(test))))]
+    let _ = consumer;
+}
+
+#[cfg(all(target_os = "none", not(test)))]
+pub(super) fn map_lifecycle_notify_for_consumer(
+    consumer: LifecycleConsumer,
+) -> Result<u64, i64> {
+    use kernel_mm::api::PageTableFlags;
+    use x86_64::VirtAddr;
+
+    let frame_phys = lifecycle_notify_frame_phys().ok_or(LINUX_ENOMEM)?;
+    let page_flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let Some(result) = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return Err(LINUX_ENOSYS);
+        }
+        let start = {
+            let (address_space, linux_process_state) =
+                process_state.address_space_and_linux_process_state_mut();
+            let Some(state) = linux_process_state.as_mut() else {
+                return Err(LINUX_ENOSYS);
+            };
+            let start = super::memory_ops::find_bootstrap_mmap_start(
+                address_space,
+                state,
+                0,
+                kernel_mm::api::paging::PAGE_4KIB_U64,
+            )?;
+            if !process_state.admit_mapping_records(1) {
+                return Err(LINUX_ENOMEM);
+            }
+            address_space
+                .map_private_file_cow_alias_at(
+                    VirtAddr::new(start),
+                    0,
+                    0,
+                    frame_phys,
+                    page_flags,
+                    LIFECYCLE_NOTIFY_BACKING_ID,
+                )
+                .map_err(address_space_error_to_linux_errno)?;
+            let end = start + kernel_mm::api::paging::PAGE_4KIB_U64;
+            state.mmap_next = state.mmap_next.max(end);
+            start
+        };
+        process_state.set_mapping_cursor(start + kernel_mm::api::paging::PAGE_4KIB_U64);
+        Ok(start + ((consumer as usize) * LIFECYCLE_NOTIFY_SLOT_STRIDE) as u64)
+    }) else {
+        return Err(LINUX_ENOSYS);
+    };
+    result
+}
+
+#[cfg(not(all(target_os = "none", not(test))))]
+pub(super) fn map_lifecycle_notify_for_consumer(
+    _consumer: LifecycleConsumer,
+) -> Result<u64, i64> {
+    Err(LINUX_ENOSYS)
+}
+
 struct LifecycleEventQueue<const CAPACITY: usize> {
     events: [LifecycleEventWire; CAPACITY],
     len: usize,
@@ -278,6 +379,7 @@ pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
             // from an empty queue.
             consumer.overflowed().store(true, Ordering::Release);
         }
+        notify_lifecycle_consumer(consumer);
     }
 }
 
@@ -331,16 +433,21 @@ pub(crate) fn record_process_exec(pid: u64) {
         pid,
         ..LifecycleEventWire::default()
     };
-    if !consumer.events().lock().push(event) {
+    let _guard = consumer.events().lock();
+    let mut events = _guard;
+    if !events.push(event) {
         consumer.overflowed().store(true, Ordering::Release);
     }
+    notify_lifecycle_consumer(consumer);
 }
 
 fn push_lifecycle_event(consumers: &[LifecycleConsumer], event: LifecycleEventWire) {
-    for consumer in consumers {
-        if !consumer.events().lock().push(event) {
+    for &consumer in consumers {
+        let mut events = consumer.events().lock();
+        if !events.push(event) {
             consumer.overflowed().store(true, Ordering::Release);
         }
+        notify_lifecycle_consumer(consumer);
     }
 }
 
@@ -401,25 +508,34 @@ pub(super) fn drain_lifecycle_events(
     // Never access pageable user memory while holding the lifecycle spinlock.
     // The single-consumer claim keeps another drain from changing the prefix;
     // producers may only append to it.
-    let mut snapshot = Vec::with_capacity(capacity);
+    let mut snapshot = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
+    let mut snapshot_len = 0_usize;
     {
         let mut events = queue.lock();
         if lifecycle_overflow_requires_rebase(consumer, &mut events, overflowed) {
             return Err(LINUX_EOVERFLOW);
         }
         let count = capacity.min(events.len());
-        snapshot.extend_from_slice(events.prefix(count));
+        if count != 0 {
+            snapshot[..count].copy_from_slice(events.prefix(count));
+            snapshot_len = count;
+        }
     }
-    let process_count = snapshot.len();
+    let process_count = snapshot_len;
     // procd's thread exits ride behind its process events. The two queues are
     // never locked together, so each keeps its own producer-visible order.
     let (thread_count, thread_loss_taken) = if consumer == LifecycleConsumer::ProcessPolicy {
-        take_thread_exit_snapshot(
+        let mut extra = Vec::new();
+        let taken = take_thread_exit_snapshot(
             &mut PROCD_THREAD_EXIT_EVENTS.lock(),
             &PROCD_THREAD_EXIT_LOST,
             capacity - process_count,
-            &mut snapshot,
-        )
+            &mut extra,
+        );
+        let extra_copy = extra.len().min(capacity - snapshot_len);
+        snapshot[snapshot_len..snapshot_len + extra_copy].copy_from_slice(&extra[..extra_copy]);
+        snapshot_len += extra_copy;
+        taken
     } else {
         (0, false)
     };
@@ -428,10 +544,11 @@ pub(super) fn drain_lifecycle_events(
             PROCD_THREAD_EXIT_LOST.store(true, Ordering::Release);
         }
     };
-    let count = snapshot.len();
-    let out_count = count as u32;
+    let out_count = snapshot_len as u32;
     if out_count != 0 {
-        if let Err(error) = usermem::write_current_user_slice(args.out_events_ptr, &snapshot) {
+        if let Err(error) =
+            usermem::write_current_user_slice(args.out_events_ptr, &snapshot[..snapshot_len])
+        {
             restore_thread_loss(thread_loss_taken);
             return Err(user_pointer_error_to_linux_errno(error));
         }
@@ -444,12 +561,14 @@ pub(super) fn drain_lifecycle_events(
     if thread_count != 0 {
         PROCD_THREAD_EXIT_EVENTS.lock().drain_prefix(thread_count);
     }
-    let mut events = queue.lock();
-    if lifecycle_overflow_requires_rebase(consumer, &mut events, overflowed) {
-        return Err(LINUX_EOVERFLOW);
+    if process_count != 0 {
+        let mut events = queue.lock();
+        if lifecycle_overflow_requires_rebase(consumer, &mut events, overflowed) {
+            return Err(LINUX_EOVERFLOW);
+        }
+        debug_assert!(events.len() >= process_count);
+        events.drain_prefix(process_count);
     }
-    debug_assert!(events.len() >= process_count);
-    events.drain_prefix(process_count);
     Ok(out_count as u64)
 }
 

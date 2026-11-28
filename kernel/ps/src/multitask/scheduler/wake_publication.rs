@@ -488,74 +488,96 @@ unsafe fn retained_wake_admitted(
     let slot = binding.slot();
     let id = binding.id();
     let cpu = nucleus_core::util::lockdep::current_cpu_index();
-    let owner = runqueue::owner(slot);
-    let blocked = runqueue::wait::blocked(slot);
-    let armed = runqueue::wait::armed(slot);
-    let blocked_since = runqueue::wait::blocked_since_ticks(slot);
-    match cpu_local::task_execution_owner(slot) {
-        Some(cpu_local::TaskExecutionOwner::Current(current_cpu)) => {
-            // Never dereference the already consumed frame. Exact physical bank,
-            // not scalar Current alone, retains the executing backing.
-            if !stack_resources::cpu_leases::owns_current(current_cpu, slot) {
-                return Err(false);
+    let mut attempt = 0_u8;
+    let (owner, blocked, armed, blocked_since) = loop {
+        let owner = runqueue::owner(slot);
+        let blocked = runqueue::wait::blocked(slot);
+        let armed = runqueue::wait::armed(slot);
+        let blocked_since = runqueue::wait::blocked_since_ticks(slot);
+        match cpu_local::task_execution_owner(slot) {
+            Some(cpu_local::TaskExecutionOwner::Current(current_cpu)) => {
+                // Never dereference the already consumed frame. Exact physical bank,
+                // not scalar Current alone, retains the executing backing.
+                if !stack_resources::cpu_leases::owns_current(current_cpu, slot) {
+                    return Err(false);
+                }
+                if !clear_wait(slot, typed.as_ref()) {
+                    return Err(false);
+                }
+                // The CPU may have published its outgoing Blocked queue custody
+                // after our Current observation. Wake AFTER that return CAS must
+                // publish queue custody too; clearing an arm alone would lose it.
+                // Original BindingPin/backing survives publication and notification;
+                // physical Current/Transition banks still exclude frame execution.
+                if runqueue::owner(slot).state == runqueue::RunOwnerState::Blocked
+                    && matches!(
+                        publish(slot, current_cpu, cpu),
+                        runqueue::RemoteWakeOutcome::Rejected
+                    )
+                {
+                    return Err(false);
+                }
+                runqueue::wait::set_ready_since_ticks(slot, 0);
+                if !on_wake(&binding) {
+                    return Err(false);
+                }
+                drop(typed);
+                return Ok(binding);
             }
-            if !clear_wait(slot, typed.as_ref()) {
-                return Err(false);
-            }
-            // The CPU may have published its outgoing Blocked queue custody
-            // after our Current observation. Wake AFTER that return CAS must
-            // publish queue custody too; clearing an arm alone would lose it.
-            // Original BindingPin/backing survives publication and notification;
-            // physical Current/Transition banks still exclude frame execution.
-            if runqueue::owner(slot).state == runqueue::RunOwnerState::Blocked
-                && matches!(
-                    publish(slot, current_cpu, cpu),
+            Some(cpu_local::TaskExecutionOwner::Transition(target)) => {
+                // Typed clear precedes queue effects. Its pending phase excludes
+                // later arms through publication; return CAS observes restored run
+                // intent atomically. Generic wake retains mailbox-before-clear.
+                if typed.is_some() && !clear_wait(slot, typed.as_ref()) {
+                    return Err(false);
+                }
+                // No read of the assembly-owned frame is allowed.
+                if matches!(
+                    publish(slot, target, cpu),
                     runqueue::RemoteWakeOutcome::Rejected
-                )
-            {
-                return Err(false);
+                ) {
+                    return Err(false);
+                }
+                if typed.is_none() {
+                    let _ = clear_wait(slot, None);
+                }
+                runqueue::wait::set_ready_since_ticks(slot, crate::arch::rtc::ticks().max(1));
+                if !on_wake(&binding) {
+                    return Err(false);
+                }
+                drop(typed);
+                return Ok(binding);
             }
-            runqueue::wait::set_ready_since_ticks(slot, 0);
-            if !on_wake(&binding) {
-                return Err(false);
-            }
-            drop(typed);
-            return Ok(binding);
+            None => {}
         }
-        Some(cpu_local::TaskExecutionOwner::Transition(target)) => {
-            // Typed clear precedes queue effects. Its pending phase excludes
-            // later arms through publication; return CAS observes restored run
-            // intent atomically. Generic wake retains mailbox-before-clear.
-            if typed.is_some() && !clear_wait(slot, typed.as_ref()) {
-                return Err(false);
+        if owner.state == runqueue::RunOwnerState::Paired {
+            if let Some(pair_cpu) = owner.cpu {
+                if super::pair::request_break_with_wake(pair_cpu, slot, owner.generation) {
+                    #[cfg(not(test))]
+                    crate::multitask::irq::request_target_reschedule(pair_cpu);
+                    return Err(false);
+                }
+                if attempt == 0 {
+                    attempt += 1;
+                    // `dissolve_if_live` already moved `Live -> Breaking`; wait
+                    // briefly for the owner word to settle to `Blocked`/`Local`
+                    // rather than losing the wakeup in the break window.
+                    for _ in 0..1024 {
+                        let now_owner = runqueue::owner(slot);
+                        if now_owner.state != runqueue::RunOwnerState::Paired
+                            || now_owner.generation != owner.generation
+                        {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    continue;
+                }
             }
-            // No read of the assembly-owned frame is allowed.
-            if matches!(
-                publish(slot, target, cpu),
-                runqueue::RemoteWakeOutcome::Rejected
-            ) {
-                return Err(false);
-            }
-            if typed.is_none() {
-                let _ = clear_wait(slot, None);
-            }
-            runqueue::wait::set_ready_since_ticks(slot, crate::arch::rtc::ticks().max(1));
-            if !on_wake(&binding) {
-                return Err(false);
-            }
-            drop(typed);
-            return Ok(binding);
+            return Err(false);
         }
-        None => {}
-    }
-    if owner.state == runqueue::RunOwnerState::Paired {
-        if let Some(pair_cpu) = owner.cpu {
-            super::pair::request_break_with_wake(pair_cpu, slot, owner.generation);
-            #[cfg(not(test))]
-            crate::multitask::irq::request_target_reschedule(pair_cpu);
-        }
-        return Err(false);
-    }
+        break (owner, blocked, armed, blocked_since);
+    };
     let Some(token) = frame_publication::observed_frame_token(slot, cpu, false) else {
         return Err(false);
     };
@@ -644,20 +666,23 @@ unsafe fn retained_wake_admitted(
         if matches!(outcome, runqueue::RemoteWakeOutcome::Rejected) {
             return Err(false);
         }
-        if let Some(current) = cpu_local::current_cpu_task_slot().filter(|current| *current != slot)
-        {
-            let current_class = class(current);
-            if woken_class < current_class
-                || (woken_class == current_class
-                    && runqueue::vruntime(current).saturating_sub(runqueue::vruntime(slot))
-                        >= SCHED_MIN_GRANULARITY_NS)
-            {
-                if let Some(target) = runqueue::owner(slot).cpu {
-                    #[cfg(not(test))]
-                    crate::multitask::irq::request_target_reschedule(target);
-                    #[cfg(test)]
-                    let _ = target;
-                }
+        if let Some(target) = runqueue::owner(slot).cpu {
+            let notify_idle = runqueue::is_cpu_running_idle(target);
+            let preempt_current = cpu_local::current_cpu_task_slot()
+                .filter(|current| *current != slot)
+                .is_some_and(|current| {
+                    let current_class = class(current);
+                    woken_class < current_class
+                        || (woken_class == current_class
+                            && runqueue::vruntime(current)
+                                .saturating_sub(runqueue::vruntime(slot))
+                                >= SCHED_MIN_GRANULARITY_NS)
+                });
+            if notify_idle || preempt_current {
+                #[cfg(not(test))]
+                crate::multitask::irq::request_target_reschedule(target);
+                #[cfg(test)]
+                let _ = target;
             }
         }
     }

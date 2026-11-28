@@ -562,6 +562,12 @@ fn run_one_smoke_unarchived(
     stop_guest(&mut dvm);
     phase("smoke-guests-stopped");
     let probe = result?;
+    // A producer can overflow after the last live readiness read. Recheck
+    // the closed transcript before accepting any success/evidence artifact.
+    let log = read_log_lossy(&layout.debugcon_log)?;
+    if let Some(line) = log.lines().find(|line| required_debugcon_milestone_lost(line)) {
+        bail!("{line}");
+    }
     if options.kernel_stack_guard_fault_probe {
         let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;

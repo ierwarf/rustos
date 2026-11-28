@@ -77,6 +77,40 @@ fn high_frequency_ipc_timeout_milestones_stay_off_debugcon() {
 }
 
 #[test]
+fn ap_startup_detail_uses_opt_in_boot_trace_without_changing_acceptance() {
+    for name in [
+        "smp-init-assert-begin",
+        "smp-init-assert-complete",
+        "smp-init-deassert-complete",
+        "smp-init-settled",
+        "smp-first-sipi-complete",
+        "smp-second-sipi-complete",
+        "smp-startup-ipi-sent",
+        "smp-ap-rust-entry",
+        "smp-ap-tsc-warp",
+    ] {
+        let class = milestone_output_class(name);
+        assert!(!class.admits_debugcon(true, false), "{name}");
+        assert!(class.admits_debugcon(false, true), "{name}");
+        assert!(!class.must_reach_sink(), "{name}");
+    }
+    for name in [
+        "smp-bringup-begin",
+        "smp-ap-private-ready",
+        "smp-ap-online-parked",
+        "smp-clocksource-promoted",
+        "smp-clocksource-retained",
+        "smp-cpu-scheduler-ready",
+        "smp-cpu-online",
+        "smp-qualification-ready",
+    ] {
+        let class = milestone_output_class(name);
+        assert!(class.must_reach_sink(), "{name}");
+        assert!(class.admits_debugcon(false, false), "{name}");
+    }
+}
+
+#[test]
 fn acceptance_milestones_retry_the_contended_debug_sink() {
     for name in [
         "smp-cpu-online",
@@ -338,22 +372,27 @@ fn qualification_drop_is_visible_only_to_following_critical_evidence() {
 }
 
 #[test]
-fn per_process_lifecycle_milestones_are_sampled_after_boot() {
-    use super::milestone_class::{lifecycle_sample_admits, per_process_lifecycle};
+fn per_process_lifecycle_sampling_bounds_the_boot_burst() {
     for name in [
         "spawn-user-process",
-        "linux-process-termination",
         "proc-map-file-batch",
         "lifecycle-spawn-reserve",
     ] {
         assert!(per_process_lifecycle(name), "{name}");
     }
     // Failure evidence and unrelated milestones stay unconditional.
-    for name in ["proc-exec-refused", "pager-vma-unmap-refused", "mm-broker-refused", "boot"] {
+    for name in [
+        "linux-process-termination",
+        "proc-exec-refused",
+        "pager-vma-unmap-refused",
+        "mm-broker-refused",
+        "product-executable-snapshot-sealed",
+        "boot",
+    ] {
         assert!(!per_process_lifecycle(name), "{name}");
     }
-    assert!((1..=256).all(lifecycle_sample_admits));
-    assert!(!lifecycle_sample_admits(257));
-    assert!(lifecycle_sample_admits(512));
-    assert!(!lifecycle_sample_admits(1000));
+    assert!((1..=16).all(lifecycle_sample_admits));
+    assert!(!lifecycle_sample_admits(17));
+    assert!(lifecycle_sample_admits(32));
+    assert!(!lifecycle_sample_admits(63));
 }

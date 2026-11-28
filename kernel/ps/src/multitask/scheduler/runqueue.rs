@@ -144,6 +144,14 @@ pub(super) fn set_cpu_running_idle(cpu: usize, idle: bool) {
     update_cpu_mask_bit(&RUNNING_IDLE_CPU_MASK, cpu, idle);
 }
 
+/// Advisory fast check of whether `cpu` is currently running its idle task.
+#[inline]
+pub(in crate::multitask) fn is_cpu_running_idle(cpu: usize) -> bool {
+    validate_cpu(cpu);
+    // ORDERING: Relaxed advisory check for idle wakeup IPI decisions.
+    RUNNING_IDLE_CPU_MASK.load(Ordering::Relaxed) & (1_u64 << cpu) != 0
+}
+
 /// Bitmask of CPUs currently running their idle task with empty local runqueue
 /// and empty remote-wake mailbox. Advisory placement hint; owner CAS stays authority.
 #[inline]
@@ -609,36 +617,53 @@ struct RunTransfer {
 
 struct RemoteWakeMailbox {
     records: SlabQueue<RunTransfer>,
+    len: usize,
 }
 
 impl RemoteWakeMailbox {
     const fn new() -> Self {
         Self {
             records: SlabQueue::new(),
+            len: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Empties the mailbox and returns slab blocks to the pool.
     fn clear(&mut self) {
         self.records.clear(&MAILBOX_POOL);
+        self.len = 0;
     }
 
-    fn publish(&mut self, record: RunTransfer) {
+    fn publish(&mut self, record: RunTransfer) -> usize {
         if let Some(existing) = self
             .records
             .find_mut(&MAILBOX_POOL, |queued| queued.slot == record.slot)
         {
             *existing = record;
-            return;
+            return self.len;
         }
         assert!(
             self.records.push_back(&MAILBOX_POOL, record),
             "scheduler remote wake mailbox slab pool exhausted"
         );
+        self.len += 1;
+        self.len
     }
 
     fn pop(&mut self) -> Option<RunTransfer> {
-        self.records.pop_front(&MAILBOX_POOL)
+        let popped = self.records.pop_front(&MAILBOX_POOL);
+        if popped.is_some() {
+            self.len = self.len.saturating_sub(1);
+        }
+        popped
     }
 
     /// Exact mailbox receipt for the slow, aged custody-conservation probe.
@@ -677,11 +702,12 @@ impl EnqueueDuty {
 fn publish_mailbox_record(cpu: usize, slot: usize, generation: u64, weight: u32) -> bool {
     {
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
-        mailbox.publish(RunTransfer {
+        let len = mailbox.publish(RunTransfer {
             slot,
             generation,
             weight,
         });
+        MAILBOX_COUNTS[cpu].store(len, Ordering::Release);
         update_cpu_mask_bit(&MAILBOX_PENDING_CPU_MASK, cpu, true);
     }
     // ORDERING: the mailbox lock release publishes the record before this
@@ -704,6 +730,8 @@ static REMOTE_WAKE_MAILBOXES: [IrqLeaf<RemoteWakeMailbox, { LockClass::Scheduler
     MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
     [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
+static MAILBOX_COUNTS: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
 
 /// Exact read-only check used only after a RemoteQueued owner has remained
 /// suspect for two seconds. This does not authorize placement or dispatch.
@@ -783,6 +811,7 @@ pub(super) fn reset_before_publication() {
         drop(rq);
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
         mailbox.clear();
+        MAILBOX_COUNTS[cpu].store(0, Ordering::Release);
         MAILBOX_PENDING[cpu].store(0, Ordering::Release);
     }
 }
@@ -1263,6 +1292,16 @@ pub(super) fn published_runnable_count(cpu: usize) -> usize {
     RUN_QUEUES[cpu].published_count.load(Ordering::Acquire)
 }
 
+/// Published runnable count including remote wakeups queued in `cpu`'s
+/// mailbox so burst placement spreads work before APs drain mailboxes.
+pub(super) fn published_total_queued_count(cpu: usize) -> usize {
+    validate_cpu(cpu);
+    RUN_QUEUES[cpu]
+        .published_count
+        .load(Ordering::Acquire)
+        .saturating_add(MAILBOX_COUNTS[cpu].load(Ordering::Acquire))
+}
+
 /// Reports whether the CPU-local dispatch owner has work beyond the task that
 /// is already running on this CPU.
 pub(super) fn local_dispatch_work_pending(cpu: usize) -> bool {
@@ -1578,18 +1617,24 @@ pub(super) fn has_no_system_runnable(cpu: usize, expected_queue_sequence: u64) -
     sys_count == 0 && !has_missing_weight
 }
 
+const MAILBOX_TASK_LOAD_UNIT: u64 = (100 << 16) | 1;
+
+#[inline]
+fn published_placement_load(cpu: usize) -> u64 {
+    // ORDERING: Acquire observes a complete rq accounting snapshot together
+    // with any un-drained remote wakeups already published to this CPU.
+    let rq_load = RUN_QUEUES[cpu].published_load.load(Ordering::Acquire);
+    let mailbox_count = MAILBOX_COUNTS[cpu].load(Ordering::Acquire) as u64;
+    rq_load.saturating_add(mailbox_count.saturating_mul(MAILBOX_TASK_LOAD_UNIT))
+}
+
 pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize {
     validate_cpu(fallback_cpu);
     let mut best = (eligible_mask & (1_u64 << fallback_cpu) != 0).then(|| {
         // ORDERING: Acquire observes the same complete placement snapshot as
         // the loop below and makes the caller's locality preference the tie
         // breaker rather than always collapsing equal load onto CPU zero.
-        (
-            fallback_cpu,
-            RUN_QUEUES[fallback_cpu]
-                .published_load
-                .load(Ordering::Acquire),
-        )
+        (fallback_cpu, published_placement_load(fallback_cpu))
     });
     let mut remaining = eligible_mask & !(1_u64 << fallback_cpu);
     while remaining != 0 {
@@ -1597,7 +1642,7 @@ pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize
         remaining &= remaining - 1;
         // ORDERING: Acquire observes a complete rq accounting snapshot. It is
         // a placement hint only; owner CAS and target adoption remain authority.
-        let load = RUN_QUEUES[cpu].published_load.load(Ordering::Acquire);
+        let load = published_placement_load(cpu);
         match best {
             None => best = Some((cpu, load)),
             Some((_, best_load)) if load < best_load => best = Some((cpu, load)),

@@ -1273,7 +1273,6 @@ impl GpuCompositor {
             self.info.generation,
             self.activation_epoch,
         );
-        diag_line(active_contract);
         crate::startup::global().succeed(crate::startup::Dependency::Gpu);
         self.active = true;
         Ok(())

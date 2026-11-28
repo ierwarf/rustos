@@ -24,7 +24,7 @@ fn key() -> FrameSourceKey {
 }
 #[test]
 fn immutable_sources_never_authorize_source_writes() {
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     for rights in [0, 2, 3, 4, 6, 7, 8, u64::MAX] {
         assert_eq!(
             table.publish(owner(), key(), rights, 0, |_| panic!(
@@ -51,7 +51,7 @@ fn publish<const N: usize>(table: &Table<N>, frame: u64) -> u64 {
 fn withdrawal_rejects_new_borrows_but_existing_installer_keeps_custody() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     let token = publish(&table, 0x1000);
     let pin = table
         .pin(token, owner(), key(), frame_capability::FRAME_RIGHT_READ)
@@ -65,14 +65,14 @@ fn withdrawal_rejects_new_borrows_but_existing_installer_keeps_custody() {
         RELEASED.lock().unwrap().is_empty(),
         "Drop must only enqueue"
     );
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
     assert_eq!(*RELEASED.lock().unwrap(), [(0x1000, token, 9)]);
     assert!(table.retire(token, owner()).is_err());
     let second = publish(&table, 0x2000);
     assert_ne!(token, second);
     assert!(table.pin_raw(token).is_err());
     table.retire(second, owner()).unwrap();
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
     assert_eq!(RELEASED.lock().unwrap().len(), 2);
 }
 
@@ -80,7 +80,7 @@ fn withdrawal_rejects_new_borrows_but_existing_installer_keeps_custody() {
 fn every_identity_component_and_rights_are_bound() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<2>::new(release);
+    let table = Table::<2>::new();
     let token = publish(&table, 0x1000);
     for wrong in [
         FrameSourceOwner {
@@ -138,7 +138,7 @@ fn every_identity_component_and_rights_are_bound() {
 fn exhausted_table_never_calls_allocator_and_failed_supply_can_retry() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     assert_eq!(
         table.publish(owner(), key(), 1, 9, |_| Err(FrameSourceError::Quota)),
         Err(FrameSourceError::Quota)
@@ -152,17 +152,17 @@ fn exhausted_table_never_calls_allocator_and_failed_supply_can_retry() {
         Err(FrameSourceError::NoSlots)
     );
     table.retire(token, owner()).unwrap();
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
     let token = publish(&table, 0x2000);
     table.retire(token, owner()).unwrap();
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
 }
 
 #[test]
 fn generation_and_reference_exhaustion_do_not_wrap() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     table.slots[0]
         .word
         .store(word(GEN_MAX, 0, FREE), Ordering::Relaxed);
@@ -193,7 +193,7 @@ fn generation_and_reference_exhaustion_do_not_wrap() {
 fn provider_retirement_is_exact_and_does_not_wait_for_installers() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<3>::new(release);
+    let table = Table::<3>::new();
     let first = publish(&table, 0x1000);
     let new_owner = FrameSourceOwner {
         service_generation: 12,
@@ -210,17 +210,17 @@ fn provider_retirement_is_exact_and_does_not_wait_for_installers() {
     assert!(RELEASED.lock().unwrap().is_empty());
     drop(pin);
     assert!(RELEASED.lock().unwrap().is_empty());
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
     assert_eq!(RELEASED.lock().unwrap().len(), 1);
     table.retire(other, new_owner).unwrap();
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
 }
 
 #[test]
 fn concurrent_pin_and_retire_release_once_after_all_borrows() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     let token = publish(&table, 0x1000);
     let retained = table.pin_raw(token).unwrap();
     std::thread::scope(|scope| {
@@ -239,7 +239,7 @@ fn concurrent_pin_and_retire_release_once_after_all_borrows() {
     assert!(RELEASED.lock().unwrap().is_empty());
     drop(retained);
     assert!(RELEASED.lock().unwrap().is_empty());
-    assert_eq!(table.reclaim(1), 1);
+    assert_eq!(table.reclaim(1, release), 1);
     assert_eq!(*RELEASED.lock().unwrap(), [(0x1000, token, 9)]);
 }
 
@@ -247,24 +247,24 @@ fn concurrent_pin_and_retire_release_once_after_all_borrows() {
 fn cold_queue_budget_and_slot_reuse_preserve_detached_backlog() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<8>::new(release);
+    let table = Table::<8>::new();
     let mut tokens = std::vec::Vec::new();
     for n in 0..8 {
         tokens.push(publish(&table, 0x1000 * (n + 1)));
     }
     assert_eq!(table.retire_owner(owner()), 8);
     assert!(RELEASED.lock().unwrap().is_empty());
-    assert_eq!(table.reclaim(0), 0);
-    assert_eq!(table.reclaim(3), 3);
+    assert_eq!(table.reclaim(0, release), 0);
+    assert_eq!(table.reclaim(3, release), 3);
     for n in 0..3 {
         let token = publish(&table, 0x1000 * (n + 9));
         assert!(!tokens.contains(&token));
         tokens.push(token);
         table.retire(token, owner()).unwrap();
     }
-    assert_eq!(table.reclaim(2), 2);
-    assert_eq!(table.reclaim(32), 6);
-    assert_eq!(table.reclaim(32), 0);
+    assert_eq!(table.reclaim(2, release), 2);
+    assert_eq!(table.reclaim(32, release), 6);
+    assert_eq!(table.reclaim(32, release), 0);
     assert_eq!(RELEASED.lock().unwrap().len(), 11);
     let unique: std::collections::BTreeSet<_> = RELEASED
         .lock()
@@ -279,18 +279,18 @@ fn cold_queue_budget_and_slot_reuse_preserve_detached_backlog() {
 fn concurrent_retirement_and_cold_consumers_lose_no_nodes() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<32>::new(release);
+    let table = Table::<32>::new();
     let tokens: std::vec::Vec<_> = (0..32).map(|n| publish(&table, 0x1000 * (n + 1))).collect();
     std::thread::scope(|scope| {
         for &token in &tokens {
             let table = &table;
             scope.spawn(move || {
                 table.retire(token, owner()).unwrap();
-                table.reclaim(1);
+                table.reclaim(1, release);
             });
         }
     });
-    table.reclaim(64);
+    table.reclaim(64, release);
     assert_eq!(RELEASED.lock().unwrap().len(), 32);
     let unique: std::collections::BTreeSet<_> = RELEASED
         .lock()
@@ -306,7 +306,7 @@ fn concurrent_retirement_and_cold_consumers_lose_no_nodes() {
 fn malformed_authority_refuses_before_reserving_or_allocating() {
     let _serial = SERIAL.lock().unwrap();
     RELEASED.lock().unwrap().clear();
-    let table = Table::<1>::new(release);
+    let table = Table::<1>::new();
     let bad = || panic!("invalid supply reached allocator");
     assert_eq!(
         table.publish(

@@ -1187,8 +1187,10 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         LIBRARY_MAP_PROBE_FAIL_MARKER,
         APP_DMABUF_PROBE_FAIL_MARKER,
     ];
-    log.lines()
-        .any(|line| FAILURES.iter().any(|failure| line.contains(failure)))
+    log.lines().any(|line| {
+        required_debugcon_milestone_lost(line)
+            || FAILURES.iter().any(|failure| line.contains(failure))
+    })
         // The owner's typed record is the authority for startup failures; the
         // free-text list above only covers crashes and stalls that have no
         // typed record.
@@ -1226,6 +1228,12 @@ fn scheduler_custody_lost_detail(log: &str) -> Option<String> {
         arg0 >> 16,
         field("arg1=").unwrap_or(0)
     ))
+}
+
+pub(super) fn required_debugcon_milestone_lost(line: &str) -> bool {
+    // Ring3 records always carry an outer escaped envelope, so they cannot
+    // impersonate this kernel-owned raw loss notification.
+    line.starts_with("debugcon: required milestone lost total=")
 }
 
 /// What to print next to a `runtime_stall_or_crash_observed` verdict: the typed
@@ -1592,6 +1600,15 @@ mod lossy_log_tests {
             runtime_failure_detail(log),
             "scheduler custody lost: slot=13 gap=remote-without-mailbox age_ticks=32768 word=0x1a2"
         );
+    }
+
+    #[test]
+    fn a_kernel_reported_debugcon_loss_fails_smoke_without_trusting_user_payloads() {
+        let marker = "debugcon: required milestone lost total=1";
+        assert!(runtime_stall_or_crash_observed(marker));
+        assert!(!runtime_stall_or_crash_observed(&format!(
+            "user-debug payload={marker}\\n"
+        )));
     }
 
     #[test]

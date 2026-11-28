@@ -749,6 +749,10 @@ pub(crate) fn finalize_kernel_initialization() {
     flow_info(13, "kernel finalize: kernel vfs runtime active");
     flow_info(14, "kernel finalize: DVM-only driver topology active");
 
+    if debug::background_debugcon_supported() {
+        ps_api::Thread::new(tasks::nucleus_debugcon_task, 100).start();
+    }
+
     // Fair class on purpose: a System-class housekeeping task starved thread
     // exit/join behind its own strict-band turns (p50 1.5M -> 127M ticks).
     // Slot shortage is handled by the spawner, which kicks this task and sleeps
@@ -879,7 +883,7 @@ pub(crate) fn run_nucleus_loop() -> ! {
     );
     ps_api::mark_root_idle();
     loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
+        ps_api::idle_wait_iteration();
     }
 }
 

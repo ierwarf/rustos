@@ -571,8 +571,8 @@ pub(crate) fn profile_line(message: &str) {
 /// priority scheduling may legitimately starve a User-class relay, while a UI
 /// heartbeat must describe the interactive loop that created it.
 pub(crate) fn heartbeat_line(message: &str) {
-    // This is a lossy try-lock debugcon attempt. A contended logger drops the
-    // sample, rather than delaying a present; the next heartbeat retries.
+    // This is a bounded debugcon submission. A full diagnostics queue may
+    // refuse a sample rather than delaying a present; the next heartbeat retries.
     debug_line(message);
 }
 

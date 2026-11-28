@@ -25,7 +25,7 @@ use core::fmt::Write as _;
 #[cfg(rustos_debug_print_enabled)]
 use core::hint::spin_loop;
 #[cfg(rustos_debug_print_enabled)]
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(rustos_debug_print_enabled)]
 use os_observatory::sink::{RingBufferSink as ObservatoryRingBufferSink, Sink as ObservatorySink};
 pub use rustos_observability::{LogCategory, LogLevel};
@@ -58,13 +58,11 @@ const MILESTONE_CAPACITY: usize = 128;
 const REQUIRED_MILESTONE_OUTPUT_ATTEMPTS: usize = 8;
 #[cfg(rustos_debug_print_enabled)]
 const DEFERRED_DRAIN_RECORDS: usize = 8;
-// Every regular diagnostic is rendered before it takes DEBUG_LOCK, so one
-// owned buffer can be sent with one debugcon write after the bounded acquire.
-// The existing ordinary call sites below admit substantially less than this;
-// an oversize line is discarded whole rather than becoming misleading partial
-// evidence.
+// An oversize line is discarded whole, rather than becoming partial evidence.
 #[cfg(rustos_debug_print_enabled)]
-const SERIALIZED_DEBUGCON_LINE_CAPACITY: usize = 512;
+const SERIALIZED_DEBUGCON_LINE_CAPACITY: usize = deferred::DEFERRED_LINE_BYTES;
+#[cfg(rustos_debug_print_enabled)]
+const DEBUGCON_BATCH_BYTES: usize = 4 * 1024;
 #[cfg(rustos_debug_print_enabled)]
 const USER_DEBUG_ESCAPED_PAYLOAD_BYTES: usize = 480;
 // Milestones duplicate their semantic record in the self-framing evidence
@@ -229,9 +227,11 @@ impl<const N: usize> ObservatorySink for KernelTextRing<N> {
 #[cfg(rustos_debug_print_enabled)]
 static TEXT_RING: KernelTextRing<TEXT_RING_CAPACITY> = KernelTextRing::new();
 #[cfg(rustos_debug_print_enabled)]
-static KERNEL_LOG_SINK: KernelLogSink = KernelLogSink;
+static TEXT_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(rustos_debug_print_enabled)]
 static DEBUG_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(rustos_debug_print_enabled)]
+static DEFERRED_OUTPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(rustos_debug_print_enabled)]
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(rustos_debug_print_enabled)]
@@ -243,9 +243,6 @@ static RATE_LIMIT_FALLBACK_MICROS: AtomicU64 =
     AtomicU64::new(DEFAULT_LOG_RATE_LIMIT_INTERVAL_MICROS);
 #[cfg(rustos_debug_print_enabled)]
 static RUNTIME_HOOKS: RwLock<DebugRuntimeHooks> = RwLock::new(DebugRuntimeHooks::new());
-
-#[cfg(rustos_debug_print_enabled)]
-struct KernelLogSink;
 
 #[cfg(rustos_debug_print_enabled)]
 struct SinkWriter<'a, S: ObservatorySink>(&'a S);
@@ -298,18 +295,22 @@ impl<const N: usize> FixedDebugconLine<N> {
     fn len(&self) -> usize {
         self.len
     }
+
+    fn try_append(&mut self, bytes: &[u8]) -> fmt::Result {
+        let end = self.len.checked_add(bytes.len()).ok_or(fmt::Error)?;
+        if end > N {
+            return Err(fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
 impl<const N: usize> fmt::Write for FixedDebugconLine<N> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
-        if end > N {
-            return Err(fmt::Error);
-        }
-        self.bytes[self.len..end].copy_from_slice(value.as_bytes());
-        self.len = end;
-        Ok(())
+        self.try_append(value.as_bytes())
     }
 }
 
@@ -325,17 +326,6 @@ struct RenderedLogMetadata<'a> {
     line: u32,
     process_id: Option<u64>,
     thread_id: Option<u64>,
-}
-
-#[cfg(rustos_debug_print_enabled)]
-impl ObservatorySink for KernelLogSink {
-    fn write_str(&self, s: &str) -> usize {
-        let written = TEXT_RING.write_str(s);
-        if RUSTOS_LOGGING_SERIAL_MIRROR && !s.is_empty() {
-            print_bytes_unlocked(s.as_bytes());
-        }
-        written
-    }
 }
 
 #[cfg(all(rustos_debug_print_enabled, test))]
@@ -415,12 +405,12 @@ impl Drop for DebugOutputGuard {
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn try_debug_output_lock() -> Option<DebugOutputGuard> {
+fn try_output_lock_irqsave(lock: &'static Mutex<()>) -> Option<DebugOutputGuard> {
     #[cfg(all(rustos_boot_image, not(test)))]
     {
         let restore_interrupts = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
-        match DEBUG_LOCK.try_lock() {
+        match lock.try_lock() {
             Some(guard) => Some(DebugOutputGuard {
                 guard: Some(guard),
                 restore_interrupts,
@@ -437,7 +427,7 @@ fn try_debug_output_lock() -> Option<DebugOutputGuard> {
     #[cfg(any(not(rustos_boot_image), test))]
     {
         Some(DebugOutputGuard {
-            guard: Some(DEBUG_LOCK.lock()),
+            guard: Some(lock.lock()),
         })
     }
 }
@@ -607,9 +597,15 @@ pub fn log_args_site(
         thread_id: user_context.map(|context| context.thread_id),
     };
 
-    if let Some(_guard) = try_debug_output_lock() {
-        let mut writer = SinkWriter(&KERNEL_LOG_SINK);
+    if let Some(_guard) = try_output_lock_irqsave(&TEXT_LOCK) {
+        let mut writer = SinkWriter(&TEXT_RING);
         let _ = render_log_line(&mut writer, metadata, args);
+    }
+    if RUSTOS_LOGGING_SERIAL_MIRROR {
+        let mut line = FixedDebugconLine::<SERIALIZED_DEBUGCON_LINE_CAPACITY>::new();
+        if render_log_line(&mut line, metadata, args).is_err() || !submit_line(line.bytes()) {
+            DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -714,13 +710,14 @@ pub fn record_product_executable_snapshot_evidence(
 #[cfg(rustos_debug_print_enabled)]
 fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     let output_class = milestone_output_class(record.name);
-    if !output_class.must_reach_sink() && !compiled_level_enabled(record.category, LogLevel::Info) {
+    if !output_class.admits_debugcon(
+        compiled_level_enabled(record.category, LogLevel::Info),
+        cfg!(rustos_boot_trace_enabled),
+    ) || !milestone_debugcon_visible(record.name)
+    {
         return;
     }
-    if !milestone_debugcon_visible(record.name) {
-        return;
-    }
-    if per_process_lifecycle(record.name) {
+    if !cfg!(rustos_boot_trace_enabled) && per_process_lifecycle(record.name) {
         static LIFECYCLE_EMISSIONS: AtomicU64 = AtomicU64::new(0);
         // ORDERING: Relaxed; the counter only thins diagnostics.
         if !lifecycle_sample_admits(LIFECYCLE_EMISSIONS.fetch_add(1, Ordering::Relaxed) + 1) {
@@ -728,28 +725,19 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
         }
     }
     let user_context = current_user_context();
-    // Measurements are one-shot; Required and QualificationCritical keep the
-    // bounded retry.
-    for _ in 0..output_class.output_attempts() {
-        if let Some(_guard) = try_debug_output_lock() {
-            drain_deferred_records();
-            // Rendering allocates the output sequence, so it must run under
-            // DEBUG_LOCK: rendering first lets a CPU that loses the acquisition
-            // race publish a lower sequence after a higher one is already on the
-            // wire, which the host validator reads as replayed evidence. `line` is
-            // then complete before the first port I/O, so one `rep outsb` publishes
-            // the whole frame without a diagnostic splicing bytes into it.
-            let line = render_milestone_debugcon_line(record, user_context, output_class);
-            print_bytes_unlocked(line.bytes());
-            return;
-        }
-        spin_loop();
+    // Fatal bootstrap and stack-guard faults may stop the only runnable CPU.
+    // Give those terminal frames a bounded synchronous attempt even after
+    // handoff; the emergency panic site itself never needs the sink.
+    let terminal = record.category == LogCategory::Panic || record.name == "kernel-stack-guard-fault";
+    if try_emit_synchronously(output_class.output_attempts(), terminal, || {
+        let line = render_milestone_debugcon_line(record, user_context, output_class);
+        print_bytes_unlocked(line.bytes());
+    }) {
+        return;
     }
-    // Preserve ordinary diagnostics in general slots and acceptance evidence
-    // in the additional reserved slots. Scheduler measurements remain one-shot
-    // so delayed emission cannot turn contention into measurement overhead.
-    // The drainer allocates the output sequence under the sink, not here.
-    if output_class != MilestoneOutputClass::Measurement
+    // Keep early measurements one-shot under sink contention. Once the
+    // worker runs, all ordinary records take the bounded enqueue route.
+    if (output_class != MilestoneOutputClass::Measurement || deferred_output_active())
         && deferred::park_milestone(deferred::ParkedMilestone {
             record,
             user_context,
@@ -758,8 +746,11 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     {
         return;
     }
-    // Critical evidence accounts only for its own rendered loss; the unwritten
-    // frame leaves a sequence gap, never a duplicate.
+    if output_class.must_reach_sink() {
+        REQUIRED_MILESTONES_LOST.fetch_add(1, Ordering::Relaxed);
+    }
+    // Qualification evidence accounts only for its own rendered loss; the
+    // unwritten frame leaves a sequence gap, never a duplicate.
     let discarded_bytes = if output_class == MilestoneOutputClass::QualificationCritical {
         render_milestone_debugcon_line(record, user_context, output_class).len() as u64
     } else {
@@ -768,16 +759,114 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     record_milestone_output_drop(output_class, discarded_bytes);
 }
 
-/// Emit a bounded batch. Remaining records retain their slots for the next
-/// sink owner; one diagnostic must not drain an unbounded stream with IRQs off.
 #[cfg(rustos_debug_print_enabled)]
-fn drain_deferred_records() {
-    deferred::drain(DEFERRED_DRAIN_RECORDS, print_bytes_unlocked, |parked| {
-        let line =
-            render_milestone_debugcon_line(parked.record, parked.user_context, parked.output_class);
-        print_bytes_unlocked(line.bytes());
-    });
+fn deferred_output_active() -> bool {
+    // ORDERING: Acquire observes the completed sink handoff.
+    DEFERRED_OUTPUT_ACTIVE.load(Ordering::Acquire)
 }
+
+#[cfg(rustos_debug_print_enabled)]
+fn try_emit_synchronously(attempts: usize, terminal: bool, emit: impl FnOnce()) -> bool {
+    for _ in 0..attempts {
+        if !terminal && deferred_output_active() {
+            return false;
+        }
+        if let Some(_guard) = try_output_lock_irqsave(&DEBUG_LOCK) {
+            // Recheck under the handoff lock in case the worker started
+            // between the producer's first check and sink acquisition.
+            if !terminal {
+                if deferred_output_active() {
+                    return false;
+                }
+                drain_deferred_records(print_bytes_unlocked);
+            }
+            emit();
+            return true;
+        }
+        spin_loop();
+    }
+    false
+}
+
+/// Only the sink owner renders milestone output sequences. Producers carry
+/// the original timestamp and identity but never number rendered records.
+#[cfg(rustos_debug_print_enabled)]
+fn drain_deferred_records(mut emit: impl FnMut(&[u8])) -> usize {
+    deferred::drain(DEFERRED_DRAIN_RECORDS, |record| match record {
+        deferred::ReadyRecord::Line(bytes) => emit(bytes),
+        deferred::ReadyRecord::Milestone(parked) => {
+            let line = render_milestone_debugcon_line(
+                parked.record,
+                parked.user_context,
+                parked.output_class,
+            );
+            emit(line.bytes());
+        }
+    })
+}
+
+pub const fn background_debugcon_supported() -> bool {
+    cfg!(rustos_debug_print_enabled)
+}
+
+/// Sole background debugcon consumer, acquired once by a schedulable worker.
+pub struct DebugconConsumer {
+    #[cfg(rustos_debug_print_enabled)]
+    reported_required_loss: u64,
+    #[cfg(rustos_debug_print_enabled)]
+    announced: bool,
+}
+
+/// Switch normal producers to queue-only admission after early sink writes
+/// finish. On contention the worker retries from normal task context.
+pub fn try_start_background_debugcon() -> Option<DebugconConsumer> {
+    #[cfg(rustos_debug_print_enabled)]
+    {
+        let _guard = try_output_lock_irqsave(&DEBUG_LOCK)?;
+        // ORDERING: Release publishes handoff while the early sink is excluded.
+        assert!(!DEFERRED_OUTPUT_ACTIVE.swap(true, Ordering::Release));
+        Some(DebugconConsumer { reported_required_loss: 0, announced: false })
+    }
+    #[cfg(not(rustos_debug_print_enabled))]
+    None
+}
+
+impl DebugconConsumer {
+    /// A bounded task-context turn. Interrupts and preemption remain enabled
+    /// even during port writes; routine producers no longer need this lock.
+    pub fn drain_turn(&mut self) -> usize {
+        #[cfg(rustos_debug_print_enabled)]
+        {
+            let Some(_guard) = DEBUG_LOCK.try_lock() else { return 0; };
+            let mut batch = FixedDebugconLine::<DEBUGCON_BATCH_BYTES>::new();
+            if !self.announced {
+                let _ = batch.try_append(b"debugcon: background writer active\n");
+                self.announced = true;
+            }
+            let drained = drain_deferred_records(|bytes| {
+                if batch.try_append(bytes).is_err() {
+                    print_bytes_unlocked(batch.bytes());
+                    batch.len = 0;
+                    batch.try_append(bytes).expect("a complete record fits an empty batch");
+                }
+            });
+            print_bytes_unlocked(batch.bytes());
+            let loss = REQUIRED_MILESTONES_LOST.load(Ordering::Relaxed);
+            if loss != self.reported_required_loss {
+                let mut line = FixedDebugconLine::<128>::new();
+                let _ = writeln!(line, "debugcon: required milestone lost total={loss}");
+                print_bytes_unlocked(line.bytes());
+                self.reported_required_loss = loss;
+            }
+            drained
+        }
+        #[cfg(not(rustos_debug_print_enabled))]
+        0
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+static REQUIRED_MILESTONES_LOST: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(rustos_debug_print_enabled)]
 fn render_milestone_debugcon_line(
@@ -962,10 +1051,8 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
     println_serialized(args);
 }
 
-/// Emits one non-panic diagnostic as one complete, bounded-retry debugcon
-/// line. It never publishes a partial formatted line: rendering completes in
-/// fixed storage before the port write, then DEBUG_LOCK remains held through
-/// exactly one `print_bytes_unlocked` call.
+/// Submits one complete non-panic diagnostic; once the worker runs, the
+/// producer never waits for the output sink or publishes a partial line.
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_serialized(args: fmt::Arguments<'_>) {
     if let Err(bytes) = try_println_serialized(args) {
@@ -983,20 +1070,17 @@ fn try_println_serialized(args: fmt::Arguments<'_>) -> Result<(), usize> {
         // turn an unavailable diagnostic into false structured evidence.
         return Err(line.len());
     }
-    for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
-        if let Some(_guard) = try_debug_output_lock() {
-            drain_deferred_records();
-            print_bytes_unlocked(line.bytes());
-            return Ok(());
-        }
-        spin_loop();
-    }
-    // Park for whichever CPU takes the sink next, rather than discarding.
-    if deferred::park(line.bytes()) {
+    if submit_line(line.bytes()) {
         Ok(())
     } else {
         Err(line.len())
     }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn submit_line(bytes: &[u8]) -> bool {
+    try_emit_synchronously(DEBUG_OUTPUT_ACQUIRE_ATTEMPTS, false, || print_bytes_unlocked(bytes))
+        || deferred::park(bytes)
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -1053,11 +1137,16 @@ impl fmt::Display for EscapedUserDebugPayload<'_> {
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_user_bytes_serialized(bytes: &[u8]) -> usize {
     write_user_bytes_with(bytes, |payload| {
-        try_println_serialized(format_args!(
+        match try_println_serialized(format_args!(
             "user-debug payload={}",
             EscapedUserDebugPayload(payload)
-        ))
-        .is_ok()
+        )) {
+            Ok(()) => true,
+            Err(bytes) => {
+                DEBUG_BYTES_DISCARDED.fetch_add(bytes as u64, Ordering::Relaxed);
+                false
+            }
+        }
     })
 }
 
@@ -1190,12 +1279,7 @@ static DEBUG_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only_line(bytes: &[u8]) {
-    if let Some(_guard) = try_debug_output_lock() {
-        if !bytes.is_empty() {
-            print_bytes_unlocked(bytes);
-        }
-        print_bytes_unlocked(b"\r\n");
-    }
+    write_debugcon_only_parts_line(&[bytes]);
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -1203,13 +1287,13 @@ pub fn write_debugcon_only_line(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only_parts_line(parts: &[&[u8]]) {
-    if let Some(_guard) = try_debug_output_lock() {
-        for part in parts {
-            if !part.is_empty() {
-                print_bytes_unlocked(part);
-            }
-        }
-        print_bytes_unlocked(b"\r\n");
+    let mut line = FixedDebugconLine::<SERIALIZED_DEBUGCON_LINE_CAPACITY>::new();
+    if parts.iter().try_for_each(|part| line.try_append(part)).is_err()
+        || line.try_append(b"\r\n").is_err()
+        || !submit_line(line.bytes())
+    {
+        let bytes = parts.iter().fold(2_u64, |len, part| len.saturating_add(part.len() as u64));
+        DEBUG_BYTES_DISCARDED.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 

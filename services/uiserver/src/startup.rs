@@ -439,8 +439,9 @@ impl Startup {
     }
 
     fn publish(&self, line: &str) {
+        // The raw typed readiness record is the acceptance signal. Do not
+        // echo every transition again through the diagnostics worker.
         crate::sys::debug_line(line);
-        crate::sys::diag_line(line);
     }
 
     pub(crate) fn begin(&self, dep: Dependency) -> Option<u32> {

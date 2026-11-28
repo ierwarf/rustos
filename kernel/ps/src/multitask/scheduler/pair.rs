@@ -207,22 +207,24 @@ pub(in crate::multitask) fn break_requested(cpu: usize) -> bool {
     })
 }
 
-fn post_break_flags(cpu: usize, slot: usize, expected_gen: u64, add_flags: u64) {
+fn post_break_flags(cpu: usize, slot: usize, expected_gen: u64, add_flags: u64) -> bool {
     let Some(ctrl) = PAIR_CONTROLS.get(cpu) else {
-        return;
+        return false;
     };
-    let _ = ctrl.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-        let phase = current_phase(word);
-        if !matches!(phase, PHASE_PREPARING | PHASE_LIVE) {
-            return None;
-        }
-        let p = ctrl.partner_slot_plus1.load(Ordering::Acquire);
-        let g = ctrl.partner_owner_gen.load(Ordering::Acquire);
-        if p != (slot as u64) + 1 || g != expected_gen {
-            return None;
-        }
-        Some(word | FLAG_BREAK_REQUESTED | add_flags)
-    });
+    ctrl.state
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+            let phase = current_phase(word);
+            if !matches!(phase, PHASE_PREPARING | PHASE_LIVE) {
+                return None;
+            }
+            let p = ctrl.partner_slot_plus1.load(Ordering::Acquire);
+            let g = ctrl.partner_owner_gen.load(Ordering::Acquire);
+            if p != (slot as u64) + 1 || g != expected_gen {
+                return None;
+            }
+            Some(word | FLAG_BREAK_REQUESTED | add_flags)
+        })
+        .is_ok()
 }
 
 pub(in crate::multitask::scheduler) fn request_break_for_retire(
@@ -230,7 +232,7 @@ pub(in crate::multitask::scheduler) fn request_break_for_retire(
     slot: usize,
     expected_gen: u64,
 ) {
-    post_break_flags(cpu, slot, expected_gen, 0);
+    let _ = post_break_flags(cpu, slot, expected_gen, 0);
 }
 
 pub(in crate::multitask::scheduler) fn request_break_for_affinity(
@@ -238,15 +240,15 @@ pub(in crate::multitask::scheduler) fn request_break_for_affinity(
     slot: usize,
     expected_gen: u64,
 ) {
-    post_break_flags(cpu, slot, expected_gen, 0);
+    let _ = post_break_flags(cpu, slot, expected_gen, 0);
 }
 
 pub(in crate::multitask::scheduler) fn request_break_with_wake(
     cpu: usize,
     slot: usize,
     expected_gen: u64,
-) {
-    post_break_flags(cpu, slot, expected_gen, FLAG_WAKE_PARTNER);
+) -> bool {
+    post_break_flags(cpu, slot, expected_gen, FLAG_WAKE_PARTNER)
 }
 
 #[inline]
@@ -278,16 +280,20 @@ pub(in crate::multitask) fn dissolve_if_live(scope: &DispatchPreemption<'_>) {
         return;
     }
     // Atomically transition Live -> Breaking while capturing any concurrent wake/retire flag.
+    // Because `post_break_flags` refuses updates once phase leaves `Live`,
+    // `final_word` records every `FLAG_WAKE_PARTNER` bit guaranteed by `true`.
     let mut final_word = prev;
-    let _ = ctrl.state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
-        if current_phase(word) != PHASE_LIVE {
-            return None;
-        }
-        let next = (word & !PHASE_MASK) | PHASE_BREAKING;
-        final_word = next;
-        Some(next)
-    });
-    if current_phase(final_word) != PHASE_LIVE && current_phase(ctrl.state.load(Ordering::Acquire)) != PHASE_BREAKING {
+    if ctrl
+        .state
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+            if current_phase(word) != PHASE_LIVE {
+                return None;
+            }
+            final_word = (word & !PHASE_MASK) | PHASE_BREAKING;
+            Some(final_word)
+        })
+        .is_err()
+    {
         return;
     }
 
@@ -302,7 +308,7 @@ pub(in crate::multitask) fn dissolve_if_live(scope: &DispatchPreemption<'_>) {
     });
 
     if let Some(partner) = partner {
-        let wake_partner = (ctrl.state.load(Ordering::Acquire) & FLAG_WAKE_PARTNER) != 0;
+        let wake_partner = (final_word & FLAG_WAKE_PARTNER) != 0;
         frame_publication::publish(
             partner.slot,
             partner.saved_rsp,
@@ -488,7 +494,7 @@ fn try_warm_call(
             || part.id != receiver_id
             || part.wait_reason != (RECEIVE, endpoint)
             || act.arch.root == 0
-            || act.arch.root != part.arch.root
+            || part.arch.root == 0
         {
             return None;
         }
@@ -612,7 +618,6 @@ fn try_cold_call(
     if !c_arch.process || c_arch.root == 0 {
         return None;
     }
-    let c_root = c_arch.root;
 
     let s = task_directory::hint(receiver_id)
         .filter(|&s| s != c && !runqueue::is_idle_slot(s) && s != super::ROOT_TASK_SLOT)?;
@@ -628,7 +633,7 @@ fn try_cold_call(
     {
         return None;
     }
-    if runqueue::address_space::root(s) != c_root
+    if runqueue::address_space::root(s) == 0
         || !cpu_eligible(c, cpu)
         || !cpu_eligible(s, cpu)
         || !identity_execution::qualified_dispatchable(c, c_id)
@@ -816,7 +821,7 @@ pub(in crate::multitask::scheduler) fn try_reply(
             || part.id != caller_id
             || part.wait_reason != (REPLY, reply)
             || act.arch.root == 0
-            || act.arch.root != part.arch.root
+            || part.arch.root == 0
         {
             return None;
         }

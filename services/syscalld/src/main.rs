@@ -21,8 +21,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS,
     COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY,
     COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY,
-    IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, SYSCALL_OFFLOAD_ABI_VERSION,
+    IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD, LIFECYCLE_BROKER_MODE_MAP_NOTIFY,
+    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    SYSCALL_OFFLOAD_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_BRK,
     SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
     SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS,
@@ -87,7 +88,8 @@ fn service_main() {
     if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD) {
         ipc::debug_line(&alloc::format!("syscalld: heartbeat thread unavailable errno={errno}"));
     }
-    drain_lifecycle_events();
+    init_lifecycle_notify();
+    drain_lifecycle_events_uncached();
     ipc::debug_line("syscalld: lifecycle drain ready");
     serve(endpoint as u64);
 }
@@ -217,7 +219,52 @@ fn reply_recv_syscall_request(
     result
 }
 
+static LIFECYCLE_NOTIFY_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static LIFECYCLE_LAST_SEEN_SEQ: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn init_lifecycle_notify() {
+    let mut notify_va = 0_u64;
+    let args = LifecycleDrainBrokerArgs {
+        abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+        mode: LIFECYCLE_BROKER_MODE_MAP_NOTIFY,
+        out_events_ptr: (&mut notify_va as *mut u64) as u64,
+        out_capacity: 1,
+        out_count_ptr: 0,
+        ..LifecycleDrainBrokerArgs::default()
+    };
+    let result = unsafe {
+        syscall1(
+            SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+            (&args as *const LifecycleDrainBrokerArgs) as u64,
+        )
+    };
+    if result > 0 && notify_va != 0 {
+        LIFECYCLE_NOTIFY_ADDR.store(notify_va, core::sync::atomic::Ordering::Release);
+    }
+}
+
 fn drain_lifecycle_events() {
+    let notify_addr = LIFECYCLE_NOTIFY_ADDR.load(core::sync::atomic::Ordering::Acquire);
+    if notify_addr != 0 {
+        // SAFETY: `notify_addr` is a read-only 64-byte-aligned kernel-mapped
+        // `AtomicU64` slot in the permanent lifecycle notify page.
+        let seq = unsafe {
+            (&*(notify_addr as *const core::sync::atomic::AtomicU64))
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+        if seq == LIFECYCLE_LAST_SEEN_SEQ.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        drain_lifecycle_events_uncached();
+        LIFECYCLE_LAST_SEEN_SEQ.store(seq, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    drain_lifecycle_events_uncached();
+}
+
+fn drain_lifecycle_events_uncached() {
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
@@ -374,27 +421,7 @@ fn handle_fast_linux_request(
     sender_pid: u64,
     sender_tid: u64,
 ) -> LinuxSyscallOffloadFastResponse {
-    let mut fast = LinuxSyscallOffloadFastResponse {
-        version: SYSCALL_OFFLOAD_ABI_VERSION,
-        op: request.op,
-        ..LinuxSyscallOffloadFastResponse::default()
-    };
-    let full_request = match fast_offload::expand_id_request(request, sender_pid, sender_tid) {
-        Ok(request) => request,
-        Err(status) => {
-            fast.status = status;
-            return fast;
-        }
-    };
-    let mut full_response = LinuxSyscallOffloadResponse::default();
-    handle_linux_request(
-        size_of::<LinuxSyscallOffloadRequest>(),
-        &full_request,
-        &mut full_response,
-        sender_pid,
-        sender_tid,
-    );
-    fast_offload::compact_response(request.op, &full_response)
+    linux_policy::handle_fast_id_request(request, sender_pid, sender_tid)
 }
 
 fn handle_commercial_request(

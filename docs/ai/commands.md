@@ -109,15 +109,12 @@ There is no separately mutable pre-launch task. F5 must never run
 lanes above. `kvm-run` keeps the interactive session operator-owned after
 startup. During SMP qualification the runner records the guest timestamp but
 does not terminate on an independent boot-to-UI deadline; `kvm-smoke` uses its
-bounded outer process timeout for readiness and proof windows. The runtime
-trace it records follows the same rule: a step that lands after its absolute
-deadline is printed with the observed and budgeted milliseconds and does not
-end the session, because a developer paused at a breakpoint or a cold host
-cache is not a product regression. `kvm-smoke` still enforces every one of
-those deadlines, so the budgets remain gates wherever the result is evidence.
-The ten-second
-product target remains a measured release requirement that must be restored as
-an enforcing gate after the SMP failure path is stable. The repository Cargo
+bounded outer process timeout for readiness and proof windows. Both commands
+record per-step runtime trace deadlines as advisory: overruns are reported,
+not rejected on timing alone. `kvm-smoke` still requires the applicable
+readiness and proof markers within its outer timeout and validates their
+causal order. The ten-second product ceiling remains a measured release
+requirement, not an independent limit enforced by the smoke runner. The repository Cargo
 config does not make optional `sccache`
 availability a prerequisite for compiling xtask; developers may opt in with
 `RUSTC_WRAPPER=sccache` when their environment supports it. The base

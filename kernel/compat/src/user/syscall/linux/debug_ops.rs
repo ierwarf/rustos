@@ -46,7 +46,7 @@ pub(super) fn syscall_linux_rustos_debug_print(user_ptr: u64, user_len: u64) -> 
         // A Ring3 caller must never be able to inject a fresh debugcon line
         // that is indistinguishable from a kernel-stamped milestone frame.
         // Every chunk gets a kernel-owned envelope and every control/quote
-        // byte is escaped before the serialized output lock is acquired.
+        // byte is escaped before the record is admitted to the output path.
         let accepted = debug::write_user_bytes_serialized(&chunk[..chunk_len]);
         written += accepted;
         if accepted != chunk_len {

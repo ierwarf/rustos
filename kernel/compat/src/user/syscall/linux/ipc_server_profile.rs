@@ -94,6 +94,27 @@ pub(super) fn charge(phase: IpcServerPhase, since: u64) -> u64 {
     }
 }
 
+#[cfg(rustos_ipc_phase_profile)]
+static LAST_FAST_COUNTER_DRAIN_TICK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(rustos_ipc_phase_profile)]
+fn drain_fast_counters_rate_limited(now_tick: u64, window_ticks: u64) -> usize {
+    use core::sync::atomic::Ordering;
+    let window_ticks = window_ticks.max(1);
+    let last = LAST_FAST_COUNTER_DRAIN_TICK.load(Ordering::Relaxed);
+    if now_tick.saturating_sub(last) < window_ticks {
+        return 0;
+    }
+    if LAST_FAST_COUNTER_DRAIN_TICK
+        .compare_exchange(last, now_tick, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return 0;
+    }
+    super::ipc_ops::drain_fast_ipc_counters()
+}
+
 /// Emits one fixed record per phase at most once per second and clears the
 /// window. Returns the number of records emitted so housekeeping can count it
 /// as work.
@@ -103,12 +124,13 @@ pub fn drain_ipc_server_profile() -> usize {
         return 0;
     }
     #[cfg(rustos_ipc_phase_profile)]
-    PROFILE
-        .drain(
-            crate::arch::rtc::ticks(),
-            crate::arch::rtc::ticks_per_second(),
-        )
-        .saturating_add(super::ipc_ops::drain_fast_ipc_counters())
+    {
+        let now_tick = crate::arch::rtc::ticks();
+        let window_ticks = crate::arch::rtc::ticks_per_second();
+        PROFILE
+            .drain(now_tick, window_ticks)
+            .saturating_add(drain_fast_counters_rate_limited(now_tick, window_ticks))
+    }
 }
 
 /// See `ipc_profile::force_drain_ipc_call_profile`: the same forced,

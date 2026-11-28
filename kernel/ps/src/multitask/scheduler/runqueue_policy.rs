@@ -122,8 +122,8 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
     placement_target_cpu(
         preferred,
         least_loaded,
-        runqueue::published_runnable_count(preferred),
-        runqueue::published_runnable_count(least_loaded),
+        runqueue::published_total_queued_count(preferred),
+        runqueue::published_total_queued_count(least_loaded),
     )
 }
 

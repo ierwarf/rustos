@@ -917,8 +917,8 @@ struct FastCallFrame {
     response_len: usize,
     state: FastCallState,
     terminal_error: Option<IpcError>,
-    request: [u8; IPC_FAST_INLINE_BYTES],
-    response: [u8; IPC_FAST_INLINE_BYTES],
+    request: [core::mem::MaybeUninit<u8>; IPC_FAST_INLINE_BYTES],
+    response: [core::mem::MaybeUninit<u8>; IPC_FAST_INLINE_BYTES],
     /// Metadata for bytes outside the 256-byte images. The two Vec headers
     /// live in the fixed reply frame even when the spill is absent: this costs
     /// some slot memory but avoids a separate infallible Box allocation on the
@@ -930,6 +930,31 @@ struct FastCallFrame {
 struct FastSpill {
     request: Vec<u8>,
     response: Vec<u8>,
+}
+
+#[inline]
+pub(super) fn write_uninit_bytes(
+    dst: &mut [core::mem::MaybeUninit<u8>],
+    src: &[u8],
+) {
+    assert!(src.len() <= dst.len());
+    // SAFETY: `src` and `dst` are valid for `src.len()` non-overlapping bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
+    }
+}
+
+#[inline]
+pub(super) fn copy_uninit_prefix(
+    src: &[core::mem::MaybeUninit<u8>],
+    len: usize,
+    dst: &mut [u8],
+) {
+    assert!(len <= src.len() && len <= dst.len());
+    // SAFETY: callers maintain that `src[..len]` was initialized by `write_uninit_bytes`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr().cast::<u8>(), dst.as_mut_ptr(), len);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1877,12 +1902,12 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
                         response_len: 0,
                         state: FastCallState::RequestReady,
                         terminal_error: None,
-                        request: [0; IPC_FAST_INLINE_BYTES],
-                        response: [0; IPC_FAST_INLINE_BYTES],
+                        request: [const { core::mem::MaybeUninit::uninit() }; IPC_FAST_INLINE_BYTES],
+                        response: [const { core::mem::MaybeUninit::uninit() }; IPC_FAST_INLINE_BYTES],
                         spill: spill.take(),
                     };
                     if frame.spill.is_none() {
-                        frame.request[..request.len()].copy_from_slice(request);
+                        write_uninit_bytes(&mut frame.request, request);
                     }
                     ReplyObject {
                         message_id: 0,
@@ -2174,7 +2199,7 @@ fn complete_fast_endpoint_reply(
                 if let Some(spill) = prepared_spill.take() {
                     replaced_spill = frame.spill.replace(spill);
                 } else {
-                    frame.response[..response_len].copy_from_slice(response.as_slice());
+                    write_uninit_bytes(&mut frame.response, response.as_slice());
                 }
                 frame.response_len = response_len;
                 frame.state = FastCallState::ResponseReady;
@@ -2258,7 +2283,7 @@ pub fn take_fast_endpoint_response_inline<const N: usize>(
                 break 'take (Err(IpcError::BufferTooSmall), true);
             }
             let mut response = [0; N];
-            response[..frame.response_len].copy_from_slice(&frame.response[..frame.response_len]);
+            copy_uninit_prefix(&frame.response, frame.response_len, &mut response[..frame.response_len]);
             (
                 Ok(FastEndpointResponseTake::Response {
                     response_len: frame.response_len,
