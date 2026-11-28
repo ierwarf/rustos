@@ -24,7 +24,7 @@ pub(super) fn configure_ready(
     let realm = match lease.application_realm {
         Some(handle) => handle,
         None => {
-            let handle = jobs::create_child(JOB_BOOTSTRAP_ROOT_FD)?;
+            let handle = jobs::create_application_realm(JOB_BOOTSTRAP_ROOT_FD)?;
             lease.application_realm = Some(handle);
             handle
         }
@@ -90,7 +90,7 @@ mod tests {
     fn provisioning_records_custody_before_transfer_and_retries_the_same_realm() {
         let source = include_str!("loader_realm.rs").split("#[cfg(test)]").next().unwrap();
         let existing = source.find("Some(handle) => handle").unwrap();
-        let create = source.find("jobs::create_child(JOB_BOOTSTRAP_ROOT_FD)?").unwrap();
+        let create = source.find("jobs::create_application_realm(JOB_BOOTSTRAP_ROOT_FD)?").unwrap();
         let retain = source.find("lease.application_realm = Some(handle)").unwrap();
         let lend = source.find("jobs::duplicate(realm, LOADER_APPLICATION_REALM_RIGHTS)?").unwrap();
         let supervise = source.find("let result = with_loader_supervision(").unwrap();

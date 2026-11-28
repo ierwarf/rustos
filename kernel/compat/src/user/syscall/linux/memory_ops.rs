@@ -12,7 +12,7 @@
 //! - **Failure:** A refused unmap, a reservation conflict, or an allocation
 //!   shortfall returns a Linux errno and leaves the prior address space intact.
 //! - **Forbidden:** No discarded address-space result, no guest-selected
-//!   frame, no W+X protection, and no partial range left published on error.
+//!   frame, no unauthorized W+X protection, and no partial range left published on error.
 //! - **Service heap growth:** vfsd's hint-free anonymous RW `mmap` (the service
 //!   allocator's only growth request) is mapped here directly, never through
 //!   syscalld: syscalld's mapping broker blocks on vfsd (`FILE_IDENTITY`,
@@ -165,6 +165,19 @@ pub(super) fn syscall_linux_brk(addr: u64) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+fn validate_current_exec_prot(prot: u64) -> Result<(), i64> {
+    if prot & !(linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0 {
+        let allowed = multitask::with_current_user_process_state_mut(|_, _, state| {
+            state.address_space().exec_memory_policy().permits(true, true)
+        }).ok_or(LINUX_ESRCH)?;
+        if !allowed { return Err(LINUX_EACCES); }
+    }
+    Ok(())
+}
+
 pub(super) fn syscall_linux_mmap(
     requested_addr: u64,
     user_len: u64,
@@ -174,6 +187,11 @@ pub(super) fn syscall_linux_mmap(
     offset: u64,
 ) -> u64 {
     linux_result((|| {
+        validate_current_exec_prot(prot)?;
+        if prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0
+            && linux_mmap_mapping_type(linux_mmap_effective_flags(flags)) != linux_abi::MAP_PRIVATE {
+            return Err(LINUX_EACCES);
+        }
         if is_plain_anonymous_heap_growth(requested_addr, prot, flags, fd, offset)
             && ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy)
         {
@@ -205,6 +223,7 @@ pub(super) fn syscall_linux_mmap(
 }
 
 pub(super) fn syscall_linux_mprotect(start: u64, user_len: u64, prot: u64) -> u64 {
+    if let Err(errno) = validate_current_exec_prot(prot) { return linux_errno(errno); }
     linux_unit_result(
         match call_syscalld_fast_mem(
             SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
@@ -312,9 +331,6 @@ fn bootstrap_mmap(
     if prot & !(linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC) != 0 {
         return Err(LINUX_EINVAL);
     }
-    if prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0 {
-        return Err(LINUX_EACCES);
-    }
     let fixed = flags & linux_abi::MAP_FIXED != 0;
     if fixed && (requested_addr == 0 || requested_addr & (PAGE_SIZE - 1) != 0) {
         return Err(LINUX_EINVAL);
@@ -333,6 +349,9 @@ fn bootstrap_mmap(
         let mapped = {
             let (address_space, linux_process_state) =
                 process_state.address_space_and_linux_process_state_mut();
+            if !address_space.exec_memory_policy().permits(prot & linux_abi::PROT_WRITE != 0, prot & linux_abi::PROT_EXEC != 0) {
+                return Err(LINUX_EACCES);
+            }
             let Some(state) = linux_process_state.as_mut() else {
                 return Err(LINUX_ENOSYS);
             };

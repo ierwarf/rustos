@@ -1365,6 +1365,11 @@ pub fn handle_mmap(
             return;
         }
     };
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0
+        && !matches!(plan, MmapPlan::Anonymous | MmapPlan::FilePrivate) {
+        response.status = errno::EACCES;
+        return;
+    }
     if matches!(plan, MmapPlan::FilePrivate | MmapPlan::FileShared | MmapPlan::MemfdShared)
         && (fd_rights & MM_BROKER_FD_RIGHT_READ == 0
             || (matches!(plan, MmapPlan::FileShared | MmapPlan::MemfdShared)
@@ -1490,6 +1495,14 @@ pub fn handle_mprotect(
     };
     if state.vmas.len().saturating_add(VMA_SPLIT_HEADROOM) > MAX_VMA_RECORDS {
         response.status = errno::ENOMEM;
+        return;
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0
+        && state.vmas.overlapping(start, end).any(|vma| {
+            !matches!(vma.kind, MmVmaKind::Anonymous | MmVmaKind::Reserved | MmVmaKind::FilePrivate)
+                || (vma.mmap_flags & MAP_TYPE) == MAP_SHARED
+        }) {
+        response.status = errno::EACCES;
         return;
     }
     if prot & PROT_WRITE != 0
@@ -1909,7 +1922,7 @@ fn validate_mmap_len(len: u64) -> Result<u64, i32> {
 
 fn validate_prot(prot: u64) -> Result<(), i32> {
     let supported = PROT_READ | PROT_WRITE | PROT_EXEC;
-    if prot & !supported != 0 || prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+    if prot & !supported != 0 {
         return Err(errno::EINVAL);
     }
     Ok(())

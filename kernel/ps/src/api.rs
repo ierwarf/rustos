@@ -162,7 +162,8 @@ pub use crate::multitask::{
     task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, task_capacity,
 };
 pub use crate::multitask::{
-    job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
+    job_admits_process, job_collect_members, job_create_child, job_create_application_realm,
+    job_exec_memory_policy, job_info, job_is_within,
     job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
     job_session_info, job_set_session_limit, job_charge_client_session,
     job_release_client_session, JobSessionInfo,

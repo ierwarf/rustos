@@ -11,7 +11,7 @@
 //! - **Failure:** Malformed, overlapping, stale, unstable, exhausted, or
 //!   unauthorized observations fail closed without blocking the fault path.
 //! - **Forbidden:** No plain-data seqlock race, PID-only authority, generation
-//!   wrap/reuse, W+X publication, physical address, or exception-time wait.
+//!   wrap/reuse, unauthorized W+X publication, physical address, or exception-time wait.
 //! - **Evidence:** Focused unit tests plus the `pager-vma-publication-*` formal
 //!   and implementation mutations.
 
@@ -27,8 +27,9 @@ use rustos_user_abi::pager::{
     PagerObjectIdentityWire, PagerRangeEdit, PagerRegionEdit, PagerVmRegionWire, VM_ACCESS_EXECUTE,
     VM_ACCESS_KNOWN, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED,
     VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, VM_SHARING_PRIVATE, VM_SHARING_SHARED,
-    apply_region_edit,
+    apply_region_edit, vm_prot_is_rwx,
 };
+use kernel_mm::api::address_space::ExecMemoryPolicy;
 
 use super::slot_dir::AtomicDir;
 use super::process_table::{ProcessHandle, ProcessIdentity};
@@ -1526,7 +1527,8 @@ fn template_is_canonical(region: PagerVmRegionWire) -> bool {
         // fork and recreates a split address-space authority.
         && region.prot & !rustos_user_abi::pager::VM_PROT_KNOWN == 0
         && region.prot & !region.object.rights == 0
-        && !(region.prot & VM_PROT_WRITE != 0 && region.prot & VM_PROT_EXECUTE != 0)
+        && ((!vm_prot_is_rwx(region.prot) && !vm_prot_is_rwx(region.object.rights))
+            || region.is_owned_private_anonymous())
         && (region.sharing == VM_SHARING_PRIVATE || region.sharing == VM_SHARING_SHARED)
         && (region.commit_state == VM_COMMIT_RESERVED || region.commit_state == VM_COMMIT_COMMITTED)
         && region.reserved1 == [0; 2]
@@ -1611,6 +1613,20 @@ pub(super) fn publish(
     template: PagerVmRegionWire,
     ceiling: usize,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
+    publish_for_policy(handle, identity, template, ceiling, ExecMemoryPolicy::StrictWx)
+}
+
+pub(super) fn publish_for_policy(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    template: PagerVmRegionWire,
+    ceiling: usize,
+    policy: ExecMemoryPolicy,
+) -> Result<PagerVmRegionWire, PagerVmaError> {
+    if (vm_prot_is_rwx(template.prot) || vm_prot_is_rwx(template.object.rights))
+        && (policy != ExecMemoryPolicy::AllowRwx || !template.is_owned_private_anonymous()) {
+        return Err(PagerVmaError::Denied);
+    }
     publish_with_builder(handle, identity, template, ceiling, build_default_vma_chunk)
 }
 
@@ -1933,6 +1949,24 @@ fn rewrite_range<F>(
     build: fn() -> Option<VmaChunkBox>,
     mutate: F,
 ) -> Result<bool, PagerVmaError>
+where F: FnOnce() -> Result<(), PagerVmaError>,
+{
+    rewrite_range_for_policy(handle, identity, start, end, replacement_prot, replacement_commit_state, ceiling, build, ExecMemoryPolicy::StrictWx, mutate)
+}
+
+#[expect(clippy::too_many_arguments, reason = "exact range and policy admission")]
+fn rewrite_range_for_policy<F>(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    start: u64,
+    end: u64,
+    replacement_prot: Option<u32>,
+    replacement_commit_state: Option<u16>,
+    ceiling: usize,
+    build: fn() -> Option<VmaChunkBox>,
+    policy: ExecMemoryPolicy,
+    mutate: F,
+) -> Result<bool, PagerVmaError>
 where
     F: FnOnce() -> Result<(), PagerVmaError>,
 {
@@ -1945,7 +1979,7 @@ where
     }
     if replacement_prot.is_some_and(|prot| {
         prot & !rustos_user_abi::pager::VM_PROT_KNOWN != 0
-            || (prot & VM_PROT_WRITE != 0 && prot & VM_PROT_EXECUTE != 0)
+            || (vm_prot_is_rwx(prot) && policy != ExecMemoryPolicy::AllowRwx)
     }) {
         return Err(PagerVmaError::Denied);
     }
@@ -2256,13 +2290,24 @@ pub fn protect_for_process_with_ceiling(
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let rewritten = retained.with_state_mut(|_, state| {
-        rewrite_attenuated_range_with_ceiling(
+        if super::process_table::published_live_process_identity(retained.handle()) != Some(identity)
+            || super::process_table::published_mm_owner_identity(vma_handle) != Some(vma_identity) {
+            return Err(PagerVmaError::Unstable);
+        }
+        let policy = state.address_space().exec_memory_policy();
+        if !policy.permits(prot & VM_PROT_WRITE != 0, prot & VM_PROT_EXECUTE != 0) {
+            return Err(PagerVmaError::Denied);
+        }
+        rewrite_range_for_policy(
             vma_handle,
             vma_identity,
             start,
             end,
             Some(prot),
+            None,
             ceiling,
+            build_default_vma_chunk,
+            policy,
             || {
                 state
                     .address_space_mut()

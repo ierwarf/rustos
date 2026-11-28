@@ -128,7 +128,8 @@ pub use self::process_table::{
     reserve_spawn_in as reserve_process_spawn_in, ProcessIdentity, SpawnReservation,
 };
 pub use self::process_table::jobs::{
-    job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
+    job_admits_process, job_collect_members, job_create_child, job_create_application_realm,
+    job_exec_memory_policy, job_info, job_is_within,
     job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
     job_policy_allows, job_policy_info, job_set_policy, JobPolicy, JobPolicyInfo,
     job_subtree_contains_process, job_session_info, job_set_session_limit,

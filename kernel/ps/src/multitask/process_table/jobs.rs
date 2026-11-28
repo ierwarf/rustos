@@ -166,6 +166,7 @@ pub(super) struct JobSlot {
     kills: u64,
     limits: JobLimits,
     policy: JobPolicy,
+    application_realm: bool,
     /// Direct + descendants; changed only under the process-table lock.
     /// The Ring3 supervisor retains exact session tokens and owns refunds.
     subtree_sessions: u64,
@@ -186,6 +187,7 @@ impl JobSlot {
             kills: 0,
             limits: JobLimits::UNSET,
             policy: JobPolicy::ALL,
+            application_realm: false,
             subtree_sessions: 0,
             session_limit: LIMIT_UNSET,
             kmem_process_limit_bytes: LIMIT_UNSET,
@@ -205,6 +207,15 @@ impl ProcessTable {
     fn job_slot(&self, id: JobId) -> Option<&JobSlot> {
         let slot = self.jobs.get(id.index as usize)?;
         (slot.in_use && slot.generation == id.generation).then_some(slot)
+    }
+
+    pub(super) fn exec_memory_policy_for_job(&self, id: JobId) -> Option<kernel_mm::api::address_space::ExecMemoryPolicy> {
+        let slot = self.job_slot(id)?;
+        Some(if slot.application_realm {
+            kernel_mm::api::address_space::ExecMemoryPolicy::AllowRwx
+        } else {
+            kernel_mm::api::address_space::ExecMemoryPolicy::StrictWx
+        })
     }
 
     fn job_id_of(&self, index: u32) -> JobId {
@@ -434,6 +445,7 @@ impl ProcessTable {
             // A recycled slot must not inherit its previous tenant's limits.
             slot.limits = JobLimits::UNSET;
             slot.policy = JobPolicy::ALL;
+            slot.application_realm = false;
             slot.session_limit = LIMIT_UNSET;
             slot.kmem_process_limit_bytes = LIMIT_UNSET;
             slot.subtree_sessions = 0;
@@ -446,6 +458,20 @@ impl ProcessTable {
 
 /// Creates a child job under `parent`.
 pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
+    job_create_child_inner(parent, false)
+}
+
+/// Root-supervisor-only entry from the typed Job broker. No user-supplied
+/// path, PID, or existing child Job can promote itself into this realm.
+pub fn job_create_application_realm() -> Result<JobId, JobError> {
+    job_create_child_inner(ROOT_JOB, true)
+}
+
+pub fn job_exec_memory_policy(id: JobId) -> Option<kernel_mm::api::address_space::ExecMemoryPolicy> {
+    PROCESS_TABLE.lock().exec_memory_policy_for_job(id)
+}
+
+fn job_create_child_inner(parent: JobId, application_realm: bool) -> Result<JobId, JobError> {
     let mut table = PROCESS_TABLE.lock();
     let parent_slot = *table.job_slot(parent).ok_or(JobError::Stale)?;
     if parent_slot.state == JobState::Killing {
@@ -467,6 +493,7 @@ pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
     slot.kills = 0;
     slot.limits = JobLimits::UNSET;
     slot.policy = JobPolicy::ALL;
+    slot.application_realm = parent_slot.application_realm || application_realm;
     slot.subtree_sessions = 0;
     slot.session_limit = LIMIT_UNSET;
     slot.kmem_process_limit_bytes = LIMIT_UNSET;

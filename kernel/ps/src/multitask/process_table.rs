@@ -1121,7 +1121,7 @@ pub fn stage_exec_state_checked(
             .ok_or(StageRefusal::NewImagePin)?,
     );
     let _process = retain_process(reservation.handle).ok_or(StageRefusal::ProcessGone)?;
-    let (process_id, job_index, detached_owner, state_lock) = {
+    let (process_id, job_index, detached_owner, state_lock, exec_memory_policy) = {
         let mut table = PROCESS_TABLE.lock();
         let Some(object) = table.lookup_object_mut(reservation.handle) else {
             return Err(StageRefusal::ProcessGone);
@@ -1129,13 +1129,19 @@ pub fn stage_exec_state_checked(
         if !exec_commit_may_transfer(object, reservation) {
             return Err(StageRefusal::Transfer);
         }
-        (
+        let job = object.job;
+        let identity = (
             object.process_id,
-            object.job.index() as usize,
+            job.index() as usize,
             object.mm_owner,
             Arc::clone(&object.state_lock),
-        )
+        );
+        let policy = table.exec_memory_policy_for_job(job).ok_or(StageRefusal::Transfer)?;
+        (identity.0, identity.1, identity.2, identity.3, policy)
     };
+    if !address_space.bind_exec_memory_policy(exec_memory_policy) {
+        return Err(StageRefusal::Transfer);
+    }
 
     let staged = if let Some(owner_handle) = detached_owner {
         let replacement_mapping_kmem = kernel_mm::api::kmem_charge::SharedMeter::new(

@@ -190,6 +190,20 @@ fn finish_without_mapping(reservation: ps_api::PagerFaultReservation) {
     let _ = wake_fault_owner(reservation.token, reservation.request.task_id);
 }
 
+fn anonymous_fault_exec_policy(region: PagerVmRegionWire) -> mm_api::address_space::ExecMemoryPolicy {
+    use mm_api::address_space::ExecMemoryPolicy;
+    use rustos_user_abi::pager::{VM_OBJECT_ANONYMOUS, VM_SHARING_PRIVATE, VM_PROT_WRITE, VM_PROT_EXECUTE};
+    // Only called while the exact VMA install permit is held. RWX publication
+    // already required the target address space's immutable execution policy.
+    if region.object.object_type == VM_OBJECT_ANONYMOUS && region.object.backing_service == 0
+        && region.sharing == VM_SHARING_PRIVATE && region.prot & VM_PROT_WRITE != 0
+        && region.prot & VM_PROT_EXECUTE != 0 {
+        ExecMemoryPolicy::AllowRwx
+    } else {
+        ExecMemoryPolicy::StrictWx
+    }
+}
+
 fn page_flags(rights: u32) -> PageTableFlags {
     use rustos_user_abi::pager::{VM_PROT_EXECUTE, VM_PROT_WRITE};
 
@@ -516,6 +530,7 @@ fn serve_anonymous_first_touch_enabled(
             VirtAddr::new(start),
             VirtAddr::new(request.virtual_address),
             page_flags(prot),
+            anonymous_fault_exec_policy(region),
         )
     });
     let (installed, populated, single_frame) = if let Some(populated) = folio {
@@ -652,6 +667,7 @@ fn install_single_anonymous_fault(
         VirtAddr::new(request.virtual_address),
         frame.as_u64(),
         page_flags(prot),
+        anonymous_fault_exec_policy(region),
     );
     // Fault-around, while the permit is still held.
     //
@@ -664,7 +680,7 @@ fn install_single_anonymous_fault(
     // already clipped to this VMA's own extent, so no page outside the region
     // that raised the fault can be touched.
     let populated = match installed {
-        Ok(_) => populate_run_under_permit(request, prot, region.start, region.end, run_pages),
+        Ok(_) => populate_run_under_permit(request, prot, region.start, region.end, run_pages, anonymous_fault_exec_policy(region)),
         Err(_) => 0,
     };
     Ok((installed, populated, Some(frame)))
@@ -866,6 +882,7 @@ fn populate_run_under_permit(
     region_start: u64,
     region_end: u64,
     run_pages: u32,
+    exec_policy: mm_api::address_space::ExecMemoryPolicy,
 ) -> u64 {
     use rustos_user_abi::pager::{PAGER_FAULT_RUN_PAGES_MAX, PAGER_PAGE_BYTES};
 
@@ -920,7 +937,7 @@ fn populate_run_under_permit(
         &frames[..supplied],
         |address, frame| {
             mm_api::paging::map_current_prepared_pager_fault_frame_at(
-                VirtAddr::new(address), frame.as_u64(), flags,
+                VirtAddr::new(address), frame.as_u64(), flags, exec_policy,
             ).map_err(|_| ())
         },
         |frame| {

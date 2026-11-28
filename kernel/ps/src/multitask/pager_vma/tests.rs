@@ -64,6 +64,29 @@ fn process_state() -> UserProcessState {
 }
 
 #[test]
+fn private_anonymous_rwx_publication_and_rewrite_require_application_policy() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(29, 151);
+    let identity = identity(151, 153);
+    let mut request = template(0x80_000);
+    let rwx = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+    request.prot = rwx;
+    request.object.rights = rwx;
+    assert_eq!(publish_for_policy(handle, identity, request, MAX_PAGER_VMAS_PER_PROCESS, ExecMemoryPolicy::StrictWx), Err(PagerVmaError::Denied));
+    let shared = PagerVmRegionWire { sharing: VM_SHARING_SHARED, ..request };
+    assert_eq!(publish_for_policy(handle, identity, shared, MAX_PAGER_VMAS_PER_PROCESS, ExecMemoryPolicy::AllowRwx), Err(PagerVmaError::Denied));
+    let published = publish_for_policy(handle, identity, request, MAX_PAGER_VMAS_PER_PROCESS, ExecMemoryPolicy::AllowRwx).unwrap();
+    assert!(lookup(handle, identity, published.start, VM_ACCESS_EXECUTE).is_ok());
+    assert!(lookup(handle, identity, published.start, VM_ACCESS_WRITE).is_ok());
+    let mut mutated = false;
+    assert_eq!(rewrite_range_for_policy(handle, identity, published.start, published.end, Some(rwx), None, MAX_PAGER_VMAS_PER_PROCESS, build_default_vma_chunk, ExecMemoryPolicy::StrictWx, || { mutated = true; Ok(()) }), Err(PagerVmaError::Denied));
+    assert!(!mutated);
+    assert_eq!(rewrite_range_for_policy(handle, identity, published.start, published.end, Some(VM_PROT_READ), None, MAX_PAGER_VMAS_PER_PROCESS, build_default_vma_chunk, ExecMemoryPolicy::AllowRwx, || Ok(())), Ok(true));
+    assert_eq!(rewrite_range_for_policy(handle, identity, published.start, published.end, Some(rwx), None, MAX_PAGER_VMAS_PER_PROCESS, build_default_vma_chunk, ExecMemoryPolicy::AllowRwx, || Ok(())), Ok(true));
+    assert_eq!(rewrite_attenuated_range(handle, identity, published.start, published.end, None, || Ok(())), Ok(true));
+}
+
+#[test]
 fn extent_prefilter_cannot_reject_from_bounds_republished_during_its_read() {
     let _guard = guard();
     let slot = PublishedPagerVma::empty();

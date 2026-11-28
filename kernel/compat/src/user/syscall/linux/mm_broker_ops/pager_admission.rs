@@ -81,12 +81,11 @@ const RING0_ANONYMOUS_EPOCH: u64 = 1;
 static NEXT_ANON_OBJECT_SLOT: AtomicU64 = AtomicU64::new(1);
 
 /// Translates a Linux protection into pager VMA rights, including the empty
-/// protection used by guard ranges. W+X and unknown bits always fail closed.
+/// protection used by guard ranges. The exact MM policy, not translation,
+/// decides whether owned private anonymous W+X may be published.
 pub(super) fn pager_protection(prot: u64) -> Option<u32> {
     let supported = linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC;
-    if prot & !supported != 0
-        || (prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0)
-    {
+    if prot & !supported != 0 {
         return None;
     }
     let mut rights = 0;
@@ -311,8 +310,7 @@ pub(super) fn admit_anonymous_region(
     prot: u64,
 ) -> AnonymousAdmission {
     let Some(rights) = pager_rights(prot) else {
-        // The broker already rejected W+X and empty protection before it got
-        // here, so this is unreachable rather than ordinary. Fail closed.
+        // Unknown protection bits never reach a VMA.
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
     admit_anonymous_rights(target, start, end, rights)
@@ -597,6 +595,7 @@ fn admit_anonymous_rights(
         }
         // The request's process/MM incarnation is gone (exec, exit).
         Err(multitask::PagerVmaError::Stale) => AnonymousAdmission::Failed(LINUX_ESRCH),
+        Err(multitask::PagerVmaError::Denied) => AnonymousAdmission::Failed(LINUX_EACCES),
         Err(error) => {
             record_publish_failure(start, error);
             AnonymousAdmission::Failed(LINUX_ENOMEM)
@@ -625,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn pager_rights_accepts_prot_none_reservations_but_rejects_wx_and_unknown_bits() {
+    fn pager_rights_translates_known_bits_without_granting_authority() {
         assert_eq!(pager_rights(linux_abi::PROT_READ), Some(VM_PROT_READ));
         assert_eq!(
             pager_rights(linux_abi::PROT_READ | linux_abi::PROT_WRITE),
@@ -633,7 +632,7 @@ mod tests {
         );
         assert_eq!(
             pager_rights(linux_abi::PROT_WRITE | linux_abi::PROT_EXEC),
-            None
+            Some(VM_PROT_WRITE | VM_PROT_EXECUTE)
         );
         // PROT_NONE still publishes one authoritative reserved interval; its
         // zero rights deny access until a later committed protection update.

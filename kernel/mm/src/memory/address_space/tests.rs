@@ -21,6 +21,23 @@ fn validate_user_page_range_rejects_unaligned_or_oob() {
 }
 
 #[test]
+fn execution_memory_policy_is_bound_once_and_defaults_strict() {
+    let mut space = ProcessAddressSpace::empty_for_tests();
+    assert_eq!(space.exec_memory_policy(), ExecMemoryPolicy::StrictWx);
+    assert!(space.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+    assert!(space.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+    assert!(!space.bind_exec_memory_policy(ExecMemoryPolicy::StrictWx));
+    assert_eq!(space.exec_memory_policy(), ExecMemoryPolicy::AllowRwx);
+    assert!(space.normalize_owned_user_page_flags(PageTableFlags::WRITABLE).is_ok());
+    assert!(space.normalize_owned_user_page_flags(USER_INACCESSIBLE_LEAF | PageTableFlags::WRITABLE).is_err());
+    assert!(space.normalize_owned_user_page_flags(PageTableFlags::HUGE_PAGE | PageTableFlags::WRITABLE).is_err());
+    let mut strict = ProcessAddressSpace::empty_for_tests();
+    assert!(strict.bind_exec_memory_policy(ExecMemoryPolicy::StrictWx));
+    assert!(!strict.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+    assert_eq!(strict.normalize_owned_user_page_flags(PageTableFlags::WRITABLE), Err(AddressSpaceError::ProtectionViolation));
+}
+
+#[test]
 fn user_page_flags_enforce_wx_and_reject_huge_pages() {
     assert_eq!(
         normalize_user_page_flags(PageTableFlags::WRITABLE),
