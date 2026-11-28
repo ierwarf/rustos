@@ -6,6 +6,53 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## Uiserver 1 ms CPU tail (2026-11-29)
+
+- Keep this criterion distinct from DVM completion: it is the admitted
+  submit attempt's UI-thread CPU time after the existing cadence/slot gate.
+  Signed 8-vCPU `core_gui` candidate: 8 ordinary runs × 128 samples (4 at
+  50% host pressure) had worst p99 0.389 ms and raw max 0.530 ms. The ninth
+  run aligned with the minute boundary: clock patch 0.783 ms, but a late
+  shell window triggered a structural rebuild at `id=0`, CPU 11.253 ms,
+  uploading 8,387,456 pixels. All 1,152 samples counted; one above 1 ms.
+  Worst per-run p99 0.783 ms, raw max 11.253 ms (target not met).
+  End-to-end max 44.708 ms. Next: preserve live atlas placements across
+  new windows and update only their changed occlusion/texture regions.
+- Retained cursor raster support, integer-scaled Wayland damage, terminal
+  caret and desktop clock no longer force large copies on those paths.
+  The benchmark reports the exact CPU p99/max threshold independently from
+  the legacy tail-ratio gate. Workspace check, 356 UI unit tests and two
+  xtask GUI collector tests passed.
+- [Raw table and provenance](../benchmarks/core-paths-progress.md);
+  logs/images under `build/uiserver-fast/`. No hard deadline, PR seal,
+  Chrome or physical scanout verification. Earlier rejected clock candidate
+  boot (`core_gui-vcpu-8-1795878807019845716`) saw IPC timeouts and a fatal
+  SIGPIPE registration assertion before receipts; do not infer a cause from
+  that boot, whose source also changed before the collector finalized.
+
+## Uiserver CPU work versus pre-submit wait (2026-11-28)
+
+- `core_gui` v2 stamps the admitted submit attempt (after the frame/slot
+  gate), scene preparation, atlas copy, ioctl return and UI thread CPU
+  delta. No scheduling, admission or compositor policy was changed.
+- Two 8-vCPU resource-unpressured runs placed 84–88% of median per-frame
+  pre-submit fraction before the successful work began; admitted UI thread
+  CPU was p50 1.05–1.38 ms / p99 4.01–4.52 ms. A 50%-pressure retry passed
+  (CPU p99 6.04 ms); the first attempt lost inputd's policy lease after netd
+  session timeouts and produced no accepted batch. Details and nested KWin
+  host reference: [core GUI v2](../benchmarks/core-paths-progress.md).
+
+## Uiserver core GUI baseline (2026-11-28)
+
+- Fixed the host collector's stale one-anchor assumption: it now binds exactly
+  the isolated app's CPUID, ALU and atomic rows to the shared sample counts.
+  Workspace check, 2 GUI collector tests and 25 ipcbench tests passed.
+- Two runs each at 1/8 vCPU and a supplemental 8-vCPU 50%-host-load run
+  collected and validated 128 frames each. [Distributions and provenance](../benchmarks/core-paths-progress.md#core_gui-재수집-2026-11-28-154a4296--호출기-수정).
+  All four ordinary runs missed the total tail-ratio goal. No change to the
+  compositor or DVM; split submit eligibility wait from CPU work next, then
+  use a repeatable Chrome workload before attributing its stalls.
+
 ## Background debugcon and boot log volume (2026-11-28)
 
 - Kept QEMU debugcon (`0xe9`) and the evidence format. After the scheduler

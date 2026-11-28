@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache, WindowId};
 use crate::canvas::{
-    CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS, Rect, SurfaceCanvas, render_cursor_bgra_strided,
+    CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS, Rect, SurfaceCanvas, cursor_raster_key,
+    render_cursor_bgra_strided,
 };
 use crate::gpu_scene::{
     AtlasLayoutPacker, GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError,
@@ -184,8 +185,8 @@ pub(crate) enum AtlasRegionKind {
     Dock,
     Cursor {
         sprite_index: u8,
-        dx: i32,
-        dy: i32,
+        cos: i32,
+        sin: i32,
     },
 }
 
@@ -205,19 +206,8 @@ pub(crate) enum RetainedAtlasAction {
 }
 
 pub(crate) fn cursor_region_kind(motion: CursorMotion) -> AtlasRegionKind {
-    if motion.sprite_index == 0 {
-        AtlasRegionKind::Cursor {
-            sprite_index: 0,
-            dx: 1,
-            dy: 0,
-        }
-    } else {
-        AtlasRegionKind::Cursor {
-            sprite_index: motion.sprite_index,
-            dx: motion.dx,
-            dy: motion.dy,
-        }
-    }
+    let (index, cos, sin) = cursor_raster_key(motion);
+    AtlasRegionKind::Cursor { sprite_index: index as u8, cos, sin }
 }
 
 pub(super) fn wayland_ssd_title_hash(window: &WaylandWindowSnapshot) -> u64 {
@@ -935,7 +925,7 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState, cropped: bool) -> u64 
     mix(crate::font::asset_revision());
     mix(u64::from(state.surface.width));
     mix(u64::from(state.surface.height));
-    mix(state.desktop_cache.content_version);
+    mix(state.desktop_cache.chrome_version);
     mix(state.focused_session_handle);
     mix(u64::from(state.focused_wayland_surface_id.unwrap_or(0)));
     state.visit_window_draw_order(|id| match id {
@@ -995,7 +985,7 @@ pub(crate) fn gpu_dock_reuse_signature(state: &AppState) -> u64 {
     mix(crate::font::asset_revision());
     mix(u64::from(state.surface.width));
     mix(u64::from(state.surface.height));
-    mix(state.desktop_cache.content_version);
+    mix(state.desktop_cache.chrome_version);
     mix(state.focused_session_handle);
     mix(u64::from(state.focused_wayland_surface_id.unwrap_or(0)));
     mix(state.console_windows.len() as u64);
@@ -1015,6 +1005,81 @@ pub(crate) fn gpu_dock_reuse_signature(state: &AppState) -> u64 {
         }
     }
     signature
+}
+
+/// The scene signature already proves the full chrome version is unchanged.
+/// Repaint the minute and patch only desktop fragments that intersect the clock.
+pub(crate) fn update_gpu_desktop_clock(
+    state: &mut AppState,
+    atlas: &mut [u32],
+    stride: usize,
+    regions: &mut [AtlasRegionEntry],
+) -> Result<Option<Vec<Rect>>, GpuSceneError> {
+    if state.desktop_cache.clock_stale {
+        repaint_home_clock(state);
+        if !state.desktop_cache.fully_valid() {
+            return Ok(None);
+        }
+    }
+    let cache = &state.desktop_cache;
+    let mut damage = Vec::new();
+    for entry in regions {
+        if entry.kind != AtlasRegionKind::Desktop || entry.content_version == cache.content_version {
+            continue;
+        }
+        let clock = crate::layout::home_clock_dirty_rect(state.surface.width, state.surface.height);
+        if let Some(rect) = patch_desktop_fragment(cache, atlas, stride, entry, clock)? {
+            damage.push(rect);
+        }
+        entry.content_version = cache.content_version;
+    }
+    Ok(Some(damage))
+}
+
+fn patch_desktop_fragment(
+    cache: &crate::app::DesktopSurfaceCache,
+    atlas: &mut [u32],
+    stride: usize,
+    entry: &AtlasRegionEntry,
+    clock: Rect,
+) -> Result<Option<Rect>, GpuSceneError> {
+    let patch = clock.intersect(entry.source_rect);
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let dst = Rect {
+        x: entry.atlas_rect.x + (patch.x - entry.source_rect.x),
+        y: entry.atlas_rect.y + (patch.y - entry.source_rect.y),
+        ..patch
+    };
+    // Do not call the atlas packer's region writer: it zeroes padding, and
+    // this patch is inside a region with live pixels outside the rectangle.
+    if patch.x + patch.width > cache.width || dst.x + dst.width > stride {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    // Most of the clock block is unchanged wallpaper. Compare bounded row
+    // chunks, then publish only a conservative bound on the changed pixels.
+    const CHUNK: usize = 32;
+    let mut changed = Rect::empty();
+    for row in 0..patch.height {
+        let src = (patch.y + row) * cache.width + patch.x;
+        let pos = (dst.y + row) * stride + dst.x;
+        let source = cache.pixels.get(src..src + patch.width).ok_or(GpuSceneError::InvalidLayer)?;
+        let target = atlas.get_mut(pos..pos + dst.width).ok_or(GpuSceneError::InvalidLayer)?;
+        for (chunk, (source, target)) in source.chunks(CHUNK).zip(target.chunks_mut(CHUNK)).enumerate() {
+            if source == target {
+                continue;
+            }
+            crate::simd::copy_xrgb_opaque_row_u32(source, target);
+            changed = changed.union(Rect {
+                x: dst.x + chunk * CHUNK,
+                y: dst.y + row,
+                width: source.len(),
+                height: 1,
+            });
+        }
+    }
+    Ok((!changed.is_empty()).then_some(changed))
 }
 
 pub(crate) fn update_dock_gpu_texture(
@@ -1403,47 +1468,17 @@ pub(crate) fn update_cropped_console_windows_textures(
         if window.surface_cache.content_version == binding.content_version {
             continue;
         }
+        let changed = window.surface_cache.damage_since(binding.content_version);
         for &(source, region) in &binding.fragments {
             if source.width != region.width || source.height != region.height {
                 return Ok(None);
             }
-            for row in 0..region.height {
-                let source_start = (source.y + row)
-                    .checked_mul(binding.outer.width)
-                    .and_then(|offset| offset.checked_add(source.x))
-                    .ok_or(GpuSceneError::InvalidLayer)?;
-                let source_end = source_start
-                    .checked_add(region.width)
-                    .ok_or(GpuSceneError::InvalidLayer)?;
-                let destination_start = (region.y + row)
-                    .checked_mul(atlas_stride_pixels)
-                    .and_then(|offset| offset.checked_add(region.x))
-                    .ok_or(GpuSceneError::InvalidLayer)?;
-                let destination_end = destination_start
-                    .checked_add(region.width)
-                    .ok_or(GpuSceneError::InvalidLayer)?;
-                atlas_pixels
-                    .get_mut(destination_start..destination_end)
-                    .ok_or(GpuSceneError::InvalidLayer)?
-                    .copy_from_slice(
-                        window
-                            .surface_cache
-                            .pixels
-                            .get(source_start..source_end)
-                            .ok_or(GpuSceneError::InvalidLayer)?,
-                    );
+            if let Some(patched) = copy_console_damage_to_atlas(
+                &window.surface_cache, atlas_pixels, atlas_stride_pixels, source, region,
+                changed, focused,
+            )? {
+                damage.push(patched);
             }
-            apply_atlas_window_fragment_alpha(
-                atlas_pixels,
-                atlas_stride_pixels,
-                region,
-                source,
-                binding.outer.width,
-                binding.outer.height,
-                focused,
-                false,
-            )?;
-            damage.push(region);
         }
         binding.content_version = window.surface_cache.content_version;
     }
@@ -1652,40 +1687,54 @@ fn update_console_gpu_texture(
         return Ok(true);
     }
 
-    for row in 0..binding.source_rect.height {
-        let source_start = row
-            .checked_mul(window.surface_cache.width)
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        let source_end = source_start
-            .checked_add(binding.source_rect.width)
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        let destination_start = (binding.source_rect.y + row)
-            .checked_mul(atlas_stride_pixels)
-            .and_then(|offset| offset.checked_add(binding.source_rect.x))
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        let destination_end = destination_start
-            .checked_add(binding.source_rect.width)
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        atlas_pixels
-            .get_mut(destination_start..destination_end)
-            .ok_or(GpuSceneError::InvalidLayer)?
-            .copy_from_slice(
-                window
-                    .surface_cache
-                    .pixels
-                    .get(source_start..source_end)
-                    .ok_or(GpuSceneError::InvalidLayer)?,
-            );
+    let changed = window.surface_cache.damage_since(binding.content_version);
+    let source = Rect { x: 0, y: 0, ..binding.source_rect };
+    if let Some(patched) = copy_console_damage_to_atlas(
+        &window.surface_cache, atlas_pixels, atlas_stride_pixels, source, binding.source_rect,
+        changed, focused,
+    )? {
+        damage.push(patched);
     }
-    apply_atlas_window_alpha(
-        atlas_pixels,
-        atlas_stride_pixels,
-        binding.source_rect,
-        focused,
-    )?;
     binding.content_version = window.surface_cache.content_version;
-    damage.push(binding.source_rect);
     Ok(true)
+}
+
+fn copy_console_damage_to_atlas(
+    cache: &crate::app::WindowSurfaceCache,
+    atlas: &mut [u32],
+    stride: usize,
+    source: Rect,
+    region: Rect,
+    changed: Rect,
+    focused: bool,
+) -> Result<Option<Rect>, GpuSceneError> {
+    let patch = source.intersect(changed);
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let dst = Rect {
+        x: region.x + (patch.x - source.x),
+        y: region.y + (patch.y - source.y),
+        ..patch
+    };
+    for row in 0..patch.height {
+        let start = (patch.y + row)
+            .checked_mul(cache.width)
+            .and_then(|offset| offset.checked_add(patch.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let end = start.checked_add(patch.width).ok_or(GpuSceneError::InvalidLayer)?;
+        let dst_start = (dst.y + row)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(dst.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let dst_end = dst_start.checked_add(dst.width).ok_or(GpuSceneError::InvalidLayer)?;
+        atlas.get_mut(dst_start..dst_end).ok_or(GpuSceneError::InvalidLayer)?
+            .copy_from_slice(cache.pixels.get(start..end).ok_or(GpuSceneError::InvalidLayer)?);
+    }
+    apply_atlas_window_fragment_alpha(
+        atlas, stride, dst, patch, cache.width, cache.height, focused, false,
+    )?;
+    Ok(Some(dst))
 }
 
 #[cfg(test)]
@@ -2812,8 +2861,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
                 chrome::draw_home_launcher(&mut canvas, home, program.title.as_str());
             }
         }
-        // The clock is part of the chrome layer, so a new minute rebuilds it
-        // and records which minute the cache now shows.
+        // A full chrome repaint draws the current minute too.
         let reading = crate::clock::ClockReading::now();
         state.desktop_cache.clock_minute = None;
         if let (Some(clock), Some(reading)) =
@@ -2832,6 +2880,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
         state.desktop_cache.clock_stale = false;
         state.desktop_cache.content_version =
             state.desktop_cache.content_version.wrapping_add(1).max(1);
+        state.desktop_cache.chrome_version = state.desktop_cache.content_version;
     }
 
     let refresh_elapsed = refresh_started.elapsed();

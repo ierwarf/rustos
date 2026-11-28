@@ -12,6 +12,13 @@ pub const STATE: &str = "core_state";
 pub const SCHEDULER: &str = "core_scheduler";
 // GUI samples are owned by uiserver, not emulated in ipcbench/Linux stdout.
 pub const GUI: &str = "core_gui";
+/// Hardware-only diagnostics emitted in isolated runs, shared with the host
+/// collector so it rejects missing, extra, skipped, or partial anchor rows.
+pub const ISOLATED_HARDWARE_ANCHORS: [(&str, usize); 3] = [
+    ("vmexit_cpuid", 50_000),
+    ("anchor_alu_chain", 10_000),
+    ("anchor_atomic_chain", 10_000),
+];
 pub const SCHEDULER_PROBES: &[&str] = &["sched_yield", "wake_to_run_futex", "smp_balance_futex"];
 pub const LIFECYCLE: &str = "core_lifecycle";
 pub const LIFECYCLE_PROBES: &[&str] = &[

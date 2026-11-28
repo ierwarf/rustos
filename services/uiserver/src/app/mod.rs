@@ -310,6 +310,24 @@ pub(crate) struct WindowSurfaceCache {
     pub(crate) focused: bool,
     pub(crate) valid: bool,
     pub(crate) content_version: u64,
+    // Only safe for a consumer that holds the exact previous surface version.
+    last_partial: Option<(u64, canvas::Rect)>,
+}
+
+impl WindowSurfaceCache {
+    pub(crate) fn record_damage(&mut self, partial: Option<canvas::Rect>) {
+        self.last_partial = partial.map(|rect| (self.content_version, rect));
+        self.content_version = self.content_version.wrapping_add(1).max(1);
+    }
+
+    pub(crate) fn damage_since(&self, version: u64) -> canvas::Rect {
+        if let Some((base, rect)) = self.last_partial {
+            if base == version {
+                return rect;
+            }
+        }
+        canvas::Rect { x: 0, y: 0, width: self.width, height: self.height }
+    }
 }
 
 #[derive(Default)]
@@ -325,6 +343,9 @@ pub(crate) struct DesktopSurfaceCache {
     pub(crate) background_valid: bool,
     pub(crate) chrome_valid: bool,
     pub(crate) content_version: u64,
+    /// The last full repaint. Later versions of the same chrome differ only
+    /// in the clock block and do not affect atlas layout or the dock backdrop.
+    pub(crate) chrome_version: u64,
     /// The local minute the cached chrome's clock shows, or `None` when it
     /// shows no clock. A different minute means the chrome is stale.
     pub(crate) clock_minute: Option<i64>,
@@ -438,8 +459,7 @@ impl ConsoleWindow {
             rect,
         );
         self.terminal.render_cursor_cell(&mut canvas);
-        self.surface_cache.content_version =
-            self.surface_cache.content_version.wrapping_add(1).max(1);
+        self.surface_cache.record_damage(Some(rect));
         Some(canvas::Rect {
             x: self.frame.x + rect.x,
             y: self.frame.y + rect.y,

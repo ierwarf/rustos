@@ -9,6 +9,31 @@ use super::{
 };
 
 #[test]
+fn clock_patch_preserves_fragment_padding_and_unaffected_pixels() {
+    use super::{AtlasRegionEntry, AtlasRegionKind, patch_desktop_fragment};
+    let cache = crate::app::DesktopSurfaceCache {
+        width: 8,
+        height: 8,
+        pixels: (0..64).collect(),
+        ..Default::default()
+    };
+    let entry = AtlasRegionEntry {
+        atlas_rect: Rect { x: 2, y: 1, width: 4, height: 4 },
+        source_rect: Rect { x: 3, y: 2, width: 4, height: 4 },
+        kind: AtlasRegionKind::Desktop,
+        content_version: 1,
+    };
+    let clock = Rect { x: 1, y: 4, width: 4, height: 3 };
+    let mut atlas = vec![0x1234_5678; 80];
+    assert_eq!(patch_desktop_fragment(&cache, &mut atlas, 10, &entry, clock).unwrap(),
+        Some(Rect { x: 2, y: 3, width: 2, height: 2 }));
+    let mut expected = vec![0x1234_5678; 80];
+    expected[32..34].copy_from_slice(&[0xff00_0023, 0xff00_0024]);
+    expected[42..44].copy_from_slice(&[0xff00_002b, 0xff00_002c]);
+    assert_eq!(atlas, expected);
+}
+
+#[test]
 fn shell_echo_updates_retained_atlas_without_dragging_the_window() {
     use crate::app::{ConsoleWindow, VisualUpdate};
     let frame = Rect {

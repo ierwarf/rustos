@@ -843,6 +843,7 @@ impl WaylandState {
                         state.width = w;
                         state.height = h;
                         state.stride_pixels = w;
+                        state.last_damage = Rect { x: 0, y: 0, width: w, height: h };
                         state.content_version = next_content_version(state.content_version);
                         if state.is_child() {
                             state.frame.width = w;

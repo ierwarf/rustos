@@ -476,7 +476,8 @@ fn probe_null_syscall(tsc_khz: u64) {
 /// this is the constant that says whether an unexplained cost *could* be
 /// hypervisor exits and how many would be needed to account for it.
 fn probe_vmexit_cpuid(tsc_khz: u64) {
-    let result = measure(SYSCALL_ITERS, WARMUP, || {
+    let [(name, iters), _, _] = core_contract::ISOLATED_HARDWARE_ANCHORS;
+    let result = measure(iters, WARMUP, || {
         // The intrinsic is used rather than raw `asm!` because LLVM reserves
         // `rbx`. Leaf 0 is architecturally available at any privilege level and
         // only reads vendor/leaf identification.
@@ -485,8 +486,8 @@ fn probe_vmexit_cpuid(tsc_khz: u64) {
         true
     });
     match result {
-        Some(mut samples) => report("vmexit_cpuid", &summarize(&mut samples), tsc_khz),
-        None => skip("vmexit_cpuid", "cpuid-failed"),
+        Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
+        None => skip(name, "cpuid-failed"),
     }
 }
 
@@ -496,12 +497,13 @@ fn probe_vmexit_cpuid(tsc_khz: u64) {
 /// Reported in TSC ticks like every row, so a host that boosts higher reads
 /// fewer ticks in both, while `vmexit_cpuid` also carries the host's KVM exit
 /// path. Together they say which resource drifted between two runs.
-const ANCHOR_CHAIN_ITERS: usize = 10_000;
 const ALU_CHAIN_LEN: u64 = 1_200;
 const ATOMIC_CHAIN_LEN: u64 = 480;
 
 fn probe_anchor_chains(tsc_khz: u64) {
-    let alu = measure(ANCHOR_CHAIN_ITERS, WARMUP, || {
+    let [_, (alu_name, alu_iters), (atomic_name, atomic_iters)] =
+        core_contract::ISOLATED_HARDWARE_ANCHORS;
+    let alu = measure(alu_iters, WARMUP, || {
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
         // SAFETY: register-only dependent multiply loop; touches no memory.
         unsafe {
@@ -519,11 +521,11 @@ fn probe_anchor_chains(tsc_khz: u64) {
         true
     });
     match alu {
-        Some(mut samples) => report("anchor_alu_chain", &summarize(&mut samples), tsc_khz),
-        None => skip("anchor_alu_chain", "measure-failed"),
+        Some(mut samples) => report(alu_name, &summarize(&mut samples), tsc_khz),
+        None => skip(alu_name, "measure-failed"),
     }
     let mut cell: u64 = 0;
-    let atomic = measure(ANCHOR_CHAIN_ITERS, WARMUP, || {
+    let atomic = measure(atomic_iters, WARMUP, || {
         // SAFETY: `cell` is a live stack word owned by this closure's caller.
         unsafe {
             core::arch::asm!(
@@ -541,8 +543,8 @@ fn probe_anchor_chains(tsc_khz: u64) {
     });
     core::hint::black_box(cell);
     match atomic {
-        Some(mut samples) => report("anchor_atomic_chain", &summarize(&mut samples), tsc_khz),
-        None => skip("anchor_atomic_chain", "measure-failed"),
+        Some(mut samples) => report(atomic_name, &summarize(&mut samples), tsc_khz),
+        None => skip(atomic_name, "measure-failed"),
     }
 }
 
@@ -1312,7 +1314,9 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
 /// counters, while making a same-session target-only A-B-A comparison capable
 /// of rejecting host clock drift instead of trusting equal-looking TSC rates.
 fn run_isolated_probe(name: &str, tsc_khz: u64) {
-    if name != "vmexit_cpuid" && name != component_contract::FILTER {
+    if name != core_contract::ISOLATED_HARDWARE_ANCHORS[0].0
+        && name != component_contract::FILTER
+    {
         probe_vmexit_cpuid(tsc_khz);
         probe_anchor_chains(tsc_khz);
     }

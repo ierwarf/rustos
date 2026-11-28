@@ -2616,6 +2616,15 @@ fn compositor_and_clients_agree_on_the_runtime_dir_by_construction() {
 
 #[test]
 fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pixels() {
+    check_retained_wire_damage(2);
+}
+
+#[test]
+fn legacy_shm_damage_upscales_only_the_patch_and_survives_undamaged_commits() {
+    check_retained_wire_damage(1);
+}
+
+fn check_retained_wire_damage(buffer_scale: usize) {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
 
@@ -2661,7 +2670,7 @@ fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pix
         .expect("initial configure");
     wire::send(&mut peer, &wire::message(7, 4, &wire::u32s(&[serial])));
 
-    // 16x16 ARGB8888 buffer at buffer_scale = 2 matches output_scale = 2 (8x8 logical).
+    // 16x16 ARGB8888, either native physical pixels or a legacy 2x upscale.
     let buf_w = 16_usize;
     let buf_h = 16_usize;
     let stride = buf_w * 4;
@@ -2680,17 +2689,22 @@ fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pix
             &wire::u32s(&[10, 0, buf_w as u32, buf_h as u32, stride as u32, 0]),
         ),
     );
-    wire::send(&mut peer, &wire::message(6, 8, &wire::u32s(&[2])));
+    wire::send(&mut peer, &wire::message(6, 8, &wire::u32s(&[buffer_scale as u32])));
     wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
     wire::send(&mut peer, &wire::message(6, 6, &[]));
     pump(&mut display, &mut state);
     wait_for_snapshot(&mut state);
+    state.clear_window_damage();
+    let (original_ptr, physical_ptr) = {
+        let surf = state.surfaces[0].shared.lock().unwrap();
+        (surf.original_pixels.as_ptr(), surf.pixels.as_ptr())
+    };
 
-    // Paint physical pixel (6, 4) -> logical (3, 2), and submit logical wl_surface.damage(3, 2, 2, 1).
-    let mut blue = [0_u8; 4];
-    blue.copy_from_slice(&0xff22_4488_u32.to_ne_bytes());
-    for y in 4..6 {
-        for x in 6..10 {
+    // Change an undeclared pixel too. A full reread would pick it up.
+    let blue = 0xff22_4488_u32.to_ne_bytes();
+    file.write_all_at(&blue, 0).unwrap();
+    for y in 2 * buffer_scale..3 * buffer_scale {
+        for x in 3 * buffer_scale..5 * buffer_scale {
             file.write_all_at(&blue, (y * stride + x * 4) as u64).unwrap();
         }
     }
@@ -2712,12 +2726,16 @@ fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pix
             },
             "wl_surface.damage must scale logical coords by buffer_scale=2"
         );
-        assert_eq!(surf.pixels[4 * buf_w + 6], 0xff22_4488);
+        assert_eq!(surf.original_pixels.as_ptr(), original_ptr);
+        assert_eq!(surf.pixels.as_ptr(), physical_ptr);
     }
 
-    // Now paint buffer pixel (1, 1) and submit wl_surface.damage_buffer(1, 1, 1, 1).
-    let mut green = [0_u8; 4];
-    green.copy_from_slice(&0xff11_aa33_u32.to_ne_bytes());
+    // A callback-only commit (even with a same-layout attach) cannot erase
+    // unapplied damage. Then a second patch must extend the pending union.
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    let green = 0xff11_aa33_u32.to_ne_bytes();
     file.write_all_at(&green, (stride + 4) as u64).unwrap();
     wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
     wire::send(&mut peer, &wire::message(6, 9, &wire::u32s(&[1, 1, 1, 1])));
@@ -2726,17 +2744,15 @@ fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pix
     wait_for_snapshot(&mut state);
 
     let surf = state.surfaces[0].shared.lock().unwrap();
-    assert_eq!(
-        surf.last_damage,
-        Rect {
-            x: 1,
-            y: 1,
-            width: 1,
-            height: 1,
-        },
-        "wl_surface.damage_buffer must remain in unscaled buffer pixels"
-    );
-    assert_eq!(surf.pixels[buf_w + 1], 0xff11_aa33);
+    let repeat = 2 / buffer_scale;
+    assert_eq!(surf.last_damage, Rect { x: repeat, y: repeat, width: 10 - repeat, height: 6 - repeat });
+    assert_eq!(surf.original_pixels[buf_w + 1], 0xff11_aa33);
+    assert_eq!(surf.original_pixels[0], 0x1111_1111);
+    let mapped = super::viewport::map_buffer_for_output(
+        &surf.original_pixels, buf_w, buf_h, surf.buffer_mapping, &surf.viewport, 2,
+    ).unwrap();
+    let expected = mapped.as_ref().map_or(surf.original_pixels.as_slice(), |(p, _, _)| p);
+    assert_eq!(surf.pixels.as_slice(), expected, "patches must match a full remap");
 }
 
 /// Bind `wl_seat` (id 3) and `wl_compositor` (id 4), create `wl_surface` 5 and

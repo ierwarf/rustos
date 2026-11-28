@@ -45,7 +45,7 @@ use crate::render::{
     cursor_region_kind, gpu_cursor_layer, gpu_dock_reuse_signature, gpu_scene_reuse_signature,
     update_console_gpu_textures, update_cropped_console_textures, update_cropped_dock_texture,
     update_cropped_wayland_textures, update_dock_gpu_texture, update_gpu_cursor_texture,
-    update_gpu_layer_destinations, update_wayland_gpu_textures,
+    update_gpu_desktop_clock, update_gpu_layer_destinations, update_wayland_gpu_textures,
 };
 use crate::sys::{
     DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, ESTALE,
@@ -689,6 +689,7 @@ impl GpuCompositor {
             return Err(EAGAIN);
         };
         let prepare_started = Instant::now();
+        let cpu_before = crate::input_completion::thread_cpu_ns();
         let mut rebuild_allocate_elapsed = Duration::ZERO;
         let mut rebuild_scene_elapsed = Duration::ZERO;
         let mut rebuild_difference_elapsed = Duration::ZERO;
@@ -709,10 +710,10 @@ impl GpuCompositor {
         let mut full_rebuild = !self.active
             || (scene_dirty
                 && ((self.cropped && !self.cropped_reusable)
-                    // Chrome/clock invalidation only changes the content
-                    // version when the desktop layer is actually repainted.
+                    || self.retained_regions.is_empty()
+                    // Full chrome invalidation changes its version only when
+                    // repainted. Minute changes can patch the retained atlas.
                     || !state.desktop_cache.fully_valid()
-                    || state.desktop_cache.clock_stale
                     || current_scene_signature != self.retained_scene_signature));
         if scene_dirty
             && !full_rebuild
@@ -726,6 +727,7 @@ impl GpuCompositor {
             full_rebuild = true;
         }
         let stride_pixels = self.info.atlas_stride_bytes as usize / size_of::<u32>();
+        let mut patch_kind = 0;
         if scene_dirty && !full_rebuild {
             match update_wayland_gpu_textures(
                 state,
@@ -753,6 +755,10 @@ impl GpuCompositor {
                     None => full_rebuild = true,
                 }
             }
+            if !damage.is_empty() {
+                patch_kind |= 8;
+            }
+            let wayland_rects = damage.len();
             if !full_rebuild && self.cropped {
                 match update_cropped_console_textures(
                     state,
@@ -779,6 +785,10 @@ impl GpuCompositor {
                     None => full_rebuild = true,
                 }
             }
+            if damage.len() != wayland_rects {
+                patch_kind |= 16;
+            }
+            let console_rects = damage.len();
             if !full_rebuild && current_dock_signature != self.retained_dock_signature {
                 if let Some(dock_rect) = self.dock_source_rect {
                     if update_dock_gpu_texture(
@@ -818,6 +828,27 @@ impl GpuCompositor {
                     full_rebuild = true;
                 }
             }
+            if damage.len() != console_rects {
+                patch_kind |= 32;
+            }
+            if !full_rebuild {
+                match update_gpu_desktop_clock(
+                    state,
+                    self.atlas.as_mut_slice(),
+                    stride_pixels,
+                    self.retained_regions.as_mut_slice(),
+                )
+                .map_err(gpu_scene_errno)?
+                {
+                    Some(changed) => {
+                        if !changed.is_empty() {
+                            patch_kind |= 64;
+                            damage.extend(changed.into_iter().map(damage_from_rect));
+                        }
+                    }
+                    None => full_rebuild = true,
+                }
+            }
             if !full_rebuild {
                 sync_retained_region_versions(
                     self.retained_regions.as_mut_slice(),
@@ -833,6 +864,8 @@ impl GpuCompositor {
                 self.retained_regions.clear();
             }
         }
+        let cursor_changed = crate::canvas::cursor_raster_key(state.cursor_motion)
+            != crate::canvas::cursor_raster_key(self.cursor_motion);
         if full_rebuild {
             crate::note_present_step(crate::PRESENT_STEP_SCENE);
             let incremental =
@@ -985,7 +1018,7 @@ impl GpuCompositor {
             // already contain every accepted commit.
             state.wayland_pending_damage.clear();
             self.retained_scene_signature = gpu_scene_reuse_signature(state, cropped);
-        } else if state.cursor_motion != self.cursor_motion {
+        } else if cursor_changed {
             let cursor_source_rect = self.cursor_source_rect.ok_or(EINVAL)?;
             update_gpu_cursor_texture(
                 self.atlas.as_mut_slice(),
@@ -994,7 +1027,15 @@ impl GpuCompositor {
                 state.cursor_motion,
             )
             .map_err(gpu_scene_errno)?;
-            damage.push(damage_from_rect(cursor_source_rect));
+            // Both support rectangles are needed: pixels made transparent
+            // by the new sprite must also be overwritten in each DVM slot.
+            let support = crate::canvas::cursor_raster_bounds(self.cursor_motion)
+                .union(crate::canvas::cursor_raster_bounds(state.cursor_motion));
+            damage.push(damage_from_rect(Rect {
+                x: cursor_source_rect.x + support.x,
+                y: cursor_source_rect.y + support.y,
+                ..support
+            }));
             self.cursor_motion = state.cursor_motion;
             let next_cursor_kind = cursor_region_kind(state.cursor_motion);
             for entry in &mut self.retained_regions {
@@ -1111,6 +1152,9 @@ impl GpuCompositor {
         // The diagnostic split ends at successful ioctl return, before slow
         // logging/formatting or pending-frame bookkeeping can run.
         let submit_accepted = Instant::now();
+        let frame_cpu_ns = cpu_before.and_then(|before| {
+            crate::input_completion::thread_cpu_ns()?.checked_sub(before)
+        });
         self.force_full_snapshot = false;
         let submit_elapsed = submit_accepted.duration_since(submit_started);
         let total_elapsed = total_started.elapsed();
@@ -1169,7 +1213,16 @@ impl GpuCompositor {
             // Attach before the first-frame blocking retirement: it can
             // complete synchronously before this present call returns.
             input_completion: crate::input_completion::submitted(
-                submit_accepted,
+                crate::input_completion::SubmitWork {
+                    start: prepare_started,
+                    copy: copy_started,
+                    ioctl: submit_started,
+                    accepted: submit_accepted,
+                    cpu_ns: frame_cpu_ns,
+                    kind: u8::from(scene_dirty) | (u8::from(full_rebuild) << 1)
+                        | (u8::from(cursor_changed) << 2) | patch_kind,
+                    upload_pixels: frame_cpu_ns.map_or(0, |_| damage_pixel_count(submit_damage)),
+                },
                 self.info.generation,
                 self.next_content_epoch,
                 surface_handle,

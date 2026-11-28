@@ -96,14 +96,25 @@ UI의 **cursor가 실제 변한 input drain**에서 시작해, 그 이후 최신
 보존한다. 중간 cursor 위치가 모두 화면에 표시됐다고 주장하지 않는다.
 
 측정값은 monotonic microseconds이며 consume→submit과 submit→observed-completion으로
-분해한다. completion polling 지연도 포함한다. slot/provider generation/content
- epoch는 실제 pending GPU frame에 붙이며 첫 frame의 동기 retirement 이전에
-등록한다. CPU ioctl 반환, submission, key echo, physical scanout/photon 시간과
+분해한다. v2는 프레임 간격과 제출 슬롯 확인을 통과한 **성공 시도**의 작업 시작,
+복사 시작, ioctl 시작도 기록한다. 소비→작업 시작에는 앞선 루프 작업과 대기가
+섞여 있고, 실패한 제출 시도의 비용도 이 앞 구간에 남는다. 작업 시작→제출의
+wall 구간에는 선점·호스트 지연 등이 남으므로, 별도로 같은 UI 스레드의
+`CLOCK_THREAD_CPUTIME_ID` 차이를 기록한다. 이는 UI 스레드에 청구된 CPU 시간만
+나타내며 GPU 실행이나 다른 스레드의 작업은 포함하지 않는다. CPU 시계 실패나
+역전·누락된 표본은 수집 실패다. `UI CPU 1ms target`은 반올림하지 않은 나노초로
+p99와 최대값을 검사하고 1 ms를 넘은 표본 수도 출력한다. 별도 p99/p50 품질표의
+`FAIL`과는 다른 기준이다. `k`의 비트 0–6은 dirty scene, rebuild, 포인터 텍스처,
+Wayland, 콘솔, dock, 시계 패치를 나타내며 `px`는 슬롯 재구성의 복사 픽셀 수다.
+completion polling 지연도 포함한다. slot/provider generation/content epoch는
+실제 pending GPU frame에 붙이며 첫 frame의 동기 retirement 이전에 등록한다. CPU ioctl 반환, submission, key echo, physical scanout/photon 시간과
 혼동하지 않는다. 취소·역전·중복 receipt, provider 변경, input drop/error,
 잘린/누락된 row·sentinel은 수집 실패다. 고정 배열에 기록하고 128개 completion
 후 동결한 뒤에만 이 벤치의 출력/포맷팅을 수행한다. 다른 서비스의 기존 로그
-간섭은 그대로 raw 지연에 포함된다. 별도 ipcbench CPUID anchor는 isolate settle
-후에 수집하므로 GUI 구간 전체의 host 안정성을 단독 증명하지 않는다.
+간섭은 그대로 raw 지연에 포함된다. 별도 ipcbench 하드웨어 기준은 CPUID
+50,000개와 ALU·atomic chain 각각 10,000개의 정확한 결과를 요구한다. 이 세
+프로브는 isolate settle 후에 수집하므로 GUI 구간 전체의 host 안정성을 단독
+증명하지 않는다.
 
 일반 `cargo xtask bench`에도 상태 회귀 rail이 항상 포함된다. 모든 checkpoint와 20,000개씩의 IPC split이
 존재해야 한다. null은 uaccess preflight의 fork/mmap/thread **이전**에 저장한

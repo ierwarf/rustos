@@ -32,10 +32,39 @@ pub(crate) struct Ticket {
     id: usize,
     warmup: bool,
     burst: Burst,
-    submitted: Instant,
+    work: SubmitWork,
     generation: u64,
     epoch: u64,
     surface: u32,
+}
+
+/// Clock boundaries of the accepted attempt after a slot was selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubmitWork {
+    pub(crate) start: Instant,
+    pub(crate) copy: Instant,
+    pub(crate) ioctl: Instant,
+    pub(crate) accepted: Instant,
+    pub(crate) cpu_ns: Option<u64>,
+    /// Dirty scene, rebuild, cursor, Wayland, console, dock and clock bits.
+    pub(crate) kind: u8,
+    pub(crate) upload_pixels: u64,
+}
+
+pub(crate) fn thread_cpu_ns() -> Option<u64> {
+    if !crate::acceptance_profile::input_completion_enabled() {
+        return None;
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: this read-only clock writes a live timespec on the stack.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    let ns = u64::try_from(ts.tv_nsec).ok()?;
+    if ns >= 1_000_000_000 {
+        return None;
+    }
+    u64::try_from(ts.tv_sec).ok()?.checked_mul(1_000_000_000)?.checked_add(ns)
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +129,7 @@ impl Collector {
 
     fn submit(
         &mut self,
-        now: Instant,
+        work: SubmitWork,
         generation: u64,
         epoch: u64,
         surface: u32,
@@ -109,7 +138,14 @@ impl Collector {
             return None;
         }
         let burst = self.pending.take()?;
-        if now < burst.last || generation == 0 || epoch == 0 {
+        if work.start < burst.last
+            || work.copy < work.start
+            || work.ioctl < work.copy
+            || work.accepted < work.ioctl
+            || work.cpu_ns.is_none()
+            || generation == 0
+            || epoch == 0
+        {
             self.failed += 1;
             return None;
         }
@@ -131,7 +167,7 @@ impl Collector {
             id,
             warmup,
             burst,
-            submitted: now,
+            work,
             generation,
             epoch,
             surface,
@@ -139,7 +175,7 @@ impl Collector {
     }
 
     fn complete(&mut self, ticket: Ticket, now: Instant) {
-        if now < ticket.submitted {
+        if now < ticket.work.accepted {
             self.failed += 1;
             return;
         }
@@ -189,7 +225,7 @@ pub(crate) fn input(now: Instant, events: u64, x: u32, y: u32) {
 }
 
 pub(crate) fn submitted(
-    accepted: Instant,
+    work: SubmitWork,
     generation: u64,
     epoch: u64,
     surface: u32,
@@ -200,7 +236,7 @@ pub(crate) fn submitted(
     COLLECTOR
         .lock()
         .unwrap()
-        .submit(accepted, generation, epoch, surface)
+        .submit(work, generation, epoch, surface)
 }
 
 pub(crate) fn completed(ticket: Option<Ticket>) {
@@ -249,15 +285,18 @@ pub(crate) fn maybe_emit() {
         return;
     }
     let origin = origin.expect("completed input frames have an origin");
-    crate::sys::debug_line("uiserver: input-completion BEGIN v=1 samples=128 warmup=16 endpoint=consume-to-observed-dvm-completion");
+    crate::sys::debug_line("uiserver: input-completion BEGIN v=2 samples=128 warmup=16 endpoint=consume-to-observed-dvm-completion");
     for entry in entries.into_iter().flatten() {
         let t = entry.ticket;
         let micros = |stamp: Instant| stamp.duration_since(origin).as_micros();
         crate::sys::debug_line(&format!(
-            "uiserver: input-completion sample id={} first={} last={} submit={} done={} gen={} epoch={} surface={} drains={} events={} x={} y={}",
-            t.id, micros(t.burst.first), micros(t.burst.last), micros(t.submitted),
+            "uiserver: input-completion sample id={} first={} last={} submit={} done={} gen={} epoch={} surface={} drains={} events={} x={} y={} start={} copy={} ioctl={} cpu_ns={} k={} px={}",
+            t.id, micros(t.burst.first), micros(t.burst.last), micros(t.work.accepted),
             micros(entry.completed), t.generation, t.epoch, t.surface,
             t.burst.drains, t.burst.events, t.burst.x, t.burst.y,
+            micros(t.work.start), micros(t.work.copy), micros(t.work.ioctl),
+            t.work.cpu_ns.expect("only valid CPU stamps are exported"), t.work.kind,
+            t.work.upload_pixels,
         ));
     }
     crate::sys::debug_line("uiserver: input-completion END samples=128 failed=0");
@@ -272,11 +311,16 @@ mod tests {
         now + Duration::from_micros(us)
     }
 
+    fn stamps(now: Instant) -> SubmitWork {
+        SubmitWork { start: now, copy: now, ioctl: now, accepted: now, cpu_ns: Some(0),
+            kind: 0, upload_pixels: 0 }
+    }
+
     fn warmed(now: Instant) -> Collector {
         let mut collector = Collector::new();
         for _ in 0..WARMUP {
             collector.input(now, 1, 2, 3);
-            let ticket = collector.submit(now, 1, 1, 7).unwrap();
+            let ticket = collector.submit(stamps(now), 1, 1, 7).unwrap();
             collector.complete(ticket, now);
         }
         collector
@@ -288,7 +332,7 @@ mod tests {
         let mut collector = warmed(now);
         collector.input(now, 2, 10, 20);
         collector.input(advance(now, 10), 3, 30, 40);
-        let ticket = collector.submit(advance(now, 20), 2, 5, 9).unwrap();
+        let ticket = collector.submit(stamps(advance(now, 20)), 2, 5, 9).unwrap();
         assert_eq!(ticket.burst.first, now);
         assert_eq!((ticket.burst.events, ticket.burst.drains), (5, 2));
         assert_eq!((ticket.burst.x, ticket.burst.y), (30, 40));
@@ -303,24 +347,24 @@ mod tests {
         let mut collector = Collector::new();
         for _ in 0..WARMUP {
             collector.input(now, 1, 2, 3);
-            let ticket = collector.submit(now, 1, 1, 7).unwrap();
+            let ticket = collector.submit(stamps(now), 1, 1, 7).unwrap();
             assert!(ticket.warmup);
         }
         collector.input(now, 1, 2, 3);
-        assert!(collector.submit(now, 1, 1, 7).is_none());
+        assert!(collector.submit(stamps(now), 1, 1, 7).is_none());
         assert_eq!(collector.issued, 0);
         // An initial blocking GPU retirement may complete before present returns.
         let mut collector = warmed(now);
         for id in 0..SAMPLES {
             collector.input(now, 1, 2, 3);
-            let ticket = collector.submit(now, 1, id as u64 + 1, 7).unwrap();
+            let ticket = collector.submit(stamps(now), 1, id as u64 + 1, 7).unwrap();
             assert_eq!(ticket.id, id);
             assert_eq!(collector.completed, id);
             collector.complete(ticket, now);
         }
         assert!(collector.ready());
         collector.input(now, 1, 2, 3);
-        assert!(collector.submit(now, 1, 999, 7).is_none());
+        assert!(collector.submit(stamps(now), 1, 999, 7).is_none());
         assert_eq!(collector.completed, SAMPLES);
     }
 
@@ -331,7 +375,7 @@ mod tests {
         let mut pending = None;
         for _ in 0..SAMPLES {
             collector.input(now, 1, 2, 3);
-            let ticket = collector.submit(now, 1, 1, 7).unwrap();
+            let ticket = collector.submit(stamps(now), 1, 1, 7).unwrap();
             if ticket.id == SAMPLES - 1 {
                 pending = Some(ticket);
             } else {
@@ -359,7 +403,7 @@ mod tests {
         assert_eq!(collector.issued, 0);
         collector.provider_lost();
         collector.input(now, 1, 2, 3);
-        assert!(collector.submit(now, 2, 1, 7).is_none());
+        assert!(collector.submit(stamps(now), 2, 1, 7).is_none());
         assert_eq!(collector.failed, 1);
         assert!(collector.ready()); // Emit FAIL, never 128 fresh-provider rows.
     }
@@ -369,12 +413,12 @@ mod tests {
         let now = Instant::now();
         let mut collector = warmed(now);
         collector.input(now, 1, 2, 3);
-        let ticket = collector.submit(advance(now, 1), 1, 1, 7).unwrap();
+        let ticket = collector.submit(stamps(advance(now, 1)), 1, 1, 7).unwrap();
         collector.complete(ticket, now);
         assert_eq!(collector.failed, 1);
         let mut collector = warmed(now);
         collector.input(now, 1, 2, 3);
-        let ticket = collector.submit(now, 1, 1, 7).unwrap();
+        let ticket = collector.submit(stamps(now), 1, 1, 7).unwrap();
         collector.complete(ticket, now);
         collector.complete(ticket, now);
         assert_eq!(collector.failed, 1);

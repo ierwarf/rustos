@@ -451,6 +451,46 @@ pub(super) fn blit_damage(
     true
 }
 
+/// Patch the physical image of an integer nearest-neighbor upscale in place.
+/// Returns physical damage, or `None` without touching pixels on a mismatch.
+pub(super) fn blit_repeated_damage(
+    dst: &mut Arc<Vec<u32>>,
+    width: usize,
+    height: usize,
+    damage: Rect,
+    rows: &[u32],
+    repeat: usize,
+) -> Option<Rect> {
+    let physical = Rect {
+        x: damage.x.checked_mul(repeat)?,
+        y: damage.y.checked_mul(repeat)?,
+        width: damage.width.checked_mul(repeat)?,
+        height: damage.height.checked_mul(repeat)?,
+    };
+    if repeat < 2
+        || width.checked_mul(height)? != dst.len()
+        || physical.x.checked_add(physical.width)? > width
+        || physical.y.checked_add(physical.height)? > height
+        || damage.width.checked_mul(damage.height)? != rows.len()
+    {
+        return None;
+    }
+    if damage.is_empty() {
+        return Some(physical);
+    }
+    let dst = Arc::make_mut(dst);
+    for (y, row) in rows.chunks_exact(damage.width).enumerate() {
+        let start = (physical.y + y * repeat) * width + physical.x;
+        for (chunk, &pixel) in dst[start..start + physical.width].chunks_exact_mut(repeat).zip(row) {
+            chunk.fill(pixel);
+        }
+        for dy in 1..repeat {
+            dst.copy_within(start..start + physical.width, start + dy * width);
+        }
+    }
+    Some(physical)
+}
+
 pub(super) struct Completion {
     pub(super) id: JobId,
     pub(super) result: io::Result<SnapshotPixels>,

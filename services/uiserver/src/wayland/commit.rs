@@ -9,8 +9,8 @@
 //! Mutter a transaction: a commit becomes visible only once its content
 //! dependency is satisfied. Nothing in this file waits on a client fd.
 
-use super::snapshot::{blit_damage, Completion, JobId, Refused};
-use super::viewport::{is_identity_output_mapping, map_buffer_for_output, ViewportError};
+use super::snapshot::{blit_damage, blit_repeated_damage, Completion, JobId, Refused};
+use super::viewport::{damage_repeat, map_buffer_for_output, ViewportError};
 use super::*;
 
 /// The state a `wl_surface.commit` carries, captured at request time.
@@ -29,8 +29,6 @@ pub(super) struct InFlightCommit {
     resource: wl_surface::WlSurface,
     source: BufferData,
     release: Option<wl_buffer::WlBuffer>,
-    damage: Rect,
-    has_damage: bool,
     started: Instant,
 }
 
@@ -96,7 +94,6 @@ struct Outcome {
     mapped: bool,
     dirty: bool,
     trigger_initial_configure: bool,
-    has_damage: bool,
     release: Option<wl_buffer::WlBuffer>,
 }
 
@@ -246,7 +243,6 @@ impl WaylandState {
                 (viewport_changed, icon_offset_changed, decoration_changed)
             });
         let mut outcome = Outcome {
-            has_damage,
             dirty: decoration_changed || icon_offset_changed,
             ..Outcome::default()
         };
@@ -337,7 +333,6 @@ impl WaylandState {
                     );
                     if can_retain {
                         surface.current_buffer = Some(source.clone());
-                        surface.last_damage = Rect::empty();
                         outcome.mapped = true;
                     }
                     can_retain
@@ -353,7 +348,7 @@ impl WaylandState {
                 ) {
                     Planned::Done => {}
                     Planned::InFlight(spec) => {
-                        self.submit_commit(resource, shared, source, spec, damage, outcome);
+                        self.submit_commit(resource, shared, source, spec, outcome);
                         return;
                     }
                     Planned::Abort => return,
@@ -377,7 +372,6 @@ impl WaylandState {
     ) -> Planned {
         if let Some(pixel) = source.shared.solid_pixel {
             let mut present_outcome = Outcome {
-                has_damage: true,
                 release: outcome.release.take(),
                 mapped: false,
                 dirty: true,
@@ -406,37 +400,31 @@ impl WaylandState {
             self.record_buffer_copy(Duration::ZERO, 4);
             return Planned::Done;
         }
-        let output_scale = self.output_scale.max(1) as usize;
-        let identity_mapping = shared.lock().is_ok_and(|surface| {
-            is_identity_output_mapping(
+        let patch_plan = has_damage.then(|| {
+            let surface = shared.lock().ok()?;
+            damage_repeat(
                 source.shared.width,
                 source.shared.height,
                 surface.buffer_mapping,
                 &surface.viewport,
-                output_scale,
-            )
-        });
-        // `damage` is in buffer coordinates; when the mapping resolves to a
-        // 1:1 physical identity (including HiDPI `wp_viewport` destinations
-        // whose physical size matches the buffer), buffer coordinates map 1:1
-        // to retained physical pixels and partial blits are exact. Under any
-        // transform, crop, or scale mismatch, read full.
-        if has_damage && identity_mapping {
-            let (width, height, stride, len) = shared.lock().map_or((0, 0, 0, 0), |surface| {
-                (
-                    surface.width,
-                    surface.height,
-                    surface.stride_pixels,
-                    surface.pixels.len(),
-                )
-            });
-            match source.plan_damage(width, height, stride, len, damage) {
+                self.output_scale.max(1) as usize,
+            )?;
+            // Work in buffer coordinates. The retained original is always
+            // packed, even when the physical display image is an upscale.
+            Some(source.plan_damage(
+                surface.original_width,
+                surface.original_height,
+                surface.original_width,
+                surface.original_pixels.len(),
+                damage,
+            ))
+        }).flatten();
+        if let Some(plan) = patch_plan {
+            match plan {
                 DamagePlan::Read(spec) => return Planned::InFlight(spec),
                 DamagePlan::Empty => {
                     if let Ok(mut surface) = shared.lock() {
                         surface.current_buffer = Some(source.clone());
-                        surface.last_damage = damage;
-                        surface.content_version = next_content_version(surface.content_version);
                         if surface.width != 0 && surface.height != 0 {
                             let (w, h) = (surface.width, surface.height);
                             Self::apply_committed_buffer_frame(
@@ -486,7 +474,6 @@ impl WaylandState {
         shared: &Arc<Mutex<WaylandSurfaceState>>,
         source: BufferData,
         spec: SnapshotSpec,
-        damage: Rect,
         outcome: Outcome,
     ) {
         let Some(client) = shared
@@ -504,8 +491,6 @@ impl WaylandState {
                         resource: resource.clone(),
                         source,
                         release: outcome.release,
-                        damage,
-                        has_damage: outcome.has_damage,
                         started: Instant::now(),
                     });
                 }
@@ -531,46 +516,17 @@ impl WaylandState {
             return;
         };
         let mut outcome = Outcome {
-            has_damage: flight.has_damage,
             release: flight.release,
             ..Outcome::default()
         };
         match completion.result {
             Ok(SnapshotPixels::Damage { damage, rows }) => {
-                let applied = shared.lock().is_ok_and(|mut surface| {
-                    let (width, height) = (surface.width, surface.height);
-                    // Drop any shared Arc clone on `original_pixels` before
-                    // `blit_damage` so `Arc::make_mut` updates `pixels` in place.
-                    if Arc::ptr_eq(&surface.pixels, &surface.original_pixels) {
-                        surface.original_pixels = Arc::default();
-                    }
-                    if !blit_damage(&mut surface.pixels, width, height, damage, &rows) {
-                        return false;
-                    }
-                    surface.original_pixels = surface.pixels.clone();
-                    surface.original_width = width;
-                    surface.original_height = height;
-                    surface.current_buffer = Some(flight.source.clone());
-                    surface.last_damage = flight.damage;
-                    surface.content_version = next_content_version(surface.content_version);
-                    outcome.mapped = true;
-                    outcome.dirty = true;
-                    outcome.trigger_initial_configure = initial_configure_due(&surface, true);
-                    true
-                });
-                if !applied {
-                    flight.resource.post_error(
-                        wl_shm::Error::InvalidFd,
-                        "wl_surface.commit: damage no longer fits the committed surface"
-                            .to_string(),
-                    );
+                if !self.apply_damage_snapshot(
+                    &flight.resource, &shared, &flight.source, damage, &rows, &mut outcome,
+                ) {
                     return;
                 }
-                let bytes = flight
-                    .damage
-                    .width
-                    .saturating_mul(flight.damage.height)
-                    .saturating_mul(std::mem::size_of::<u32>());
+                let bytes = std::mem::size_of_val(rows.as_slice());
                 super::dmabuf::note_snapshot(&flight.source, bytes);
                 // Include the UI-side application of the completed read;
                 // measuring before blit hid copy-on-write and patch costs.
@@ -610,6 +566,74 @@ impl WaylandState {
         }
         self.finish_commit(&shared, outcome);
         self.start_queued_commit(&flight.resource, &shared);
+    }
+
+    fn apply_damage_snapshot(
+        &mut self,
+        resource: &wl_surface::WlSurface,
+        shared: &Arc<Mutex<WaylandSurfaceState>>,
+        source: &BufferData,
+        damage: Rect,
+        rows: &[u32],
+        outcome: &mut Outcome,
+    ) -> bool {
+        let Ok(mut surface) = shared.lock() else {
+            return false;
+        };
+        let (width, height) = (surface.original_width, surface.original_height);
+        let (physical_width, physical_height) = (surface.width, surface.height);
+        let repeat = damage_repeat(
+            width, height, surface.buffer_mapping, &surface.viewport,
+            self.output_scale.max(1) as usize,
+        );
+        let aliased = Arc::ptr_eq(&surface.pixels, &surface.original_pixels);
+        // Release the second Arc before patching the same allocation.
+        if aliased {
+            surface.pixels = Arc::default();
+        }
+        if !blit_damage(&mut surface.original_pixels, width, height, damage, rows) {
+            if aliased {
+                surface.pixels = surface.original_pixels.clone();
+            }
+            resource.post_error(
+                wl_shm::Error::InvalidFd,
+                "wl_surface.commit: damage no longer fits the committed surface".to_string(),
+            );
+            return false;
+        }
+        let physical_damage = match repeat {
+            Some(1) if (physical_width, physical_height) == (width, height) => {
+                surface.pixels = surface.original_pixels.clone();
+                Some(damage)
+            }
+            Some(repeat) if width.checked_mul(repeat) == Some(physical_width)
+                && height.checked_mul(repeat) == Some(physical_height) => {
+                blit_repeated_damage(&mut surface.pixels, physical_width, physical_height,
+                    damage, rows, repeat)
+            }
+            _ => None,
+        };
+        if let Some(physical_damage) = physical_damage {
+            surface.current_buffer = Some(source.clone());
+            surface.last_damage = surface.last_damage.union(physical_damage);
+            surface.content_version = next_content_version(surface.content_version);
+            outcome.mapped = true;
+            outcome.dirty = true;
+            outcome.trigger_initial_configure = initial_configure_due(&surface, true);
+            return true;
+        }
+
+        // The output scale can change while the worker is reading. Rebase
+        // from the patched original if the new mapping cannot take a patch.
+        let original = surface.original_pixels.clone();
+        drop(surface);
+        if !self.present_original(resource, shared, original, width, height, outcome) {
+            return false;
+        }
+        if let Ok(mut surface) = shared.lock() {
+            surface.current_buffer = Some(source.clone());
+        }
+        true
     }
 
     fn present_original(
@@ -796,7 +820,7 @@ impl WaylandState {
             }
         }
         let released_fallback = outcome.release.take();
-        if released_fallback.is_some() || !outcome.mapped || !outcome.dirty {
+        if released_fallback.is_some() || !outcome.mapped {
             if let Ok(mut surface) = shared.lock() {
                 if let Some(buffer) = released_fallback {
                     surface.pending_buffer_releases.push(buffer);
@@ -807,9 +831,6 @@ impl WaylandState {
                     && surface.height != 0
                 {
                     outcome.mapped = true;
-                }
-                if !outcome.dirty {
-                    surface.last_damage = Rect::empty();
                 }
             } else if let Some(buffer) = released_fallback {
                 buffer.release();

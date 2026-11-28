@@ -132,13 +132,24 @@
   damage: unchanged pixels are identical and remain outside the compositor
   copy. Semantic changes to the target, score, layout, or initial buffer still
   force full damage. A profile-only callback commit with no content change
-  carries no fabricated damage.
+  carries no fabricated damage. Undelivered physical damage accumulates until
+  the compositor consumes it; an undamaged attach or callback cannot clear it.
+  An unchanged mapping with a whole-number nearest-neighbor upscale patches both
+  the retained original and its physical image from the same clipped SHM read.
+  Mapping changes and unsupported transforms/crops still use a full snapshot.
 - Retained GPU console layers are versioned independently from scene topology.
   Any nonempty content damage, including a default update extended by console
   refresh, marks the retained scene dirty. Terminal output refreshes only that
   layer's atlas rectangle without requiring window motion; it must not change
-  the structural scene signature and trigger a 2048x2048 rebuild. Cursor-only
-  damage preserves the texture-reuse fast path until content damage is added.
+  the structural scene signature and trigger an atlas rebuild. A terminal
+  caret-only update patches the cell if the atlas has the exact preceding
+  console version, otherwise it refreshes the layer. Pointer-only changes
+  preserve texture reuse; a new cursor raster uploads the union of its old
+  and new alpha support so vacated pixels become transparent in every slot.
+- A clock tick advances desktop pixel content but not the full chrome version.
+  In a retained GPU scene, repaint the clock block and patch only its visible
+  desktop fragments, without touching padding or the disjoint dock backdrop.
+  Chrome, geometry and other structural changes still use the rebuild path.
 - Window position is command metadata, not atlas topology. A drag updates the
   exact capability-bound texture layer's destination rectangle without
   allocating, rasterizing, comparing, or copying the 2048x2048 atlas. Identity,

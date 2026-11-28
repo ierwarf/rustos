@@ -661,6 +661,37 @@ fn cropped_console_binding_skips_unchanged_and_patches_incremental_updates() {
             &expected[source_start..source_start + frag_src.width],
         );
     }
+    // The visible fragment ends mid-patch. Only its intersection should be
+    // uploaded, while a consumer which misses a version needs the full fragment.
+    let before = atlas_pixels.clone();
+    let cursor = rect(118, 84, 8, 9);
+    let cache = &mut windows[0].surface_cache;
+    for y in cursor.y..cursor.y + cursor.height {
+        let start = y * cache.width + cursor.x;
+        cache.pixels[start..start + cursor.width].fill(0xffce_ab89);
+    }
+    cache.record_damage(Some(cursor));
+    let updated = super::super::update_cropped_console_windows_textures(
+        &mut windows, 0, Some(1), &mut atlas_pixels, stride, &mut bindings,
+    ).unwrap().unwrap();
+    assert_eq!(updated, vec![rect(128, 94, 2, 9)]);
+    let mut expected = windows[0].surface_cache.pixels.clone();
+    chrome::apply_window_texture_alpha(&mut expected, outer.width, outer.width, outer.height, false);
+    for (index, pixel) in atlas_pixels.iter().enumerate() {
+        let (x, y) = (index % stride, index / stride);
+        let expected = if (128..130).contains(&x) && (94..103).contains(&y) {
+            expected[(y - frag_dst.y) * outer.width + x - frag_dst.x]
+        } else {
+            before[index]
+        };
+        assert_eq!(*pixel, expected);
+    }
+    let cache = &mut windows[0].surface_cache;
+    cache.record_damage(Some(cursor));
+    cache.record_damage(Some(rect(15, 93, 8, 9)));
+    assert_eq!(super::super::update_cropped_console_windows_textures(
+        &mut windows, 0, Some(1), &mut atlas_pixels, stride, &mut bindings,
+    ).unwrap().unwrap(), vec![frag_dst]);
 }
 
 #[test]

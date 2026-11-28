@@ -595,13 +595,24 @@ fn cursor_motion_rotation(motion: CursorMotion) -> (i32, i32) {
     )
 }
 
-/// The most recent cursor raster. The texture is a pure function of the sprite
-/// index and the quantized rotation, and the cursor is stationary or moving in
-/// a steady direction for most frames, so repeating the 47k-sample bilinear
-/// pass every scene build is wasted work.
 type CursorRasterKey = (usize, i32, i32);
-static CURSOR_RASTER_CACHE: std::sync::Mutex<Option<(CursorRasterKey, Vec<u32>)>> =
+const CURSOR_CACHE_ENTRIES: usize = 8;
+const CURSOR_RASTER_PIXELS: usize = CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE;
+
+struct CursorRasterCache {
+    keys: [Option<CursorRasterKey>; CURSOR_CACHE_ENTRIES],
+    next: usize,
+    pixels: Vec<u32>,
+}
+
+static CURSOR_RASTER_CACHE: std::sync::Mutex<Option<CursorRasterCache>> =
     std::sync::Mutex::new(None);
+
+pub(crate) fn cursor_raster_key(motion: CursorMotion) -> CursorRasterKey {
+    let index = motion.sprite_index.min(CURSOR_SPRITE_MAX_DISTANCE) as usize;
+    let (cos, sin) = cursor_motion_rotation(motion);
+    (index, cos, sin)
+}
 
 #[cfg(test)]
 pub(crate) fn render_cursor_bgra(pixels: &mut [u32], motion: CursorMotion) -> bool {
@@ -631,38 +642,38 @@ pub(crate) fn render_cursor_bgra_strided(
     if pixels.len() < required {
         return false;
     }
-    let sprite_index = (motion.sprite_index as usize).min(CURSOR_SPRITE_MAX_DISTANCE as usize);
-    let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
-    let key = (sprite_index, cos_fp, sin_fp);
-    if let Ok(mut cache) = CURSOR_RASTER_CACHE.lock() {
-        let (cached_key, cached) = cache.get_or_insert_with(|| {
-            (
-                (usize::MAX, 0, 0),
-                vec![0; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE],
-            )
+    let key = cursor_raster_key(motion);
+    // A concurrent scene builder must not park the presentation owner on a
+    // cache lock. An exact bounded raster is safe even without a cache hit.
+    if let Ok(mut cache) = CURSOR_RASTER_CACHE.try_lock() {
+        let cache = cache.get_or_insert_with(|| CursorRasterCache {
+            keys: [None; CURSOR_CACHE_ENTRIES],
+            next: 0,
+            pixels: vec![0; CURSOR_CACHE_ENTRIES * CURSOR_RASTER_PIXELS],
         });
-        if *cached_key != key {
-            *cached_key = (usize::MAX, 0, 0);
+        let hit = cache.keys.iter().position(|&k| k == Some(key));
+        let slot = hit.unwrap_or(cache.next);
+        let from = slot * CURSOR_RASTER_PIXELS;
+        let cached = &mut cache.pixels[from..from + CURSOR_RASTER_PIXELS];
+        if hit.is_none() {
+            cache.keys[slot] = None;
             if !rasterize_cursor_bgra(cached, CURSOR_TEXTURE_SIZE, motion) {
                 return false;
             }
-            *cached_key = key;
+            cache.keys[slot] = Some(key);
+            cache.next = (slot + 1) % CURSOR_CACHE_ENTRIES;
         }
         if stride_pixels == CURSOR_TEXTURE_SIZE {
             simd::copy_u32s(cached, &mut pixels[..required]);
         } else {
-            for row in 0..CURSOR_TEXTURE_SIZE {
-                let src = row * CURSOR_TEXTURE_SIZE;
-                let dst = row * stride_pixels;
-                simd::copy_u32s(
-                    &cached[src..src + CURSOR_TEXTURE_SIZE],
-                    &mut pixels[dst..dst + CURSOR_TEXTURE_SIZE],
-                );
+            for (src, dst) in cached.chunks_exact(CURSOR_TEXTURE_SIZE)
+                .zip(pixels.chunks_mut(stride_pixels))
+            {
+                simd::copy_u32s(src, &mut dst[..CURSOR_TEXTURE_SIZE]);
             }
         }
         return true;
     }
-    // Preserve the uncached rendering path if another caller poisoned the cache.
     rasterize_cursor_bgra(pixels, stride_pixels, motion)
 }
 
@@ -684,6 +695,85 @@ fn rasterize_cursor_bgra(
     })
 }
 
+const CURSOR_SOURCE_STEP: i32 =
+    CURSOR_ROTATION_FP * CURSOR_SCALE_NUM / (CURSOR_SCALE_DEN * CURSOR_SUBPIXEL_FP);
+const CURSOR_SOURCE_HOTSPOT: i32 = (CURSOR_SPRITE_SIZE / 2) as i32 * CURSOR_SUBPIXEL_FP;
+const _: () = assert!(CURSOR_ROTATION_FP * CURSOR_SCALE_NUM
+    == CURSOR_SOURCE_STEP * CURSOR_SCALE_DEN * CURSOR_SUBPIXEL_FP);
+
+/// All texels that can contribute to the bilinear sample, including one tap
+/// of transparent margin. Derive from the bundled bytes once, not from an
+/// assumption about the shape of future sprite assets.
+fn cursor_source_support() -> [i32; 4] {
+    static SUPPORT: OnceLock<[i32; 4]> = OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        let size = CURSOR_SPRITE_SIZE as i32;
+        let mut left = size;
+        let mut top = size;
+        let mut right = 0;
+        let mut bottom = 0;
+        for (i, alpha) in CURSOR_SPRITE_ALPHA.chunks_exact(CURSOR_SPRITE_CHANNELS).enumerate() {
+            if alpha[0] != 0 || alpha[1] != 0 {
+                let i = (i % (CURSOR_SPRITE_SIZE * CURSOR_SPRITE_SIZE)) as i32;
+                let x = i % size;
+                let y = i / size;
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x);
+                bottom = bottom.max(y);
+            }
+        }
+        // Convert to the unrounded rotated domain. Rounding towards the
+        // nearest source subpixel can shift each edge by at most half a step.
+        let lower = |p| ((p - 1) * CURSOR_SUBPIXEL_FP - CURSOR_SOURCE_HOTSPOT)
+            * CURSOR_SOURCE_STEP - CURSOR_SOURCE_STEP / 2;
+        let upper = |p| (((p + 1) * CURSOR_SUBPIXEL_FP - 1) - CURSOR_SOURCE_HOTSPOT)
+            * CURSOR_SOURCE_STEP + CURSOR_SOURCE_STEP / 2;
+        [lower(left), lower(top), upper(right), upper(bottom)]
+    })
+}
+
+/// Intersect an inclusive integer interval with `min <= a*x + b <= max`.
+fn clip_cursor_axis(lo: &mut i32, hi: &mut i32, a: i32, b: i32, min: i32, max: i32) {
+    let (a, min, max) = if a < 0 { (-a, b - max, b - min) } else { (a, min - b, max - b) };
+    if a == 0 {
+        if min > 0 || max < 0 {
+            *hi = *lo - 1;
+        }
+    } else {
+        *lo = (*lo).max(-(-min).div_euclid(a));
+        *hi = (*hi).min(max.div_euclid(a));
+    }
+}
+
+/// Conservative projected support in texture coordinates. The determinant
+/// is positive even for non-unit rotations from integer normalization.
+pub(crate) fn cursor_raster_bounds(motion: CursorMotion) -> Rect {
+    let (_, cos, sin) = cursor_raster_key(motion);
+    let [left, top, right, bottom] = cursor_source_support();
+    let det = cos * cos + sin * sin;
+    let r = CURSOR_VISUAL_RADIUS as i32;
+    let mut x0 = r;
+    let mut y0 = r;
+    let mut x1 = -r;
+    let mut y1 = -r;
+    for x in [left, right] {
+        for y in [top, bottom] {
+            let xx = x * cos - y * sin;
+            let yy = x * sin + y * cos;
+            x0 = x0.min(xx.div_euclid(det));
+            y0 = y0.min(yy.div_euclid(det));
+            x1 = x1.max(-(-xx).div_euclid(det));
+            y1 = y1.max(-(-yy).div_euclid(det));
+        }
+    }
+    let x0 = x0.clamp(-r, r);
+    let y0 = y0.clamp(-r, r);
+    Rect { x: (x0 + r) as usize, y: (y0 + r) as usize,
+        width: (x1.clamp(-r, r) - x0 + 1) as usize,
+        height: (y1.clamp(-r, r) - y0 + 1) as usize }
+}
+
 fn for_each_cursor_pixel(
     motion: CursorMotion,
     mut emit: impl FnMut(i32, i32, u8, u8),
@@ -698,28 +788,29 @@ fn for_each_cursor_pixel(
     else {
         return false;
     };
-    let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
+    let (cos, sin) = cursor_motion_rotation(motion);
     let radius = CURSOR_VISUAL_RADIUS as i32;
-    let hotspot_fp = ((CURSOR_SPRITE_SIZE / 2) as i32).saturating_mul(CURSOR_SUBPIXEL_FP);
-    let divisor = CURSOR_ROTATION_FP.saturating_mul(CURSOR_SCALE_NUM);
-    let factor = CURSOR_SCALE_DEN.saturating_mul(CURSOR_SUBPIXEL_FP);
-    for local_y in -radius..=radius {
-        let mut rot_x = (-radius)
-            .saturating_mul(cos_fp)
-            .saturating_add(local_y.saturating_mul(sin_fp));
-        let mut rot_y = local_y
-            .saturating_mul(cos_fp)
-            .saturating_sub((-radius).saturating_mul(sin_fp));
-        for local_x in -radius..=radius {
-            let sx_fp = div_round(rot_x.saturating_mul(factor), divisor).saturating_add(hotspot_fp);
-            let sy_fp = div_round(rot_y.saturating_mul(factor), divisor).saturating_add(hotspot_fp);
-            let (blue_alpha, white_alpha) =
-                sample_cursor_alpha_bilinear(sprite_alpha, sx_fp, sy_fp);
-            if blue_alpha != 0 || white_alpha != 0 {
-                emit(local_x, local_y, blue_alpha, white_alpha);
+    let [left, top, right, bottom] = cursor_source_support();
+    let bounds = cursor_raster_bounds(motion);
+    for local_y in bounds.y as i32 - radius..(bounds.y + bounds.height) as i32 - radius {
+        let mut lo = -radius;
+        let mut hi = radius;
+        // |cos| and |sin| are at most 1024, and local coordinates at most 108.
+        let x_offset = local_y * sin;
+        let y_offset = local_y * cos;
+        clip_cursor_axis(&mut lo, &mut hi, cos, x_offset, left, right);
+        clip_cursor_axis(&mut lo, &mut hi, -sin, y_offset, top, bottom);
+        let mut rot_x = lo * cos + x_offset;
+        let mut rot_y = y_offset - lo * sin;
+        for local_x in lo..=hi {
+            let sx = div_round(rot_x, CURSOR_SOURCE_STEP) + CURSOR_SOURCE_HOTSPOT;
+            let sy = div_round(rot_y, CURSOR_SOURCE_STEP) + CURSOR_SOURCE_HOTSPOT;
+            let (blue, white) = sample_cursor_alpha_bilinear(sprite_alpha, sx, sy);
+            if blue != 0 || white != 0 {
+                emit(local_x, local_y, blue, white);
             }
-            rot_x = rot_x.saturating_add(cos_fp);
-            rot_y = rot_y.saturating_sub(sin_fp);
+            rot_x += cos;
+            rot_y -= sin;
         }
     }
     true
@@ -737,14 +828,28 @@ fn sample_cursor_alpha_bilinear(sprite_alpha: &[u8], sx_fp: i32, sy_fp: i32) -> 
     }
     let fx = sx_fp.rem_euclid(CURSOR_SUBPIXEL_FP);
     let fy = sy_fp.rem_euclid(CURSOR_SUBPIXEL_FP);
+    // Most contributing samples have all four taps in-bounds. Interleave
+    // the two channels without four coordinate tests or dynamic weights.
+    if (x0 as usize) < CURSOR_SPRITE_SIZE - 1 && (y0 as usize) < CURSOR_SPRITE_SIZE - 1 {
+        let stride = CURSOR_SPRITE_SIZE * CURSOR_SPRITE_CHANNELS;
+        let index = y0 as usize * stride + x0 as usize * CURSOR_SPRITE_CHANNELS;
+        let top = &sprite_alpha[index..index + 4];
+        let bottom = &sprite_alpha[index + stride..index + stride + 4];
+        let lerp = |a: u8, b: u8| i32::from(a) * CURSOR_SUBPIXEL_FP + (i32::from(b) - i32::from(a)) * fx;
+        let channel = |i| {
+            let a = lerp(top[i], top[i + 2]);
+            let b = lerp(bottom[i], bottom[i + 2]);
+            ((a * CURSOR_SUBPIXEL_FP + (b - a) * fy + 32768) >> 16) as u8
+        };
+        return (channel(0), channel(1));
+    }
+    sample_cursor_edge(sprite_alpha, x0, y0, fx, fy)
+}
+
+fn sample_cursor_edge(sprite_alpha: &[u8], x0: i32, y0: i32, fx: i32, fy: i32) -> (u8, u8) {
     let wx0 = CURSOR_SUBPIXEL_FP - fx;
     let wy0 = CURSOR_SUBPIXEL_FP - fy;
-    let weights = [
-        wx0.saturating_mul(wy0),
-        fx.saturating_mul(wy0),
-        wx0.saturating_mul(fy),
-        fx.saturating_mul(fy),
-    ];
+    let weights = [wx0 * wy0, fx * wy0, wx0 * fy, fx * fy];
     let coords = [(x0, y0), (x0 + 1, y0), (x0, y0 + 1), (x0 + 1, y0 + 1)];
     let mut blue_acc = 0_i32;
     let mut white_acc = 0_i32;
@@ -968,6 +1073,45 @@ fn sanitized_surface_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_cursor_matches_full_exact_bilinear_raster() {
+        let mut clipped = vec![(0, 0); CURSOR_RASTER_PIXELS];
+        let r = CURSOR_VISUAL_RADIUS as i32;
+        let area = CURSOR_SPRITE_SIZE * CURSOR_SPRITE_SIZE * CURSOR_SPRITE_CHANNELS;
+        for index in [0, 1, 6, 31, 60, 255_u8] {
+            let i = index.min(CURSOR_SPRITE_MAX_DISTANCE) as usize;
+            let sprite = &CURSOR_SPRITE_ALPHA[i * area..(i + 1) * area];
+            for (dx, dy) in [(0, 0), (3, 0), (-4, 0), (0, -5), (0, 2), (1, 1),
+                (-2, 1), (9, -4), (-11, -13), (i32::MIN, i32::MAX)] {
+                let motion = CursorMotion { dx, dy, sprite_index: index };
+                let (cos, sin) = cursor_motion_rotation(motion);
+                let bound = cursor_raster_bounds(motion);
+                clipped.fill((0, 0));
+                assert!(for_each_cursor_pixel(motion, |x, y, b, w| {
+                    assert!(bound.contains((x + r) as u32, (y + r) as u32));
+                    clipped[(y + r) as usize * CURSOR_TEXTURE_SIZE + (x + r) as usize] = (b, w);
+                }));
+                for y in -r..=r {
+                    for x in -r..=r {
+                        let point = |rot: i32| {
+                            div_round(rot * CURSOR_SCALE_DEN * CURSOR_SUBPIXEL_FP,
+                                CURSOR_ROTATION_FP * CURSOR_SCALE_NUM) + CURSOR_SOURCE_HOTSPOT
+                        };
+                        let sx = point(x * cos + y * sin);
+                        let sy = point(y * cos - x * sin);
+                        let (x0, fx) = (sx.div_euclid(256), sx.rem_euclid(256));
+                        let (y0, fy) = (sy.div_euclid(256), sy.rem_euclid(256));
+                        let expected = if (-1..100).contains(&x0) && (-1..100).contains(&y0) {
+                            sample_cursor_edge(sprite, x0, y0, fx, fy)
+                        } else { (0, 0) };
+                        assert_eq!(clipped[(y + r) as usize * CURSOR_TEXTURE_SIZE + (x + r) as usize], expected,
+                            "{motion:?} at ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn strided_cursor_matches_packed_pixels_without_touching_padding() {

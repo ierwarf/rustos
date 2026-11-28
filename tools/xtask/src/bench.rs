@@ -53,7 +53,7 @@ const TSC_PREFIX: &str = "ipcbench: tsc_khz=";
 /// fewer ticks. Comparing two runs across that shift reads as a uniform
 /// improvement in every probe at once. Anchoring on a probe with no code in it
 /// is what tells the two apart.
-const HARDWARE_ANCHOR: &str = "vmexit_cpuid";
+const HARDWARE_ANCHOR: &str = core_paths::contract::ISOLATED_HARDWARE_ANCHORS[0].0;
 
 /// How far the anchor may move before a comparison stops being a comparison.
 ///

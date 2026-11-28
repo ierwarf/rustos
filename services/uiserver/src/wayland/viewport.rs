@@ -191,6 +191,33 @@ pub(super) fn is_identity_output_mapping(
         && logical_dh.checked_mul(output_scale) == Some(height)
 }
 
+/// Exact nearest-neighbor repeat factor for a retained damage patch. Only
+/// accept mappings whose sample footprint is wholly local to each source
+/// pixel. Non-integer scaling, crops and transforms still remap the full image.
+pub(super) fn damage_repeat(
+    width: usize,
+    height: usize,
+    mapping: BufferMapping,
+    viewport: &ViewportState,
+    output_scale: usize,
+) -> Option<usize> {
+    let output_scale = output_scale.max(1);
+    if is_identity_output_mapping(width, height, mapping, viewport, output_scale) {
+        return Some(1);
+    }
+    if mapping.transform == 0
+        && mapping.scale != 0
+        && output_scale % mapping.scale == 0
+        && width % mapping.scale == 0
+        && height % mapping.scale == 0
+        && viewport.source.is_none()
+        && viewport.destination.is_none()
+    {
+        return Some(output_scale / mapping.scale);
+    }
+    None
+}
+
 /// Interpret a buffer into physical display pixels for an output with integer
 /// scale `output_scale` (e.g. `2` at 200% DPI).
 ///
