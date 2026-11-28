@@ -24,7 +24,8 @@ Existing imports are never overwritten implicitly.
 `Google Chrome` appears on uiserver's desktop with a browser glyph. Its startup
 mode is **none**: no Chrome autostart file or boot/session launch is installed.
 The desktop action names the real `/apps/chrome/chrome` ELF, not the host shell
-wrapper, and selects Wayland. Import, build, and ordinary boot do not run Chrome.
+wrapper, and selects Wayland. Chrome uses V8's default JIT settings. Import,
+build, and ordinary boot do not run Chrome.
 
 This is installation/discovery, not proof that Chrome runs. Shared-library,
 Linux syscall, sandbox, writable-profile and Wayland compatibility still need
@@ -79,7 +80,8 @@ cargo xtask build
 사용하세요. 백그라운드 네트워크 옵션만으로는 네트워크가 차단되지 않습니다.
 
 uiserver 바탕화면에 `Google Chrome`이 표시되지만 **자동 실행하지 않습니다**.
-실행 아이콘은 실제 Chrome ELF와 Wayland 옵션에 연결됩니다. Chrome 실행 호환성은
+실행 아이콘은 실제 Chrome ELF와 Wayland 옵션에 연결되며 V8의 기본 JIT 설정을
+사용합니다. Chrome 실행 호환성은
 아직 보장하지 않으며 라이브러리·시스템 호출·샌드박스·프로필·Wayland 시험은
 별도입니다. 호스트 설치, 패키지 스크립트 실행, cron 등록, 샌드박스 우회는 하지
 않고 setuid/setgid 비트도 제거합니다.

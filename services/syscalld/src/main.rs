@@ -614,15 +614,37 @@ fn handle_linux_request(
         SYSCALL_OFFLOAD_OP_LINUX_SETSID => linux_policy::handle_setsid(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MADVISE => linux_policy::handle_madvise(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_BRK => linux_policy::handle_brk(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_MMAP => linux_policy::handle_mmap(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT => linux_policy::handle_mprotect(request, response),
-        SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => linux_policy::handle_munmap(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_MMAP => {
+            linux_policy::handle_mmap(request, response);
+            trace_refused_mem(request, response);
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT => {
+            linux_policy::handle_mprotect(request, response);
+            trace_refused_mem(request, response);
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => {
+            linux_policy::handle_munmap(request, response);
+            trace_refused_mem(request, response);
+        }
         SYSCALL_OFFLOAD_OP_LINUX_MREMAP => linux_policy::handle_mremap(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => {
             linux_policy::handle_memfd_create(request, response)
         }
         _ => response.status = errno::EINVAL,
     }
+}
+
+/// Bounded evidence for refused address-space operations (first 160), so a
+/// runtime that dies on a failed reservation names the exact request.
+fn trace_refused_mem(request: &LinuxSyscallOffloadRequest, response: &LinuxSyscallOffloadResponse) {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if response.status == 0 || RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 160 {
+        return;
+    }
+    ipc::debug_line(&alloc::format!(
+        "syscalld: mem refused op={} pid={} addr={:#x} len={:#x} prot={:#x} flags={:#x} status={}",
+        request.op, request.pid, request.arg0, request.arg1, request.mask, request.flags, response.status
+    ));
 }
 
 fn handle_win32_request(

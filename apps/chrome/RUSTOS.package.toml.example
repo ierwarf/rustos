@@ -26,7 +26,7 @@ launch = "new-session"
 # the browser deliberately. Peak thread/process counts have not been measured.
 # Interim: RustOS has no user namespaces or setuid sandbox yet, and /data may be
 # absent, so Chrome runs unsandboxed with its profile on tmpfs.
-args = ["/apps/chrome/chrome", "--ozone-platform=wayland", "--no-sandbox", "--disable-gpu", "--js-flags=--jitless", "--disable-background-networking", "--user-data-dir=/tmp/chrome-profile", "--no-first-run", "--no-default-browser-check", "--password-store=basic", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--disable-component-extensions-with-background-pages", "--disable-domain-reliability", "--metrics-recording-only", "--disable-breakpad", "--disable-features=Translate,MediaRouter,OptimizationHints", "about:blank"]
+args = ["/apps/chrome/chrome", "--ozone-platform=wayland", "--no-sandbox", "--disable-gpu", "--disable-background-networking", "--user-data-dir=/tmp/chrome-profile", "--no-first-run", "--no-default-browser-check", "--password-store=basic", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--disable-component-extensions-with-background-pages", "--disable-domain-reliability", "--metrics-recording-only", "--disable-breakpad", "--disable-features=Translate,MediaRouter,OptimizationHints", "about:blank"]
 # Startup work Chrome would otherwise do on every launch against services this
 # image does not have (all names verified present in the 157 binary; none touch
 # the sandbox policy): `--no-first-run` skips the first-run flow, including the
