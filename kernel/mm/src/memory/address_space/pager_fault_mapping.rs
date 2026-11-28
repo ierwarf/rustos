@@ -12,7 +12,7 @@
 //! - **Failure:** CAS loss, stale PTE/VMA, descriptor mismatch, or contention
 //!   returns every unpublished frame and leaves the live mapping unchanged.
 //! - **Forbidden:** No exception-time allocation of ownership metadata,
-//!   sleepable lock, W+X grant, or present non-COW replacement.
+//!   sleepable lock, delegated W+X grant, or present non-COW replacement.
 //! - **Evidence:** `CowFrameLifecycle`, `PageTableMapTransaction`, and focused
 //!   PTE/COW source mutations.
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -188,16 +188,19 @@ fn pages_to_level_boundary(virt: VirtAddr, shift: u32) -> usize {
     ((span - offset) / PAGE_4KIB_U64) as usize
 }
 
+/// Policy comes from the exact private-anonymous VMA install permit.
+/// Userspace reply rights are never execution-policy authority.
 pub fn map_current_prepared_pager_fault_frame_at(
     start: VirtAddr,
     frame_phys: u64,
     flags: PageTableFlags,
+    policy: ExecMemoryPolicy,
 ) -> Result<bool, AddressSpaceError> {
     validate_user_page_range(start, 1)?;
     if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
-    let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
+    let page_flags = normalize_user_page_flags_with_policy(flags, policy)? | ROOT_OWNED_USER_LEAF;
     let root = kernel_vm::current_root_phys();
     let result = with_prepared_user_leaf_atomic(root, start, |leaf| {
         install_prepared_data_leaf(root, start, frame_phys, page_flags, leaf)
@@ -610,7 +613,7 @@ impl ProcessAddressSpace {
         if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) {
             return Err(AddressSpaceError::InvalidFrameOwnership);
         }
-        let page_flags = normalize_user_page_flags(flags)?
+        let page_flags = self.normalize_owned_user_page_flags(flags)?
             .difference(PageTableFlags::WRITABLE)
             .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
         self.map_user_page(start, PhysAddr::new(frame_phys), page_flags)
@@ -911,7 +914,7 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
         validate_user_page_range(start, page_count)?;
-        let page_flags = normalize_user_page_flags(flags)?;
+        let page_flags = self.normalize_owned_user_page_flags(flags)?;
         self.demote_user_huge_pages(start, page_count)?;
         let root = self.root_phys();
         let mut present = 0_usize;
@@ -1654,6 +1657,7 @@ pub fn try_map_current_prepared_anon_folio(
     start: VirtAddr,
     fault: VirtAddr,
     flags: PageTableFlags,
+    policy: ExecMemoryPolicy,
 ) -> Option<u64> {
     const PAGES: usize = phys::ANON_FOLIO_PAGES;
     const BYTES: u64 = ANON_FOLIO_BYTES;
@@ -1665,7 +1669,7 @@ pub fn try_map_current_prepared_anon_folio(
         return None;
     }
     validate_user_page_range(start, PAGES).ok()?;
-    let flags = normalize_user_page_flags(flags).ok()? | ROOT_OWNED_USER_LEAF;
+    let flags = normalize_user_page_flags_with_policy(flags, policy).ok()? | ROOT_OWNED_USER_LEAF;
     let root = kernel_vm::current_root_phys();
     let mut unused = [PhysAddr::new(0); PAGES];
     let mut unused_len = 0;

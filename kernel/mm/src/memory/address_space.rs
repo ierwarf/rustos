@@ -139,13 +139,20 @@ impl UserRegion {
 }
 
 /// Kernel-assigned execution-memory class. Unbound roots fail closed.
-/// This is authority metadata only; the existing W^X gates remain intact
-/// until the complete pager/PTE admission path is converted.
+/// Only private, process-owned memory may use the relaxed class. External
+/// frame mappings and the kernel keep independent strict checks.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExecMemoryPolicy {
     #[default]
     StrictWx,
     AllowRwx,
+}
+
+impl ExecMemoryPolicy {
+    #[inline]
+    pub const fn permits(self, writable: bool, executable: bool) -> bool {
+        !writable || !executable || matches!(self, Self::AllowRwx)
+    }
 }
 
 #[derive(Debug)]
@@ -206,6 +213,10 @@ impl ProcessAddressSpace {
 
     pub fn exec_memory_policy(&self) -> ExecMemoryPolicy {
         self.exec_memory_policy.unwrap_or_default()
+    }
+
+    fn normalize_owned_user_page_flags(&self, flags: PageTableFlags) -> Result<PageTableFlags, AddressSpaceError> {
+        normalize_user_page_flags_with_policy(flags, self.exec_memory_policy())
     }
 
     pub fn root_phys(&self) -> PhysAddr {
@@ -459,7 +470,7 @@ impl ProcessAddressSpace {
                 if let Some(mode) = shared_mode {
                     let child_flags = match shared_flags_memo {
                         Some((input, output)) if input == flags => output,
-                        _ => match normalize_user_page_flags(flags) {
+                        _ => match cloned.normalize_owned_user_page_flags(flags) {
                             Ok(normalized) => {
                                 let output = normalized
                                     .difference(PageTableFlags::WRITABLE)
@@ -535,7 +546,7 @@ impl ProcessAddressSpace {
                 } else {
                     inherited_flags
                 };
-                let child_flags = match normalize_user_page_flags(child_source_flags) {
+                let child_flags = match cloned.normalize_owned_user_page_flags(child_source_flags) {
                     Ok(flags) => flags | ROOT_OWNED_USER_LEAF,
                     Err(error) => {
                         phys::cancel_data_leaf(child_root, virt_address, dst_phys.as_u64());
@@ -681,7 +692,7 @@ impl ProcessAddressSpace {
     ) -> Result<UserRegion, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
 
-        let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
+        let page_flags = self.normalize_owned_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
         let mut mapped_pages = Vec::new();
         mapped_pages
             .try_reserve_exact(page_count)
@@ -937,7 +948,7 @@ impl ProcessAddressSpace {
         flags: PageTableFlags,
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
-        let page_flags = normalize_user_page_flags(flags)?;
+        let page_flags = self.normalize_owned_user_page_flags(flags)?;
         if page_count == 0 {
             return Ok(());
         }
@@ -946,6 +957,19 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
+        // RWX must never elevate an external/shared/DMA frame. Immutable
+        // private aliases are eligible only through transactional copy below.
+        if page_flags.contains(PageTableFlags::WRITABLE) && !page_flags.contains(PageTableFlags::NO_EXECUTE) {
+            for index in 0..page_count {
+                let va = page_addr(start, index)?;
+                let (_, old) = self.translate_user_with_flags(va).ok_or(AddressSpaceError::NotMapped)?;
+                if !old.contains(ROOT_OWNED_USER_LEAF)
+                    && !self.immutable_overlaps(va.as_u64(), va.as_u64() + 1)
+                {
+                    return Err(AddressSpaceError::ProtectionViolation);
+                }
+            }
+        }
         self.demote_user_huge_pages(start, page_count)?;
 
         // Private immutable aliases must become owned copies before a write
@@ -1454,10 +1478,14 @@ fn user_table_flags() -> PageTableFlags {
 }
 
 fn normalize_user_page_flags(flags: PageTableFlags) -> Result<PageTableFlags, AddressSpaceError> {
+    normalize_user_page_flags_with_policy(flags, ExecMemoryPolicy::StrictWx)
+}
+
+fn normalize_user_page_flags_with_policy(flags: PageTableFlags, policy: ExecMemoryPolicy) -> Result<PageTableFlags, AddressSpaceError> {
     if flags.contains(PageTableFlags::HUGE_PAGE) {
         return Err(AddressSpaceError::HugePageConflict);
     }
-    if flags.contains(PageTableFlags::WRITABLE) && !flags.contains(PageTableFlags::NO_EXECUTE) {
+    if !policy.permits(flags.contains(PageTableFlags::WRITABLE), !flags.contains(PageTableFlags::NO_EXECUTE)) {
         return Err(AddressSpaceError::ProtectionViolation);
     }
 
