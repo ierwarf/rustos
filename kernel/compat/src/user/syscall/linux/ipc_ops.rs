@@ -1011,6 +1011,10 @@ fn revoke_service_endpoint_publication(service_id: u64) -> LinuxResult<()> {
 fn register_service_endpoint_publication(service_id: u64, endpoint: u64) -> LinuxResult<()> {
     let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
     let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    let strict = multitask::with_current_user_process_state_mut(|_, _, state| {
+        !state.address_space().exec_memory_policy().permits(true, true)
+    }).ok_or(LINUX_ESRCH)?;
+    if !strict { return Err(LINUX_EPERM); }
     ipc_trace!(
         "ipc register service endpoint: service={} process={} endpoint={}",
         service_id,

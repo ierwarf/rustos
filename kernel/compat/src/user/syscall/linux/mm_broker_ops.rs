@@ -310,7 +310,8 @@ fn broker_map_anon(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     let start = checked_page_addr(args.addr)?;
     let page_count = page_count(len)?;
     let mapping_end = checked_mapping_end(start, page_count)?;
-    let page_flags = protection_to_page_flags(args.prot)?;
+    let page_flags = owned_protection_to_page_flags(args.prot)?;
+    validate_target_exec_policy(t, args.prot)?;
 
     // Every post-bootstrap anonymous mapping is first represented in the
     // process VMA authority. Policy decides only whether committed pages are
@@ -440,7 +441,8 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let mapping_end = checked_mapping_end(start, page_count(len)?)?;
-    let page_flags = protection_to_page_flags(args.prot)?;
+    let page_flags = owned_protection_to_page_flags(args.prot)?;
+    validate_target_exec_policy(t, args.prot)?;
     let source = file_mapping_source(t, args.fd)?;
 
     // A description bound to a sealed shared library object is served by
@@ -752,7 +754,7 @@ fn map_library_alias(
 ) -> Result<Option<RustosMmMapBrokerResult>, i64> {
     // Only read-capable, page-aligned private mappings are served; PROT_NONE
     // reservations and unaligned offsets use the existing path.
-    if args.prot & linux_abi::PROT_READ == 0 || !args.offset.is_multiple_of(PAGE_SIZE) {
+    if linux_prot_is_rwx(args.prot) || args.prot & linux_abi::PROT_READ == 0 || !args.offset.is_multiple_of(PAGE_SIZE) {
         return Ok(None);
     }
     let Some((object, file_len)) = bound_library_object(t, args.fd) else {
@@ -1374,7 +1376,8 @@ fn broker_protect(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     let start = checked_page_addr(args.addr)?;
     let page_count = page_count(len)?;
     let end = checked_mapping_end(start, page_count)?;
-    let page_flags = protection_to_page_flags(args.prot)?;
+    let page_flags = owned_protection_to_page_flags(args.prot)?;
+    validate_target_exec_policy(t, args.prot)?;
     let pager_prot = pager_admission::pager_protection(args.prot).ok_or(LINUX_EINVAL)?;
 
     // A shared memfd mapping admitted read-only was never counted as writable
@@ -2067,10 +2070,25 @@ fn page_count(len: usize) -> Result<usize, i64> {
 }
 
 fn protection_to_page_flags(prot: u64) -> Result<PageTableFlags, i64> {
+    if linux_prot_is_rwx(prot) { return Err(LINUX_EACCES); }
+    owned_protection_to_page_flags(prot)
+}
+
+fn validate_target_exec_policy(t: MmTarget, prot: u64) -> Result<(), i64> {
+    if !linux_prot_is_rwx(prot) { return Ok(()); }
+    let allowed = multitask::with_process_state_by_generation_mut(t.pid, t.process_generation, t.mm_generation, |state| {
+        state.address_space().exec_memory_policy().permits(true, true)
+    }).ok_or(LINUX_ESRCH)?;
+    if allowed { Ok(()) } else { Err(LINUX_EACCES) }
+}
+
+fn linux_prot_is_rwx(prot: u64) -> bool {
+    prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0
+}
+
+fn owned_protection_to_page_flags(prot: u64) -> Result<PageTableFlags, i64> {
     let supported = linux_abi::PROT_READ | linux_abi::PROT_WRITE | linux_abi::PROT_EXEC;
-    if prot & !supported != 0
-        || prot & linux_abi::PROT_WRITE != 0 && prot & linux_abi::PROT_EXEC != 0
-    {
+    if prot & !supported != 0 {
         return Err(LINUX_EINVAL);
     }
     let mut flags = PageTableFlags::NO_EXECUTE;
