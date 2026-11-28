@@ -293,6 +293,10 @@ pub const VM_PROT_WRITE: u32 = 1 << 1;
 pub const VM_PROT_EXECUTE: u32 = 1 << 2;
 pub const VM_PROT_KNOWN: u32 = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
 
+pub const fn vm_prot_is_rwx(prot: u32) -> bool {
+    prot & VM_PROT_WRITE != 0 && prot & VM_PROT_EXECUTE != 0
+}
+
 pub const PAGER_ACTION_MAP_ZEROED: u16 = 1;
 pub const PAGER_ACTION_MAP_SHARED: u16 = 2;
 pub const PAGER_ACTION_MAP_COW: u16 = 3;
@@ -340,7 +344,8 @@ impl PagerObjectIdentityWire {
             && self.object_type <= VM_OBJECT_DEVICE_PINNED
             && self.reserved0 == 0
             && self.rights & !VM_PROT_KNOWN == 0
-            && !(self.rights & VM_PROT_WRITE != 0 && self.rights & VM_PROT_EXECUTE != 0)
+            && (!vm_prot_is_rwx(self.rights)
+                || (self.object_type == VM_OBJECT_ANONYMOUS && self.backing_service == 0))
     }
 
     pub const fn has_authority(self) -> bool {
@@ -379,7 +384,8 @@ impl PagerVmRegionWire {
             && self.end & (PAGER_PAGE_BYTES - 1) == 0
             && self.object_offset & (PAGER_PAGE_BYTES - 1) == 0
             && self.prot & !VM_PROT_KNOWN == 0
-            && !(self.prot & VM_PROT_WRITE != 0 && self.prot & VM_PROT_EXECUTE != 0)
+            && ((!vm_prot_is_rwx(self.prot) && !vm_prot_is_rwx(self.object.rights))
+                || self.is_owned_private_anonymous())
             && (self.sharing == VM_SHARING_PRIVATE || self.sharing == VM_SHARING_SHARED)
             && (self.commit_state == VM_COMMIT_RESERVED || self.commit_state == VM_COMMIT_COMMITTED)
             && self.reserved1[0] == 0
@@ -390,6 +396,13 @@ impl PagerVmRegionWire {
             && self.mm_generation != 0
             && self.object.has_authority()
             && self.fault_endpoint.has_authority()
+    }
+
+    /// Shape only: kernel-ps must authorize the exact MM before publication.
+    pub const fn is_owned_private_anonymous(self) -> bool {
+        self.object.object_type == VM_OBJECT_ANONYMOUS
+            && self.object.backing_service == 0
+            && self.sharing == VM_SHARING_PRIVATE
     }
 
     pub const fn contains(self, address: u64) -> bool {
@@ -722,6 +735,10 @@ mod tests {
             }
             .is_canonical()
         );
+        assert!(PagerFaultRequestWire {
+            object: PagerObjectIdentityWire { rights: VM_PROT_WRITE | VM_PROT_EXECUTE, object_type: VM_OBJECT_ANONYMOUS, backing_service: 0, ..valid.object },
+            ..valid
+        }.is_canonical());
         for invalid in [
             PagerFaultRequestWire {
                 reserved0: 1,
@@ -735,6 +752,8 @@ mod tests {
             PagerFaultRequestWire {
                 object: PagerObjectIdentityWire {
                     rights: VM_PROT_WRITE | VM_PROT_EXECUTE,
+                    object_type: VM_OBJECT_FILE_PRIVATE,
+                    backing_service: 2,
                     ..valid.object
                 },
                 ..valid
