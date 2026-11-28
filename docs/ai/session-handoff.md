@@ -6,27 +6,19 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
-## IPC optimization planning (2026-11-27, linked-image audit)
+## IPC L1–L3 & Queued Q0–Q4 optimization completion (2026-11-28)
 
-- [Queued slowpath and tail plan](performance/ipc-queued-tail-plan.md) audits
-  the accepted forced-queue archive and linked CALL/wake/wait/REPLY_RECV.
-  Idle p50/p99 are 23,680/48,080 ticks; all eight longest rounds are dominated
-  by CALL-to-RECV, but host vs guest cause remains unresolved. First steps:
-  eliminate the second kernel-owned payload copy and add diagnostic-only
-  tail attribution. No fixed tick or per-stage saving gate remains.
-- [L1–L3 implementation and acceptance plan](performance/ipc-l1-l3-plan.md) binds
-  the existing 5,600/8,640-tick register IPC result to the `f9a70967` linked
-  and staged images and records source boundaries, phase gates and the
-  audit census. No kernel/ABI implementation or new timing was performed.
-- Linked direct stubs create and zero a 432-byte scheduler context in each
-  direction, but their successful parked-register tail already skips IRET.
-  L1 removes the reply-slot transaction, L2 keeps one owner across both
-  switches, and L3 removes the synthetic context and then the redundant
-  parked take. Start with B0 boundary/switch diagnostics; do not bypass
-  physical stack ACK, authority, or SIMD/SYSRET checks.
-- Draft, ELF dumps, and owner-observer census: `docs/ai/performance/` and
-  `build/ipc-l1-l3-plan/` (queued dumps under `queued-tail/`). No new build,
-  tests, measurements or formal run; no commit or push.
+- Executed [ipc-l1-l3-plan.md](performance/ipc-l1-l3-plan.md) (`B0`, `L1`, `L2`, `L3a`, `L3b`) and [ipc-queued-tail-plan.md](performance/ipc-queued-tail-plan.md) (`Q0–Q4`, `T0–T3`) end-to-end.
+- **L1–L3 changes:** Added objectless 256-slot virtual rendezvous (`kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs`, `formal/ipc-register-rendezvous/IpcRegisterRendezvous.tla`), per-CPU `RunOwnerState::Paired` custody (`kernel/ps/src/multitask/scheduler/pair.rs`, `ownership.rs`, `cpu_local.rs`, `formal/scheduler-owner-word/SchedulerOwnerWord.tla`), `DirectSwitchResult` skipping 54-qword synthetic `SavedContext` zeroing on fast switches (`kernel-lowlevel`, `kernel-hal/src/interrupt_stubs.rs`, `kernel-ps/src/multitask/irq.rs`), IRQ-check & `SleepWaiter` buffer optimizations (`rtc.rs`, `current.rs`), and direct `take_inline_reply::<16>` completion (`ipc_ops.rs`, `registers.rs`).
+- **Queued & tail changes:** Moved `EndpointPayload` ownership without redundant kernel copies, added inline short-message storage and Q0/T0–T3 diagnostics & fixes (`ipcbench` probes & `SeqRing`).
+- **Latent ABI bug fixed (`int_args.rs`, `linux.rs`, `dispatch_ext.rs`):** Replaced in-place `normalize_linux_int_fd_args(frame)` with read-only `canonical_linux_args(frame) -> [u64; 6]` so Linux x86-64 caller-preserved registers (`r9` across `SYS_futex` under host CPU load) are not upper-32-bit truncated across `sysretq`.
+- **Shipping KVM measurements (`tsc_khz ≈ 3991 MHz`, 20k samples):**
+  - Register IPC 1-vCPU idle (`final-vcpu1-reg-B.txt`): `min=4,200 (1,052 ns) / p50=4,320 (1,082 ns)` vs `5,200 / 5,640` baseline (`-23.4%` p50, `mean=4,576`, `>1M=0`).
+  - Register IPC 8-vCPU idle (`final-vcpu8-idle-reg-B.txt`): `min=4,280 / p50=4,400 / p99=6,720 / mean=4,595` (`>1M=0`).
+  - Register IPC under 50%/100% host CPU load: 1-vCPU `p50=8,240 / 8,040`; 8-vCPU `p50=7,520 / 8,200` (all PASS).
+  - Queued IPC (`ipc_rt_intra_process_queued_reply_recv`): 1-vCPU `p50 24,240 -> 10,320` (`-57.4%`, `min=9,720`), 8-vCPU `min=9,400 / p50=10,160 / >1M=0`.
+  - Q0 matrix 1-vCPU: `0fd_16b p50 24,360 -> 10,520`, `reg_16b 7,560 -> 6,680`, `fd_16b 48,120 -> 45,560`, `256b 43,080 -> 41,040`, `32k 53,120 -> 48,200`, `backlog 44,680 -> 42,840`.
+- **Formal:** Registered `ipc-register-rendezvous/IpcRegisterRendezvous` across `contracts.toml`, `model-bindings.tsv`, `CONFORMANCE.md`, `models.md`, `COVERAGE.md`, `run-source-conformance.sh`, `rust-source-debt.tsv`; `formal-preflight.sh` 23/23 passed; crate unit suites passed.
 
 ## RustOS Internet transfer performance (2026-11-27, 1-vCPU KVM)
 

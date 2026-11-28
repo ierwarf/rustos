@@ -1,29 +1,13 @@
 # IPC register rendezvous: P3 design draft
 
 [Contract index](../performance-hardening.md). Owner: `kernel/ps` scheduler lane
-(`scheduler/ipc_lane*`, `scheduler/resident.rs`) with `kernel/ipc-runtime` endpoints.
-Status: **design draft, not implemented.** Written 2026-10-26 after the stage 1 package
-of `ipc-lane.md` ("P3 stage 1"); it records what was measured, what the proposed
-mechanism would buy, and the formal model that bounds its correctness argument.
-The existing resident scheduler lane, direct parking and queued/rendezvous reply
-convergence are implemented separately in [IPC lane](ipc-lane.md). This draft's
-**objectless virtual reply and paired-custody mechanisms remain unimplemented**;
-its cost estimates are historical projections, not current measured latency.
+(`scheduler/ipc_lane*`, `scheduler/pair.rs`, `scheduler/resident.rs`) with `kernel/ipc-runtime` endpoints (`virtual_rendezvous.rs`).
+Status: **implemented (L1–L3b), formal model registered (`ipc-register-rendezvous/IpcRegisterRendezvous`), KVM-verified (2026-11-28).**
+The implementation follows [ipc-l1-l3-plan.md](ipc-l1-l3-plan.md) and supersedes the historical draft estimates below. On shipping KVM (`tsc_khz ≈ 3991 MHz`), 1-vCPU idle `ipc_rt_intra_process_register_reply_recv` dropped from `p50=5,640` (`min=5,200`) to **`p50=4,320` (`min=4,200` cyc / `1,052 ns`, `-23.4%` p50)**, and 8-vCPU idle measured **`p50=4,400` (`min=4,280` cyc, `p99=6,720`, `>1M=0`)**.
 
-## Implementation plan and cycle budget — 2026-11-27
+## Implementation plan and verified L1–L3 summary — 2026-11-28
 
-**Planned, not implemented.** The [L1–L3 implementation and acceptance
-plan](ipc-l1-l3-plan.md) specifies the implementation order, disassembly
-anchors and recovery boundaries. The companion [queued and tail plan](ipc-queued-tail-plan.md)
-covers the general transport and worst-latency work. There is no fixed tick gate. This section
-supersedes the historical draft below where its admission, reply identity,
-or cycle budget differs. Start
-from the `f9a70967` isolated 16-byte
-register IPC echo on 1-vCPU KVM: host idle, 2,000 warmups, 20,000 round
-trips, p50 **5,600 guest invariant-TSC ticks**, p99 **8,640**; CPUID p50
-**3,760** (not subtracted). The call-to-receive and reply-to-return p50s
-are 2,920 and 2,600, respectively. They are separate distributions.
-The evidence is `build/ipc-slowpath-baseline/register-kvm-0-samples.log`.
+L1 (`kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs`, bound to `formal/ipc-register-rendezvous/IpcRegisterRendezvous.tla`), L2 (`kernel/ps/src/multitask/scheduler/pair.rs` & `RunOwnerState::Paired` in `formal/scheduler-owner-word/SchedulerOwnerWord.tla`), and L3a/L3b (`DirectSwitchResult` in `kernel-hal`/`kernel-ps`, IRQ-check & `SleepWaiter` allocation fast paths, and `take_inline_reply::<16>` in `kernel-compat`) are implemented per [ipc-l1-l3-plan.md](ipc-l1-l3-plan.md). See section 5 of that plan and [ipc-queued-tail-plan.md](ipc-queued-tail-plan.md) for the complete shipping measurements.
 
 ### L1 — objectless register rendezvous, existing scheduler ownership
 

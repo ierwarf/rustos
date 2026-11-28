@@ -1,12 +1,7 @@
 # Register IPC L1–L3: implementation and acceptance plan
 
-Status: design only, audited against `f9a70967`. No new IPC ABI, kernel change,
-KVM run or proof result is claimed here. This is the implementation plan for
-[the rendezvous draft](ipc-rendezvous.md), not a new ABI contract. The
-[queued slowpath and tail track](ipc-queued-tail-plan.md) is part of the
-same program, alongside L1–L3. Start with one local protection domain;
-extending L3 across address spaces is a separate admission decision, not
-justification for weakening isolation.
+Status: implemented and shipping-benchmarked (2026-11-28, KVM ~3.991 GHz host).
+See `docs/ai/abi/ipc.md` and `formal/CONFORMANCE.md` for the registered ABI and formal bindings.
 
 ## 1. Baseline and the actual linked path
 
@@ -276,3 +271,27 @@ for p99, separate address spaces or other hardware follows from this table.
    stamp protocol. Compare same-root and separate-root separately; report
    raw as well as warm-paired and cold/mixed cases, not just a filtered minimum.
    A green microbench does not make it an app↔`netd` throughput result.
+
+## 5. Implemented stages & verified KVM results (2026-11-28)
+
+### Implemented components
+- **B0 (`ipc_rt_diag_register_echo`, `ipc_rt_diag_switch_floor`):** Isolated entry/return echo (`p50=600` cyc) and switch-floor diagnostic probes (`kernel/ps/src/multitask/irq.rs`, `apps/ipcbench/`).
+- **L1 (`kernel/ipc-runtime/src/ipc/virtual_rendezvous.rs`, `formal/ipc-register-rendezvous/IpcRegisterRendezvous.tla`):** Objectless 256-slot cache-padded virtual rendezvous table (`VirtualSlotData`) for `<= 16` B register calls, using monotonic 40-bit generations + zero low-16-bit virtual reply tokens strictly disjoint from `REPLIES` slab handles, with transparent slab fallback on saturation.
+- **L2 (`kernel/ps/src/multitask/scheduler/pair.rs`, `kernel/ps/src/multitask/cpu_local.rs`, `kernel/ps/src/multitask/scheduler/runqueue/ownership.rs`):** Per-CPU paired custody (`RunOwnerState::Paired` preserving wait reason/epoch in `SchedulerOwnerWord.tla` & `ownership.rs`) transferring `CpuLeases` and `PublishedFrameView` across paired call/reply switches (`pair_publish` with `SeqCst` bank fence + scalar publication), dissolving cleanly to `Local` / `Blocked` on IRQ, preemption, wake, migration, or retirement.
+- **L3a (`kernel/lowlevel`, `kernel/hal/src/interrupt_stubs.rs`, `kernel/ps/src/multitask/irq.rs`):** `DirectSwitchResult` compact register handoff bypassing the 54-qword (`432` B) synthetic `SavedContext` zeroing on admitted fast switches while keeping generic escape intact.
+- **L3b (`kernel/hal/src/arch/rtc.rs`, `kernel/ps/src/multitask/current.rs`, `kernel/compat/src/user/syscall/linux/ipc_ops{,.rs,/registers.rs}`):** Avoids 8 KiB `SleepWaiter` buffer alloc/free when not growing, checks `interrupts::are_enabled()` before redundant CLI/STI wrappers, and adds a direct `take_inline_reply::<16>` fast path in `complete_parked_call`.
+- **Latent ABI fix uncovered under load (`kernel/compat/src/user/syscall/linux/{int_args.rs,linux.rs,dispatch_ext.rs}`):** `int_args::canonical_linux_args` now returns `[u64; 6]` instead of mutating `SyscallFrame::rdi..r9` in place (which truncated caller-preserved upper bits in `r9` across `SYS_futex` under host CPU contention).
+
+### Shipping KVM benchmark comparison (`tsc_khz ≈ 3991 MHz`, 20,000 timed samples)
+- **Register IPC idle (`ipc_rt_intra_process_register_reply_recv`):**
+  - 1-vCPU baseline (`build/diag/ipc_rt_intra_process_register_reply_recv.txt`): `min=5,200`, `p50=5,640`, `p99=6,360`, `mean=60,306` (`max=179,027,520`, `>10M=9`, `top1%=90.77%`).
+  - **1-vCPU final (`build/diag/final-vcpu1-reg-B.txt`):** **`min=4,200` (`1,052 ns`), `p50=4,320` (`1,082 ns`, `-23.4%`), `p99=7,400`, `max=874,480`, `mean=4,576` (`>1M=0`, `>10M=0`, `top1%=5.29%`)**. Legs: `call_to_recv` `min=2,040 / p50=2,120`, `server_body` `40 / 80`, `reply_to_return` `min=2,040 / p50=2,120` (`vmexit_cpuid p50=3,520`).
+  - **8-vCPU idle final (`build/diag/final-vcpu8-idle-reg-B.txt`):** **`min=4,280` (`1,072 ns`), `p50=4,400` (`1,102 ns`), `p99=6,720`, `max=131,000`, `mean=4,595` (`>1M=0`, `>10M=0`, `top1%=3.34%`)**.
+- **Register IPC under host CPU load (`final-vcpu{1,8}-load{50,100}-reg.txt`):**
+  - 1-vCPU 50% load (8 `yes`): `min=6,560`, `p50=8,240`, `p99=9,560`, `mean=9,249` (`>10M=0`).
+  - 1-vCPU 100% load (16 `yes`): `min=7,280`, `p50=8,040`, `p99=8,960`, `mean=15,125`.
+  - 8-vCPU 50% load (8 `yes`): `min=6,720`, `p50=7,520`, `p99=15,360`, `mean=8,016` (`>1M=0`, `>10M=0`).
+  - 8-vCPU 100% load (16 `yes`): `min=6,280`, `p50=8,200`, `p99=12,720`, `mean=18,753`.
+- **Full unisolated suite (`final-vcpu{1,8}-full-B.txt`):**
+  - Buffer `ipc_rt_intra_process_reply_recv`: 1-vCPU `min=7,240 / p50=7,720`, 8-vCPU `min=7,400 / p50=7,680`.
+  - Cross-process `ipc_rt_cross_process_syscalld_getuid`: 1-vCPU `min=14,400 / p50=15,000`, 8-vCPU `min=13,960 / p50=15,040`.

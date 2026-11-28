@@ -518,3 +518,9 @@ Left alone, all 100-400 ticks each and spread across ~20 places: budget pair per
 `wrmsr`s (unconditional by design, see `prepare_for_context_return`), frame reader acquire.
 Cutting a further ~40% needs a yield-specific lane (skip the scan and claim chain), a
 separate custody/formal change.
+
+## Register IPC L1–L3 & Queued Q0–Q4 Update (2026-11-28)
+
+- **L1/L2/L3a/L3b implemented (`virtual_rendezvous.rs`, `scheduler/pair.rs`, `DirectSwitchResult`, `take_inline_reply::<16>`):** Register RPCs use 256-slot virtual tokens (no `REPLIES` slab allocation on hits, automatic slab fallback on saturation) and per-CPU `RunOwnerState::Paired` custody (`scheduler-owner-word/SchedulerOwnerWord`, `ipc-register-rendezvous/IpcRegisterRendezvous`), reducing 1-vCPU idle register IPC to `min=4,200 / p50=4,320` cyc (`1,052 / 1,082 ns`, `mean=4,576`, `>1M=0`) and 8-vCPU idle to `min=4,280 / p50=4,400` cyc (`p99=6,720`).
+- **Queued fastpath & tail reductions:** Moving `EndpointPayload` ownership + inline short-message carrier + tail fixes reduced 1-vCPU `ipc_rt_intra_process_queued_reply_recv` from `p50=24,240` (`min=21,400`) to `p50=10,320` (`min=9,720`, `-57.4%`) and 8-vCPU idle to `p50=10,160` (`min=9,400`, `>1M=0`).
+- **Full evidence & measurements:** See [ipc-l1-l3-plan.md](ipc-l1-l3-plan.md) and [ipc-queued-tail-plan.md](ipc-queued-tail-plan.md).

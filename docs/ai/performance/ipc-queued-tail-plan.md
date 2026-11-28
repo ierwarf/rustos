@@ -1,6 +1,6 @@
 # Queued IPC and latency tails: optimization plan
 
-Status: static review and linked-image inspection only, against `f9a70967`.
+Status: implemented and shipping-benchmarked (2026-11-28, KVM ~3.991 GHz host).
 Companion to the [L1–L3 fastpath plan](ipc-l1-l3-plan.md). Optimize the lowest
 repeatable cost the architecture permits without weakening ordering, authority,
 accounting or fallback. There is no target tick count that ends the work and no
@@ -216,3 +216,23 @@ counts. Re-measure after each accepted optimization and choose the next
 largest removable cost. Accept a measured improvement larger than repeat
 noise with correctness and no reproducible regression in the relevant p99 or
 ordinary fallback; no fixed saving, floor or benchmark-only fast route.
+
+## 5. Implemented Q0–Q4 & T0–T3 results (2026-11-28)
+
+### Implemented changes
+- **Q0 (`apps/ipcbench/src/ipc_probes.rs`, `tools/xtask/src/bench.rs`):** Added isolated matrix probes `ipc_rt_queued_{0fd_16b,fd_16b,reg_16b,256b,32k,backlog,cross_proc}`.
+- **Q1–Q4 (`kernel/ipc-runtime/`, `kernel/compat/`):** Replaced duplicate request/response copies with moved `EndpointPayload`, inline short-message carrier specialization avoiding heap allocation on short queued calls/replies, waiter readiness fast paths, and shared dequeue/wake/reply retirement cleanup.
+- **T0–T3 (`apps/ipcbench/src/tails.rs`, `kernel/ps/`, `kernel/compat/`):** Retained per-request sequential ring attribution (`seq-summary/*` with 0 unpaired/overflow in isolated runs), fixed latency-tail causes in queued wake/wait/return paths, and isolated return-leg tails.
+
+### Shipping KVM benchmark comparison (`tsc_khz ≈ 3991 MHz`, 1-vCPU & 8-vCPU)
+- **`ipc_rt_intra_process_queued_reply_recv`:**
+  - 1-vCPU baseline (`build/diag/ipc_rt_intra_process_queued_reply_recv.txt`): `min=21,400`, `p50=24,240`, `p99=39,240`, `mean=99,752` (historical `queued.log`: `min=21,840`, `p50=23,680`, `p99=48,080`).
+  - **1-vCPU final (`build/diag/final-vcpu1-queued-B.txt`):** **`min=9,720` (`2,435 ns`), `p50=10,320` (`2,585 ns`, `-57.4%` vs `24,240`), `p99=18,320`, `mean=11,531` (`>10M=0`, `top1%=10.49%`)**.
+  - **8-vCPU final (`build/diag/final-vcpu8-idle-queued-B.txt`):** **`min=9,400` (`2,362 ns`), `p50=10,160` (`2,553 ns`), `p99=18,120`, `max=231,680`, `mean=10,962` (`>1M=0`, `>10M=0`, `top1%=3.36%`)**.
+- **Q0 1-vCPU isolated matrix (`build/diag/ipc_rt_queued_*.txt` -> `build/diag/final-ipc_rt_queued_*.txt`):**
+  - `ipc_rt_queued_0fd_16b`: `min 21,680 -> 9,960`, `p50 24,360 -> 10,520` (`-56.8%`), `p99 42,960 -> 13,560`, `mean 102,550 -> 11,030`.
+  - `ipc_rt_queued_reg_16b`: `min 6,840 -> 6,360`, `p50 7,560 -> 6,680` (`-11.6%`), `p99 8,360 -> 7,920`, `mean 81,290 -> 7,161`.
+  - `ipc_rt_queued_fd_16b`: `min 38,120 -> 29,960`, `p50 48,120 -> 45,560`, `p99 88,960 -> 65,320`, `mean 132,233 -> 62,960`.
+  - `ipc_rt_queued_256b`: `min 32,560 -> 24,600`, `p50 43,080 -> 41,040`, `mean 129,236 -> 46,600`.
+  - `ipc_rt_queued_32k`: `min 44,360 -> 30,680`, `p50 53,120 -> 48,200`, `p99 79,240 -> 68,000`, `mean 137,108 -> 49,958`.
+  - `ipc_rt_queued_backlog`: `min 34,720 -> 26,560`, `p50 44,680 -> 42,840`, `p99 65,000 -> 62,880`, `mean 146,221 -> 88,913`.

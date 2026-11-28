@@ -112,9 +112,15 @@ The unsafe typed helpers require their own input/output ranges to remain valid;
 raw syscall helpers retain kernel fault validation of arbitrary user pointers.
 Large protocols are not silently truncated or migrated to a new wire format.
 
-The register ABI adds no new authority or objectless rendezvous cell. Process
-endpoint authorization, exact reply generation/rights, deadlines/cancellation,
-funding custody, fairness and arm/register/recheck/commit remain unchanged.
+The register ABI preserves process endpoint authorization, exact reply
+generation/rights, deadlines/cancellation, funding custody, fairness and
+arm/register/recheck/commit invariants. For `<= 16` B fast-hit calls,
+`kernel-ipc-runtime` uses an objectless virtual rendezvous slot
+(`virtual_rendezvous.rs`, virtual token low 16 bits zero, strictly disjoint
+from `REPLIES` slab handles, falling back transparently to the `REPLIES` slab
+on virtual-slot saturation), and `kernel-ps` switches eligible same-CPU pairs
+via per-CPU `RunOwnerState::Paired` custody (`scheduler/pair.rs`) and
+`DirectSwitchResult` without fabricating a 432 B synthetic `SavedContext`.
 A fast reservation decline rolls back before the existing queued fallback;
 remote/unparked peers still work. REPLY_RECV authenticates the next endpoint
 before consuming the old capability, and uses the existing post-commit errno
@@ -139,14 +145,15 @@ the same task's next blocking receive (or its next syscall or scheduler entry).
 
 The transport still owns its existing fixed frame, but short request/response
 return images are specialized to 16 bytes, rather than copying 256-byte arrays
-through every Rust layer. Exact object-slot transactions, caller/receiver checks,
-receive capacity refusal before consume, terminal response overflow retirement,
-and queued/large-message fallback are shared with the legacy 256-byte API.
-The scheduler's resident lane and direct syscall-frame resume now switch eligible
-peers without the generic dispatch turn; see [IPC lane](../performance/ipc-lane.md).
-The register image specialization does not itself remove reply objects or the
-reservation/funding/custody layer. Objectless virtual rendezvous and paired-custody
-switching remain [unimplemented design](../performance/ipc-rendezvous.md).
+through every Rust layer. Exact object-slot or virtual-rendezvous transactions,
+caller/receiver checks, receive capacity refusal before consume, terminal
+response overflow retirement, and queued/large-message fallback preserve the
+same ABI semantics. The scheduler's resident lane, per-CPU paired custody
+(`scheduler/pair.rs`), `DirectSwitchResult` fast switch, and `take_inline_reply`
+direct syscall-frame resume switch eligible peers cleanly; see [IPC lane](../performance/ipc-lane.md)
+and [IPC rendezvous](../performance/ipc-rendezvous.md). Formal custody and
+token-disjointness invariants are registered in `ipc-register-rendezvous/IpcRegisterRendezvous`
+and `scheduler-owner-word/SchedulerOwnerWord`.
 
 Only these four opt-in syscalls declare all enabled FP/vector **data**
 (x87/MMX/XMM/YMM) caller-clobbered; x87 status/stack state is reset. The entering
