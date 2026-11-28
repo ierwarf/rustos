@@ -21,6 +21,19 @@ fn validate_user_page_range_rejects_unaligned_or_oob() {
 }
 
 #[test]
+fn execution_memory_policy_is_bound_once_and_defaults_strict() {
+    let mut space = ProcessAddressSpace::empty_for_tests();
+    assert_eq!(space.exec_memory_policy(), ExecMemoryPolicy::StrictWx);
+    assert!(space.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+    assert!(space.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+    assert!(!space.bind_exec_memory_policy(ExecMemoryPolicy::StrictWx));
+    assert_eq!(space.exec_memory_policy(), ExecMemoryPolicy::AllowRwx);
+    let mut strict = ProcessAddressSpace::empty_for_tests();
+    assert!(strict.bind_exec_memory_policy(ExecMemoryPolicy::StrictWx));
+    assert!(!strict.bind_exec_memory_policy(ExecMemoryPolicy::AllowRwx));
+}
+
+#[test]
 fn user_page_flags_enforce_wx_and_reject_huge_pages() {
     assert_eq!(
         normalize_user_page_flags(PageTableFlags::WRITABLE),

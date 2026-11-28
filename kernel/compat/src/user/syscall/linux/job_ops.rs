@@ -12,7 +12,7 @@
 use super::*;
 use kernel_object::api::handle::{HandleRights, JobHandleRights};
 use rustos_user_abi::syscall::{
-    JOB_ABI_VERSION, JOB_OP_CREATE_CHILD, JOB_OP_DUPLICATE_HANDLE, JOB_OP_GET_INFO,
+    JOB_ABI_VERSION, JOB_CREATE_APPLICATION_REALM, JOB_OP_CREATE_CHILD, JOB_OP_DUPLICATE_HANDLE, JOB_OP_GET_INFO,
     JOB_OP_KILL, JOB_OP_OPEN_SUBTREE, JOB_OP_PROCESS_JOB, JOB_OP_SET_LIMITS, JOB_STATE_KILLING, JOB_STATE_LIVE, RustosJobArgs,
 };
 
@@ -66,7 +66,7 @@ fn job_args_are_valid(args: &RustosJobArgs) -> bool {
         _ => false,
     };
     args.abi_version == JOB_ABI_VERSION
-        && args.flags == 0
+        && (args.flags == 0 || (args.op == JOB_OP_CREATE_CHILD && args.flags == JOB_CREATE_APPLICATION_REALM))
         && args.reserved0 == 0
         && args.reserved1 == 0
         && limits_ok
@@ -254,8 +254,19 @@ fn run_job_op(args: &mut RustosJobArgs, caller: u64) -> Result<Option<PendingJob
             args.limit_mask = 0;
         }
         JOB_OP_CREATE_CHILD => {
+            let application_realm = args.flags == JOB_CREATE_APPLICATION_REALM;
+            if application_realm && (job != multitask::ROOT_JOB
+                || args.job_handle != rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD
+                || !rights.contains(JobHandleRights::SET_POLICY)
+                || !ipc_ops::process_owns_live_service_endpoint(caller, rustos_user_abi::syscall::IPC_SERVICE_ROOTD)) {
+                return Err(LINUX_EPERM);
+            }
             let mut pending = PendingJobHandle::reserve(caller)?;
-            let child = multitask::job_create_child(job).map_err(job_error_errno)?;
+            let child = if application_realm {
+                multitask::job_create_application_realm()
+            } else {
+                multitask::job_create_child(job)
+            }.map_err(job_error_errno)?;
             pending.child = Some(child);
             pending.target = Some((child, rights));
             args.result_handle = pending.fd;
@@ -602,6 +613,13 @@ mod tests {
             RustosJobArgs { kills: 1, ..request(JOB_OP_KILL) },
         ] { assert!(!job_args_are_valid(&bad)); }
         assert!(job_args_are_valid(&RustosJobArgs { rights: 1, ..request(JOB_OP_DUPLICATE_HANDLE) }));
+    }
+
+    #[test]
+    fn application_realm_flag_is_create_only() {
+        assert!(job_args_are_valid(&RustosJobArgs { flags: JOB_CREATE_APPLICATION_REALM, ..request(JOB_OP_CREATE_CHILD) }));
+        assert!(!job_args_are_valid(&RustosJobArgs { flags: JOB_CREATE_APPLICATION_REALM, ..request(JOB_OP_GET_INFO) }));
+        assert!(!job_args_are_valid(&RustosJobArgs { flags: JOB_CREATE_APPLICATION_REALM << 1, ..request(JOB_OP_CREATE_CHILD) }));
     }
 
     #[test]

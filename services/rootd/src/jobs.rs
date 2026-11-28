@@ -80,6 +80,13 @@ pub(super) fn create_child(parent: u64) -> Result<u64, i64> {
     Ok(call(request(JOB_OP_CREATE_CHILD, parent, 0))?.result_handle)
 }
 
+/// A fresh, isolated application realm. Ordinary service Jobs use create_child.
+pub(super) fn create_application_realm(parent: u64) -> Result<u64, i64> {
+    let mut args = request(JOB_OP_CREATE_CHILD, parent, 0);
+    args.flags = rustos_user_abi::syscall::JOB_CREATE_APPLICATION_REALM;
+    Ok(call(args)?.result_handle)
+}
+
 pub(super) fn duplicate(handle: u64, rights: u32) -> Result<u64, i64> {
     let mut args = request(JOB_OP_DUPLICATE_HANDLE, handle, 0);
     args.rights = rights;

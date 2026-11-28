@@ -1558,6 +1558,9 @@ pub const ROOTD_MEMORY_CENSUS_MAX_ENTRIES: usize = 32;
 pub const JOB_ABI_VERSION: u16 = 4;
 pub const JOB_OP_GET_INFO: u16 = 1;
 pub const JOB_OP_CREATE_CHILD: u16 = 2;
+/// CREATE_CHILD only: root supervisor creates the isolated application realm.
+/// Descendants inherit its execution-memory class; no existing Job is changed.
+pub const JOB_CREATE_APPLICATION_REALM: u32 = 1;
 pub const JOB_OP_KILL: u16 = 3;
 pub const JOB_OP_PROCESS_JOB: u16 = 4;
 pub const JOB_OP_DUPLICATE_HANDLE: u16 = 5;

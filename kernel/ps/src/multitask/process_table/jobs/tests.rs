@@ -12,6 +12,24 @@ fn spawn_in(pid: u64, parent: Option<u64>, job: Option<JobId>) -> Option<Process
 }
 
 #[test]
+fn application_realm_class_is_inherited_and_recycled_slots_are_strict() {
+    use kernel_mm::api::address_space::ExecMemoryPolicy::{AllowRwx, StrictWx};
+    let _isolation = isolate_process_table();
+    let service = job_create_child(ROOT_JOB).unwrap();
+    let realm = job_create_application_realm().unwrap();
+    let app = job_create_child(realm).unwrap();
+    assert_eq!(job_exec_memory_policy(ROOT_JOB), Some(StrictWx));
+    assert_eq!(job_exec_memory_policy(service), Some(StrictWx));
+    assert_eq!(job_exec_memory_policy(realm), Some(AllowRwx));
+    assert_eq!(job_exec_memory_policy(app), Some(AllowRwx));
+    job_kill_begin(realm).unwrap();
+    assert_eq!(job_exec_memory_policy(realm), None);
+    assert_eq!(job_exec_memory_policy(app), None);
+    let replacement = job_create_child(ROOT_JOB).unwrap();
+    assert_eq!(job_exec_memory_policy(replacement), Some(StrictWx));
+}
+
+#[test]
 fn every_process_starts_in_the_root_job_and_children_inherit_their_parents_job() {
     let _isolation = isolate_process_table();
     let child_job = job_create_child(ROOT_JOB).unwrap();

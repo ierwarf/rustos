@@ -284,12 +284,18 @@ fn publish_inner(
     mut state: UserProcessState,
     root: Option<RootSpawnKey>,
 ) -> Result<(ProcessHandle, Option<pin_owner::ProcessObjectPin>), super::super::SpawnTaskError> {
-    let resolved_job = {
+    let (resolved_job, exec_memory_policy) = {
         let table = PROCESS_TABLE.lock();
-        table
+        let job = table
             .resolve_new_member_job(reservation.job, parent_process_id)
-            .map_err(|_| super::super::SpawnTaskError::NoFreeTaskSlot)?
+            .map_err(|_| super::super::SpawnTaskError::NoFreeTaskSlot)?;
+        let policy = table.exec_memory_policy_for_job(job)
+            .ok_or(super::super::SpawnTaskError::NoFreeTaskSlot)?;
+        (job, policy)
     };
+    if !state.address_space_mut().bind_exec_memory_policy(exec_memory_policy) {
+        return publish_refused(8, 0, 0, super::super::SpawnTaskError::NoFreeTaskSlot);
+    }
     let job_index = resolved_job.index() as usize;
     {
         struct PreObject<'a> {
@@ -420,6 +426,12 @@ fn publish_vfork_inner(
     if !table.admits_process(object.job) {
         let (all, pending_free) = table.refusal_census(object.job.index());
         return publish_refused(2, all, pending_free, super::super::SpawnTaskError::ProcessLimit);
+    }
+    // A vfork borrower uses the owner's exact MM, not its own fresh root.
+    // It must retain the same Job rather than import execution authority
+    // across the application/service boundary.
+    if table.lookup_object(owner_handle).map(|owner| owner.job) != Some(object.job) {
+        return publish_refused(8, 0, 0, super::super::SpawnTaskError::NoFreeTaskSlot);
     }
     let owner_mm_generation = {
         let Some(owner_obj) = table.lookup_object_mut(owner_handle) else {

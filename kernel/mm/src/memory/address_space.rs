@@ -138,8 +138,19 @@ impl UserRegion {
     }
 }
 
+/// Kernel-assigned execution-memory class. Unbound roots fail closed.
+/// This is authority metadata only; the existing W^X gates remain intact
+/// until the complete pager/PTE admission path is converted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecMemoryPolicy {
+    #[default]
+    StrictWx,
+    AllowRwx,
+}
+
 #[derive(Debug)]
 pub struct ProcessAddressSpace {
+    exec_memory_policy: Option<ExecMemoryPolicy>,
     pml4_frame_phys: u64,
     next_user_addr: u64,
     execution: Option<execution_lifetime::Owner>,
@@ -176,7 +187,25 @@ impl ProcessAddressSpace {
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(pml4_phys.as_u64(), true)),
             immutable: Vec::new(),
+            exec_memory_policy: None,
         })
+    }
+
+    /// Called only by the process lifecycle owner before root publication.
+    /// Once bound, a root may never switch execution-memory class, including
+    /// when a cloned root is admitted into a Job.
+    pub fn bind_exec_memory_policy(&mut self, policy: ExecMemoryPolicy) -> bool {
+        match self.exec_memory_policy {
+            Some(bound) => bound == policy,
+            None => {
+                self.exec_memory_policy = Some(policy);
+                true
+            }
+        }
+    }
+
+    pub fn exec_memory_policy(&self) -> ExecMemoryPolicy {
+        self.exec_memory_policy.unwrap_or_default()
     }
 
     pub fn root_phys(&self) -> PhysAddr {
@@ -236,6 +265,7 @@ impl ProcessAddressSpace {
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(root, false)),
             immutable: Vec::new(),
+            exec_memory_policy: None,
         }
     }
 
@@ -246,6 +276,7 @@ impl ProcessAddressSpace {
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(0, false)),
             immutable: Vec::new(),
+            exec_memory_policy: None,
         }
     }
 
@@ -273,6 +304,7 @@ impl ProcessAddressSpace {
             ((USER_SPACE_END_EXCLUSIVE - USER_SPACE_BASE) / PAGE_4KIB_U64) as usize,
         )?;
         let mut cloned = Self::new()?;
+        cloned.exec_memory_policy = self.exec_memory_policy;
         cloned.next_user_addr = self.next_user_addr;
         // Only page-table pages are recorded here; the leaves themselves are
         // read straight from each 512-entry page below, so the walk neither
